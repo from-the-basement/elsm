@@ -7,10 +7,10 @@ use crate::serdes::{Decode, Encode};
 
 #[derive(Debug)]
 pub struct Record<K, V, T = u64> {
-    pub(crate) record_type: RecordType,
-    pub(crate) key: K,
-    pub(crate) ts: T,
-    pub(crate) value: Option<V>,
+    pub record_type: RecordType,
+    pub key: K,
+    pub ts: T,
+    pub value: Option<V>,
 }
 
 impl<K, V, T> Record<K, V, T> {

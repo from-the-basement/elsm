@@ -1,7 +1,7 @@
-use std::ops::Bound;
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashSet},
     hash::Hash,
+    ops::Bound,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -16,11 +16,11 @@ where
 {
     type Timestamp: Ord + Clone;
 
-    fn read(&self) -> Self::Timestamp;
+    fn start_read(&self) -> Self::Timestamp;
 
     fn read_commit(&self, ts: Self::Timestamp);
 
-    fn tick(&self) -> Self::Timestamp;
+    fn start_write(&self) -> Self::Timestamp;
 
     fn write_commit(
         &self,
@@ -71,7 +71,7 @@ where
 {
     type Timestamp = u64;
 
-    fn read(&self) -> Self::Timestamp {
+    fn start_read(&self) -> Self::Timestamp {
         let mut in_read = self.in_read.lock().unwrap();
         let now = self.now.load(Ordering::Relaxed);
         match in_read.entry(now) {
@@ -99,7 +99,7 @@ where
         }
     }
 
-    fn tick(&self) -> Self::Timestamp {
+    fn start_write(&self) -> Self::Timestamp {
         self.now.fetch_add(1, Ordering::Relaxed) + 1
     }
 
@@ -118,10 +118,10 @@ where
 
         if !conflicts.is_empty() {
             committed_txns.insert(write_at, in_write);
-            return Err(WriteConflict { keys: conflicts });
+            Err(WriteConflict { keys: conflicts })
+        } else {
+            committed_txns.insert(write_at, in_write);
+            Ok(())
         }
-
-        committed_txns.insert(write_at, in_write);
-        Ok(())
     }
 }

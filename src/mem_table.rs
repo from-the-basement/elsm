@@ -1,6 +1,11 @@
-use std::{borrow::Borrow, ops::Bound, pin::pin, sync::Arc};
+use std::{
+    borrow::Borrow,
+    collections::{btree_map::Entry, BTreeMap},
+    ops::Bound,
+    pin::pin,
+    sync::Arc,
+};
 
-use crossbeam_skiplist::SkipMap;
 use futures::StreamExt;
 
 use crate::{record::RecordType, wal::WalRecover};
@@ -11,7 +16,7 @@ where
     K: Ord,
     T: Ord,
 {
-    data: SkipMap<Arc<K>, SkipMap<T, Option<V>>>,
+    data: BTreeMap<Arc<K>, BTreeMap<T, Option<V>>>,
 }
 
 impl<K, V, T> Default for MemTable<K, V, T>
@@ -21,31 +26,30 @@ where
 {
     fn default() -> Self {
         Self {
-            data: SkipMap::default(),
+            data: BTreeMap::default(),
         }
     }
 }
 
 impl<K, V, T> MemTable<K, V, T>
 where
-    K: Ord + Send + 'static,
-    T: Ord + Send + 'static,
-    V: Send + 'static,
+    K: Ord,
+    T: Ord,
 {
-    pub(crate) async fn new<W>(wal: &W) -> Result<Self, W::Error>
+    pub(crate) async fn from_wal<W>(wal: &mut W) -> Result<Self, W::Error>
     where
         W: WalRecover<Arc<K>, V, T>,
     {
-        let this = Self {
-            data: SkipMap::new(),
+        let mut mem_table = Self {
+            data: BTreeMap::new(),
         };
 
-        this.recover(wal).await?;
+        mem_table.recover(wal).await?;
 
-        Ok(this)
+        Ok(mem_table)
     }
 
-    pub(crate) async fn recover<W>(&self, wal: &W) -> Result<(), W::Error>
+    pub(crate) async fn recover<W>(&mut self, wal: &mut W) -> Result<(), W::Error>
     where
         W: WalRecover<Arc<K>, V, T>,
     {
@@ -54,12 +58,7 @@ where
         while let Some(record) = stream.next().await {
             let record = record?;
             match record.record_type {
-                RecordType::Full => {
-                    self.data
-                        .get_or_insert_with(record.key, || SkipMap::new())
-                        .value()
-                        .insert(record.ts, record.value);
-                }
+                RecordType::Full => self.insert(record.key, record.ts, record.value),
                 RecordType::First => {
                     if batch.is_none() {
                         batch = Some(vec![record]);
@@ -79,10 +78,7 @@ where
                         b.push(record);
                         let batch = batch.take().unwrap();
                         for record in batch {
-                            self.data
-                                .get_or_insert_with(record.key, || SkipMap::new())
-                                .value()
-                                .insert(record.ts, record.value);
+                            self.insert(record.key, record.ts, record.value);
                         }
                         continue;
                     }
@@ -96,38 +92,34 @@ where
 
 impl<K, V, T> MemTable<K, V, T>
 where
-    K: Ord + 'static,
-    T: Ord + Send + 'static,
-    V: Sync + Send + 'static,
+    K: Ord,
+    T: Ord,
 {
-    pub(crate) fn insert(&self, key: Arc<K>, ts: T, value: Option<V>) {
-        self.data
-            .get_or_insert_with(key, || SkipMap::new())
-            .value()
-            .insert(ts, value);
-    }
-
-    pub(crate) fn put_batch(&self, mut kvs: impl ExactSizeIterator<Item = (Arc<K>, T, Option<V>)>) {
-        for (key, ts, value) in &mut kvs {
-            self.insert(key, ts, value);
+    pub(crate) fn insert(&mut self, key: Arc<K>, ts: T, value: Option<V>) {
+        match self.data.entry(key) {
+            Entry::Vacant(vacant) => {
+                let versions = vacant.insert(BTreeMap::new());
+                versions.insert(ts, value);
+            }
+            Entry::Occupied(mut occupied) => {
+                occupied.get_mut().insert(ts, value);
+            }
         }
     }
 
-    pub(crate) fn get<G, Q>(&self, key: &Q, ts: &T, f: impl FnOnce(&V) -> G) -> Option<G>
+    pub(crate) fn get<Q>(&self, key: &Q, ts: &T) -> Option<&V>
     where
         Q: ?Sized + Ord,
         Arc<K>: Borrow<Q>,
     {
-        if let Some(entry) = self.data.get(key) {
-            if let Some(entry) = entry
-                .value()
-                .range((Bound::Unbounded, Bound::Included(ts)))
-                .next_back()
-            {
-                return entry.value().as_ref().map(f);
-            }
-        }
-        None
+        self.data
+            .get(key)
+            .and_then(|versions| {
+                versions
+                    .range((Bound::Unbounded, Bound::Included(ts)))
+                    .next_back()
+            })
+            .and_then(|(_, v)| v.as_ref())
     }
 }
 
@@ -138,8 +130,10 @@ mod tests {
     use futures::{executor::block_on, io::Cursor};
 
     use super::MemTable;
-    use crate::record::{Record, RecordType};
-    use crate::wal::{WalFile, WalWrite};
+    use crate::{
+        record::{Record, RecordType},
+        wal::{WalFile, WalWrite},
+    };
 
     #[test]
     fn recover_from_wal() {
@@ -148,17 +142,17 @@ mod tests {
         let value = "value".to_owned();
         block_on(async {
             {
-                let wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
                 wal.write(Record::new(RecordType::Full, &key, &0, Some(&value)))
                     .await
                     .unwrap();
                 wal.flush().await.unwrap();
             }
-            dbg!(&file);
             {
-                let wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
-                let mem_table: MemTable<String, String, u64> = MemTable::new(&wal).await.unwrap();
-                assert_eq!(mem_table.get(&key, &0, |v: &String| v.clone()), Some(value));
+                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mem_table: MemTable<String, String, u64> =
+                    MemTable::from_wal(&mut wal).await.unwrap();
+                assert_eq!(mem_table.get(&key, &0), Some(&value));
             }
         });
     }

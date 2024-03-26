@@ -2,7 +2,6 @@ mod checksum;
 
 use std::{future::Future, hash::Hasher, io, marker::PhantomData};
 
-use async_lock::Mutex;
 use async_stream::stream;
 use checksum::{HashReader, HashWriter};
 use futures::{
@@ -19,22 +18,23 @@ use crate::{
 pub trait WalWrite<K, V, T> {
     type Error: std::error::Error + 'static;
 
-    fn write(&self, record: Record<&K, &V, &T>) -> impl Future<Output = Result<(), Self::Error>>;
+    fn write(
+        &mut self,
+        record: Record<&K, &V, &T>,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 
-    fn freeze(&self) -> impl Future<Output = io::Result<()>>;
-
-    fn flush(&self) -> impl Future<Output = io::Result<()>>;
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>>;
 }
 
 pub trait WalRecover<K, V, T> {
     type Error: std::error::Error + 'static;
 
-    fn recover(&self) -> impl Stream<Item = Result<Record<K, V, T>, Self::Error>>;
+    fn recover(&mut self) -> impl Stream<Item = Result<Record<K, V, T>, Self::Error>>;
 }
 
 #[derive(Debug)]
 pub(crate) struct WalFile<H, F, K, V, T> {
-    file: Mutex<BufWriter<F>>,
+    file: BufWriter<F>,
     hasher: fn() -> H,
     _marker: PhantomData<(K, V, T)>,
 }
@@ -45,7 +45,7 @@ where
 {
     pub(crate) fn new(file: F, hasher: fn() -> H) -> Self {
         Self {
-            file: Mutex::new(BufWriter::new(file)),
+            file: BufWriter::new(file),
             hasher,
             _marker: PhantomData,
         }
@@ -62,20 +62,15 @@ where
 {
     type Error = WriteError<<Record<K, V, T> as Encode>::Error>;
 
-    async fn write(&self, record: Record<&K, &V, &T>) -> Result<(), Self::Error> {
-        let mut file = self.file.lock().await;
-        let mut writer = HashWriter::new((self.hasher)(), &mut *file);
+    async fn write(&mut self, record: Record<&K, &V, &T>) -> Result<(), Self::Error> {
+        let mut writer = HashWriter::new((self.hasher)(), &mut self.file);
         record.encode(&mut writer).await?;
         writer.eol().await.map_err(WriteError::Io)?;
         Ok(())
     }
 
-    async fn freeze(&self) -> io::Result<()> {
-        todo!()
-    }
-
-    async fn flush(&self) -> io::Result<()> {
-        self.file.lock().await.flush().await
+    async fn flush(&mut self) -> io::Result<()> {
+        self.file.flush().await
     }
 }
 
@@ -89,10 +84,9 @@ where
 {
     type Error = RecoverError<<Record<K, V, T> as Decode>::Error>;
 
-    fn recover(&self) -> impl Stream<Item = Result<Record<K, V, T>, Self::Error>> {
+    fn recover(&mut self) -> impl Stream<Item = Result<Record<K, V, T>, Self::Error>> {
         stream! {
-            let mut file = self.file.lock().await;
-            let mut file = BufReader::new(file.get_mut());
+            let mut file = BufReader::new(self.file.get_mut());
 
             loop {
                 if file.buffer().is_empty() && file.fill_buf().await.map_err(RecoverError::Io)?.is_empty() {
@@ -162,7 +156,7 @@ mod tests {
         let mut file = Vec::new();
         block_on(async {
             {
-                let wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
                 wal.write(Record::new(
                     RecordType::Full,
                     &"key".to_string(),
@@ -174,7 +168,7 @@ mod tests {
                 wal.flush().await.unwrap();
             }
             {
-                let wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
 
                 {
                     let mut stream = pin!(wal.recover());
@@ -196,7 +190,7 @@ mod tests {
             }
 
             {
-                let wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
 
                 {
                     let mut stream = pin!(wal.recover());

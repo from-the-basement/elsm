@@ -1,39 +1,35 @@
-use std::hash::Hash;
 use std::{
     borrow::Borrow,
     collections::{btree_map::Entry, BTreeMap},
+    hash::Hash,
     sync::Arc,
 };
 
 use thiserror::Error;
 
-use crate::oracle::Oracle;
-use crate::GetWrite;
+use crate::{oracle::WriteConflict, GetWrite};
 
 #[derive(Debug)]
 pub struct Transaction<K, V, DB>
 where
     K: Ord,
-    DB: Oracle<K> + GetWrite<K, V>,
+    DB: GetWrite<K, V>,
 {
     pub(crate) read_at: DB::Timestamp,
-    pub(crate) write_at: Option<DB::Timestamp>,
     pub(crate) local: BTreeMap<Arc<K>, Option<V>>,
     share: Arc<DB>,
 }
 
 impl<K, V, DB> Transaction<K, V, DB>
 where
-    K: Hash + Ord + Send + 'static,
-    V: Sync + Send + 'static,
-    DB: Oracle<K> + GetWrite<K, V>,
-    DB::Timestamp: Send + 'static,
+    K: Hash + Ord,
+    DB: GetWrite<K, V>,
+    DB::Timestamp: Send + Sync,
 {
-    pub(crate) async fn new(share: Arc<DB>) -> Self {
-        let read_at = share.read();
+    pub(crate) fn new(share: Arc<DB>) -> Self {
+        let read_at = share.start_read();
         Self {
             read_at,
-            write_at: None,
             local: BTreeMap::new(),
             share,
         }
@@ -41,9 +37,10 @@ where
 
     pub async fn get<G, F, Q>(&self, key: &Q, f: F) -> Option<G>
     where
-        Q: ?Sized + Ord,
-        F: FnOnce(&V) -> G,
-        Arc<K>: Borrow<Q>,
+        Q: ?Sized + Hash + Ord + Send + Sync + 'static,
+        F: FnOnce(&V) -> G + Send + 'static,
+        Arc<K>: Borrow<Q> + Send,
+        G: Send + 'static,
     {
         match self.local.get(key).and_then(|v| v.as_ref()) {
             Some(v) => Some((f)(v)),
@@ -59,7 +56,7 @@ where
         self.entry(key, None)
     }
 
-    pub(crate) fn entry(&mut self, key: K, value: Option<V>) {
+    fn entry(&mut self, key: K, value: Option<V>) {
         match self.local.entry(Arc::from(key)) {
             Entry::Vacant(v) => {
                 v.insert(value);
@@ -68,27 +65,24 @@ where
         }
     }
 
-    pub async fn commit(mut self) -> Result<(), CommitError<K>> {
+    pub async fn commit(self) -> Result<(), CommitError<K>> {
         self.share.read_commit(self.read_at.clone());
-        if !self.local.is_empty() {
-            let write_at = self.share.tick();
-            self.write_at = Some(write_at.clone());
-            self.share
-                .write_commit(
-                    self.read_at.clone(),
-                    write_at.clone(),
-                    self.local.keys().cloned().collect(),
-                )
-                .map_err(|e| CommitError::WriteConflict(e.to_keys()))?;
-            self.share
-                .write_batch(
-                    self.local
-                        .into_iter()
-                        .map(|(k, v)| (k, write_at.clone(), v)),
-                )
-                .await
-                .map_err(|e| CommitError::WriteError(e))?;
+        if self.local.is_empty() {
+            return Ok(());
         }
+        let write_at = self.share.start_write();
+        self.share.write_commit(
+            self.read_at.clone(),
+            write_at.clone(),
+            self.local.keys().cloned().collect(),
+        )?;
+        self.share
+            .write_batch(
+                self.local
+                    .into_iter()
+                    .map(|(k, v)| (k, write_at.clone(), v)),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -96,5 +90,11 @@ where
 #[derive(Debug, Error)]
 pub enum CommitError<K> {
     WriteConflict(Vec<Arc<K>>),
-    WriteError(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    WriteError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl<K> From<WriteConflict<K>> for CommitError<K> {
+    fn from(e: WriteConflict<K>) -> Self {
+        CommitError::WriteConflict(e.to_keys())
+    }
 }
