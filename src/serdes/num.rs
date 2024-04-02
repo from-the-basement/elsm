@@ -10,6 +10,10 @@ impl Encode for u64 {
     async fn encode<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<(), Self::Error> {
         writer.write_all(&self.to_le_bytes()).await
     }
+
+    fn size(&self) -> usize {
+        size_of::<Self>()
+    }
 }
 
 impl Decode for u64 {

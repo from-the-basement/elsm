@@ -30,4 +30,8 @@ where
     {
         self.as_ref().encode(writer).await
     }
+
+    fn size(&self) -> usize {
+        Encode::size(self.as_ref())
+    }
 }

@@ -142,14 +142,14 @@ mod tests {
         let value = "value".to_owned();
         block_on(async {
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
                 wal.write(Record::new(RecordType::Full, &key, &0, Some(&value)))
                     .await
                     .unwrap();
                 wal.flush().await.unwrap();
             }
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
                 let mem_table: MemTable<String, String, u64> =
                     MemTable::from_wal(&mut wal).await.unwrap();
                 assert_eq!(mem_table.get(&key, &0), Some(&value));

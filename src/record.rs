@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, mem::size_of};
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use thiserror::Error;
@@ -47,6 +47,10 @@ where
             .await
             .map_err(EncodeError::Timsetamp)?;
         self.value.encode(writer).await.map_err(EncodeError::Value)
+    }
+
+    fn size(&self) -> usize {
+        size_of::<u8>() + self.key.size() + self.ts.size() + self.value.size()
     }
 }
 

@@ -9,16 +9,19 @@ use futures::{ready, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use pin_project_lite::pin_project;
 
 pin_project! {
-    pub(crate) struct HashWriter<H: Hasher, W: AsyncWrite> {
-        hasher: H,
+    pub(crate) struct HashWriter<W: AsyncWrite> {
+        hasher: crc32fast::Hasher,
         #[pin]
         writer: W,
     }
 }
 
-impl<H: Hasher, W: AsyncWrite + Unpin> HashWriter<H, W> {
-    pub(crate) fn new(hasher: H, writer: W) -> Self {
-        Self { hasher, writer }
+impl<W: AsyncWrite + Unpin> HashWriter<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            hasher: crc32fast::Hasher::new(),
+            writer,
+        }
     }
 
     pub(crate) async fn eol(mut self) -> io::Result<usize> {
@@ -26,7 +29,7 @@ impl<H: Hasher, W: AsyncWrite + Unpin> HashWriter<H, W> {
     }
 }
 
-impl<H: Hasher, W: AsyncWrite> AsyncWrite for HashWriter<H, W> {
+impl<W: AsyncWrite> AsyncWrite for HashWriter<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -53,16 +56,19 @@ impl<H: Hasher, W: AsyncWrite> AsyncWrite for HashWriter<H, W> {
 }
 
 pin_project! {
-    pub(crate) struct HashReader<H: Hasher, R: AsyncRead> {
-        hasher: H,
+    pub(crate) struct HashReader<R: AsyncRead> {
+        hasher: crc32fast::Hasher,
         #[pin]
         reader: R,
     }
 }
 
-impl<H: Hasher, R: AsyncRead + Unpin> HashReader<H, R> {
-    pub(crate) fn new(hasher: H, reader: R) -> Self {
-        Self { hasher, reader }
+impl<R: AsyncRead + Unpin> HashReader<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            hasher: crc32fast::Hasher::new(),
+            reader,
+        }
     }
 
     pub(crate) async fn checksum(mut self) -> io::Result<bool> {
@@ -74,7 +80,7 @@ impl<H: Hasher, R: AsyncRead + Unpin> HashReader<H, R> {
     }
 }
 
-impl<H: Hasher, R: AsyncRead> AsyncRead for HashReader<H, R> {
+impl<R: AsyncRead> AsyncRead for HashReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

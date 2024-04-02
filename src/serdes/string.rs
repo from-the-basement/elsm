@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, mem::size_of};
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -11,6 +11,10 @@ impl Encode for String {
         writer.write_all(&(self.len() as u16).to_le_bytes()).await?;
         writer.write_all(self.as_bytes()).await
     }
+
+    fn size(&self) -> usize {
+        size_of::<u16>() + self.len()
+    }
 }
 
 impl Decode for String {
@@ -18,7 +22,7 @@ impl Decode for String {
 
     async fn decode<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self, Self::Error> {
         let len = {
-            let mut len = [0; 2];
+            let mut len = [0; size_of::<u16>()];
             reader.read_exact(&mut len).await?;
             u16::from_le_bytes(len) as usize
         };

@@ -6,53 +6,84 @@ pub mod serdes;
 pub mod transaction;
 pub mod wal;
 
-use std::{
-    borrow::Borrow,
-    collections::VecDeque,
-    error,
-    future::Future,
-    hash::Hash,
-    mem,
-    sync::{Arc, RwLock},
-};
+use std::{borrow::Borrow, error, future::Future, hash::Hash, io, mem, sync::Arc};
 
 use consistent_hash::jump_consistent_hash;
+use crossbeam_queue::ArrayQueue;
 use executor::shard::Shard;
+use futures::{executor::block_on, AsyncWrite};
 use mem_table::MemTable;
 use oracle::Oracle;
 use record::{Record, RecordType};
+use serdes::Encode;
 use transaction::Transaction;
-use wal::WalWrite;
+use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 #[derive(Debug)]
-struct LocalDB<K, V, T, W>
+pub struct DbOption {
+    pub max_wal_size: usize,
+    pub immutable_chunk_num: usize,
+}
+
+#[derive(Debug)]
+struct MutableShard<K, V, T, W>
 where
     K: Ord,
     T: Ord,
 {
     mutable: MemTable<K, V, T>,
-    wal: W,
+    wal: WalFile<W, Arc<K>, V, T>,
 }
 
 #[derive(Debug)]
-pub struct DB<K, V, W, O>
+pub struct Db<K, V, O, WP>
 where
     K: Ord,
     O: Oracle<K>,
+    WP: WalProvider,
 {
+    option: DbOption,
     pub(crate) oracle: O,
-    pub(crate) mutable_shards: Shard<LocalDB<K, V, O::Timestamp, W>>,
-    pub(crate) immutable: RwLock<VecDeque<MemTable<K, V, O::Timestamp>>>,
+    wal_manager: Arc<WalManager<WP>>,
+    pub(crate) mutable_shards:
+        Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
+    pub(crate) immutable: ArrayQueue<MemTable<K, V, O::Timestamp>>,
 }
 
-impl<K, V, W, O> DB<K, V, W, O>
+impl<K, V, O, WP> Db<K, V, O, WP>
 where
-    K: Ord + Hash + Send + Sync + 'static,
-    V: Send + 'static,
+    K: Ord + Send + Sync,
+    V: Send,
     O: Oracle<K>,
-    O::Timestamp: Send + Sync + 'static,
-    W: WalWrite<Arc<K>, V, O::Timestamp> + 'static,
-    W::Error: Send + Sync + 'static,
+    O::Timestamp: Send,
+    WP: WalProvider + Send,
+{
+    pub fn new(oracle: O, wal_provider: WP, option: DbOption) -> io::Result<Self> {
+        let wal_manager = Arc::new(WalManager::new(wal_provider, option.max_wal_size));
+        let mutable_shards = Shard::new(|| {
+            unsend::lock::RwLock::new(crate::MutableShard {
+                mutable: MemTable::default(),
+                wal: block_on(wal_manager.create_wal_file()).unwrap(),
+            })
+        });
+        Ok(Db {
+            option,
+            oracle,
+            wal_manager,
+            mutable_shards,
+            immutable: ArrayQueue::new(1),
+        })
+    }
+}
+
+impl<K, V, O, WP> Db<K, V, O, WP>
+where
+    K: Encode + Ord + Hash + Send + Sync + 'static,
+    V: Encode + Send + 'static,
+    O: Oracle<K>,
+    O::Timestamp: Encode + Send + Sync + 'static,
+    WP: WalProvider,
+    WP::File: AsyncWrite,
 {
     pub fn new_txn(self: &Arc<Self>) -> Transaction<K, V, Self> {
         Transaction::new(self.clone())
@@ -64,20 +95,48 @@ where
         key: Arc<K>,
         ts: O::Timestamp,
         value: Option<V>,
-    ) -> Result<(), W::Error> {
+    ) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(&key), executor::worker_num()) as usize;
-        self.mutable_shards
+        let wal_manager = self.wal_manager.clone();
+        let freeze = self
+            .mutable_shards
             .with(consistent_hash, move |local| async move {
                 let mut local = local.write().await;
-                local
+                let result = local
                     .wal
                     .write(Record::new(record_type, &key, &ts, value.as_ref()))
-                    .await?;
-                local.mutable.insert(key, ts, value);
-                Ok::<_, W::Error>(())
+                    .await;
+                match result {
+                    Ok(_) => {
+                        local.mutable.insert(key, ts, value);
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        if let WriteError::MaxSizeExceeded = e {
+                            let mut wal_file = wal_manager
+                                .create_wal_file()
+                                .await
+                                .map_err(WriteError::Io)?;
+                            let mut mem_table = MemTable::default();
+                            mem::swap(&mut local.wal, &mut wal_file);
+                            mem::swap(&mut local.mutable, &mut mem_table);
+
+                            wal_file.close().await.map_err(WriteError::Io)?;
+                            Ok(Some(mem_table))
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
             })
-            .await
+            .await?;
+        if let Some(mem_table) = freeze {
+            if let Err(mem_table) = self.immutable.push(mem_table) {
+                let _ = mem_table;
+            }
+        }
+        Ok(())
     }
 
     async fn get<G, Q>(
@@ -95,7 +154,7 @@ where
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(key), executor::worker_num()) as usize;
 
-        // Safety: `key` and `ts` are guaranteed to be valid for the lifetime of the closure.
+        // Safety: read-only would not break data.
         let (key, ts) = unsafe {
             (
                 mem::transmute::<_, &Q>(key),
@@ -113,7 +172,7 @@ where
     async fn write_batch(
         &self,
         mut kvs: impl ExactSizeIterator<Item = (Arc<K>, O::Timestamp, Option<V>)>,
-    ) -> Result<(), W::Error> {
+    ) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
         match kvs.len() {
             0 => Ok(()),
             1 => {
@@ -135,10 +194,11 @@ where
     }
 }
 
-impl<K, V, W, O> Oracle<K> for DB<K, V, W, O>
+impl<K, V, O, WP> Oracle<K> for Db<K, V, O, WP>
 where
     K: Ord,
     O: Oracle<K>,
+    WP: WalProvider,
 {
     type Timestamp = O::Timestamp;
 
@@ -194,14 +254,14 @@ where
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 }
 
-impl<K, V, W, O> GetWrite<K, V> for DB<K, V, W, O>
+impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
-    K: Ord + Hash + Send + Sync + 'static,
-    V: Send + 'static,
+    K: Encode + Ord + Hash + Send + Sync + 'static,
+    V: Encode + Send + 'static,
     O: Oracle<K>,
-    O::Timestamp: Send + Sync + 'static,
-    W: WalWrite<Arc<K>, V, O::Timestamp> + 'static,
-    W::Error: Send + Sync + 'static,
+    O::Timestamp: Encode + Send + Sync + 'static,
+    WP: WalProvider,
+    WP::File: AsyncWrite,
 {
     async fn write(
         &self,
@@ -210,7 +270,7 @@ where
         ts: O::Timestamp,
         value: Option<V>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
-        DB::write(self, record_type, key, ts, value).await?;
+        Db::write(self, record_type, key, ts, value).await?;
         Ok(())
     }
 
@@ -226,43 +286,43 @@ where
         G: Send + 'static,
         O::Timestamp: Sync,
     {
-        DB::get(self, key, ts, f).await
+        Db::get(self, key, ts, f).await
     }
 
     async fn write_batch(
         &self,
         kvs: impl ExactSizeIterator<Item = (Arc<K>, O::Timestamp, Option<V>)>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
-        DB::write_batch(self, kvs).await?;
+        Db::write_batch(self, kvs).await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, RwLock},
-    };
+    use std::sync::Arc;
 
-    use executor::{shard::Shard, ExecutorBuilder};
-    use futures::io::Cursor;
+    use executor::ExecutorBuilder;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, transaction::CommitError, wal::WalFile, DB,
+        oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
+        DbOption,
     };
 
     #[test]
     fn read_committed() {
         ExecutorBuilder::new().build().unwrap().block_on(async {
-            let db = Arc::new(DB {
-                mutable_shards: Shard::new(|| crate::LocalDB {
-                    mutable: MemTable::default(),
-                    wal: WalFile::new(Cursor::new(Vec::new()), crc32fast::Hasher::new),
-                }),
-                oracle: LocalOracle::default(),
-                immutable: RwLock::new(VecDeque::default()),
-            });
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption {
+                        max_wal_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                .unwrap(),
+            );
 
             let mut txn = db.new_txn();
             txn.set("key0".to_string(), 0);
@@ -300,14 +360,17 @@ mod tests {
     #[test]
     fn write_conflicts() {
         ExecutorBuilder::new().build().unwrap().block_on(async {
-            let db = Arc::new(DB {
-                mutable_shards: Shard::new(|| crate::LocalDB {
-                    mutable: MemTable::default(),
-                    wal: WalFile::new(Cursor::new(Vec::new()), crc32fast::Hasher::new),
-                }),
-                oracle: LocalOracle::default(),
-                immutable: RwLock::new(VecDeque::default()),
-            });
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption {
+                        max_wal_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                .unwrap(),
+            );
 
             let mut txn = db.new_txn();
             txn.set("key0".to_string(), 0);

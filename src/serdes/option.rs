@@ -45,6 +45,10 @@ where
         }
         Ok(())
     }
+
+    fn size(&self) -> usize {
+        1
+    }
 }
 
 impl<V> Decode for Option<V>

@@ -1,6 +1,12 @@
 mod checksum;
+pub mod provider;
 
-use std::{future::Future, hash::Hasher, io, marker::PhantomData};
+use std::{
+    future::Future,
+    io,
+    marker::PhantomData,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use async_stream::stream;
 use checksum::{HashReader, HashWriter};
@@ -10,20 +16,52 @@ use futures::{
 };
 use thiserror::Error;
 
+use self::provider::WalProvider;
 use crate::{
     record::Record,
     serdes::{Decode, Encode},
 };
 
-pub trait WalWrite<K, V, T> {
-    type Error: std::error::Error + 'static;
+#[derive(Debug)]
+pub(crate) struct WalManager<WP> {
+    wal_provider: WP,
+    file_id: AtomicU32,
+    file_max_size: usize,
+}
 
+impl<WP> WalManager<WP>
+where
+    WP: WalProvider,
+{
+    pub(crate) fn new(wal_provider: WP, file_max_size: usize) -> Self {
+        Self {
+            wal_provider,
+            file_id: AtomicU32::new(0),
+            file_max_size,
+        }
+    }
+
+    pub(crate) async fn create_wal_file<K, V, T>(&self) -> io::Result<WalFile<WP::File, K, V, T>> {
+        let file_id = self.file_id.fetch_add(1, Ordering::Relaxed);
+        let file = self.wal_provider.open(file_id).await?;
+        Ok(WalFile::new(file, self.file_max_size))
+    }
+}
+
+pub trait WalWrite<K, V, T>
+where
+    K: Encode,
+    V: Encode,
+    T: Encode,
+{
     fn write(
         &mut self,
         record: Record<&K, &V, &T>,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+    ) -> impl Future<Output = Result<(), WriteError<<Record<&K, &V, &T> as Encode>::Error>>>;
 
     fn flush(&mut self) -> impl Future<Output = io::Result<()>>;
+
+    fn close(self) -> impl Future<Output = io::Result<()>>;
 }
 
 pub trait WalRecover<K, V, T> {
@@ -33,51 +71,60 @@ pub trait WalRecover<K, V, T> {
 }
 
 #[derive(Debug)]
-pub(crate) struct WalFile<H, F, K, V, T> {
-    file: BufWriter<F>,
-    hasher: fn() -> H,
+pub(crate) struct WalFile<F, K, V, T> {
+    file: F,
+    max_size: usize,
+    writed_size: usize,
     _marker: PhantomData<(K, V, T)>,
 }
 
-impl<H, F, K, V, T> WalFile<H, F, K, V, T>
-where
-    F: AsyncWrite,
-{
-    pub(crate) fn new(file: F, hasher: fn() -> H) -> Self {
+impl<F, K, V, T> WalFile<F, K, V, T> {
+    pub(crate) fn new(file: F, max_size: usize) -> Self {
         Self {
-            file: BufWriter::new(file),
-            hasher,
+            file,
+            max_size,
+            writed_size: 0,
             _marker: PhantomData,
         }
     }
 }
 
-impl<H, F, K, V, T> WalWrite<K, V, T> for WalFile<H, F, K, V, T>
+impl<F, K, V, T> WalWrite<K, V, T> for WalFile<F, K, V, T>
 where
-    H: Hasher,
     F: AsyncWrite + Unpin,
     K: Encode,
     V: Encode,
     T: Encode,
 {
-    type Error = WriteError<<Record<K, V, T> as Encode>::Error>;
+    async fn write(
+        &mut self,
+        record: Record<&K, &V, &T>,
+    ) -> Result<(), WriteError<<Record<&K, &V, &T> as Encode>::Error>> {
+        let write_size = record.size();
+        if self.writed_size + write_size > self.max_size {
+            return Err(WriteError::MaxSizeExceeded);
+        }
 
-    async fn write(&mut self, record: Record<&K, &V, &T>) -> Result<(), Self::Error> {
-        let mut writer = HashWriter::new((self.hasher)(), &mut self.file);
+        let mut writer = HashWriter::new(&mut self.file);
         record.encode(&mut writer).await?;
         writer.eol().await.map_err(WriteError::Io)?;
+        self.writed_size += write_size;
         Ok(())
     }
 
     async fn flush(&mut self) -> io::Result<()> {
         self.file.flush().await
     }
+
+    async fn close(mut self) -> io::Result<()> {
+        self.file.flush().await?;
+        self.file.close().await
+    }
 }
 
-impl<H, F, K, V, T> WalRecover<K, V, T> for WalFile<H, F, K, V, T>
+impl<F, K, V, T> WalRecover<K, V, T> for WalFile<F, K, V, T>
 where
-    H: Hasher,
-    F: AsyncRead + AsyncWrite + Unpin,
+    F: AsyncRead + Unpin,
     K: Decode,
     V: Decode,
     T: Decode,
@@ -86,14 +133,15 @@ where
 
     fn recover(&mut self) -> impl Stream<Item = Result<Record<K, V, T>, Self::Error>> {
         stream! {
-            let mut file = BufReader::new(self.file.get_mut());
+            // Safety: https://github.com/rust-lang/futures-rs/pull/2848 fix this, waiting for release
+            let mut file = BufReader::new(unsafe { std::mem::transmute::<_, &mut F>(std::mem::transmute::<_, &mut BufWriter<Vec<_>>>(&mut self.file).get_mut()) });
 
             loop {
                 if file.buffer().is_empty() && file.fill_buf().await.map_err(RecoverError::Io)?.is_empty() {
                     return;
                 }
 
-                let mut reader = HashReader::new((self.hasher)(), &mut file);
+                let mut reader = HashReader::new(&mut file);
 
                 let record = Record::decode(&mut reader).await?;
 
@@ -109,11 +157,13 @@ where
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum WriteError<E: std::error::Error> {
+pub enum WriteError<E: std::error::Error> {
     #[error("wal write encode error: {0}")]
     Encode(#[from] E),
     #[error("wal write io error")]
     Io(#[source] std::io::Error),
+    #[error("wal write max size exceeded")]
+    MaxSizeExceeded,
 }
 
 #[derive(Debug, Error)]
@@ -126,37 +176,21 @@ pub(crate) enum RecoverError<E: std::error::Error> {
     Io(#[source] std::io::Error),
 }
 
-pub trait WalProvider {
-    type File: AsyncRead + AsyncWrite + Unpin;
-
-    fn open(&self, fid: u64) -> impl Future<Output = io::Result<Self::File>>;
-}
-
 #[cfg(test)]
 mod tests {
     use std::pin::pin;
 
     use futures::{executor::block_on, io::Cursor, StreamExt};
 
-    use super::{Record, WalFile, WalProvider, WalRecover, WalWrite};
+    use super::{Record, WalFile, WalRecover, WalWrite};
     use crate::record::RecordType;
-
-    pub(crate) struct InMemProvider;
-
-    impl WalProvider for InMemProvider {
-        type File = Cursor<Vec<u8>>;
-
-        async fn open(&self, _fid: u64) -> std::io::Result<Self::File> {
-            Ok(Cursor::new(Vec::new()))
-        }
-    }
 
     #[test]
     fn write_and_recover() {
         let mut file = Vec::new();
         block_on(async {
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
                 wal.write(Record::new(
                     RecordType::Full,
                     &"key".to_string(),
@@ -168,7 +202,7 @@ mod tests {
                 wal.flush().await.unwrap();
             }
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
 
                 {
                     let mut stream = pin!(wal.recover());
@@ -190,7 +224,7 @@ mod tests {
             }
 
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), crc32fast::Hasher::new);
+                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
 
                 {
                     let mut stream = pin!(wal.recover());
