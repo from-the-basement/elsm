@@ -117,11 +117,9 @@ where
             .collect();
 
         if !conflicts.is_empty() {
-            committed_txns.insert(write_at, in_write);
-            Err(WriteConflict { keys: conflicts })
-        } else {
-            committed_txns.insert(write_at, in_write);
-            Ok(())
+            return Err(WriteConflict { keys: conflicts });
         }
+        committed_txns.insert(write_at, in_write);
+        Ok(())
     }
 }

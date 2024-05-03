@@ -74,12 +74,11 @@ where
                     panic!("middle record should in a batch");
                 }
                 RecordType::Last => {
-                    if let Some(b) = &mut batch {
-                        b.push(record);
-                        let batch = batch.take().unwrap();
-                        for record in batch {
-                            self.insert(record.key, record.ts, record.value);
+                    if let Some(b) = batch.take() {
+                        for r in b {
+                            self.insert(r.key, r.ts, r.value);
                         }
+                        self.insert(record.key, record.ts, record.value);
                         continue;
                     }
                     panic!("last record should in a batch");
