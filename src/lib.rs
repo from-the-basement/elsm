@@ -379,6 +379,7 @@ mod tests {
 
             let mut t0 = db.new_txn();
             let mut t1 = db.new_txn();
+            let mut t2 = db.new_txn();
 
             t0.set(
                 "key0".into(),
@@ -388,11 +389,20 @@ mod tests {
                 "key0".into(),
                 t1.get(&"key0".to_owned(), |v| *v).await.unwrap(),
             );
+            t1.set(
+                "key2".into(),
+                2
+            );
+            t2.set(
+                "key2".into(),
+                3
+            );
 
             t0.commit().await.unwrap();
 
             let commit = t1.commit().await;
             assert!(commit.is_err());
+            assert!(t2.commit().await.is_ok());
             if let Err(CommitError::WriteConflict(keys)) = commit {
                 assert_eq!(db.new_txn().get(&keys[0], |v| *v).await, Some(1));
                 return;
