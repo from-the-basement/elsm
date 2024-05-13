@@ -144,7 +144,10 @@ where
             .rev()
         {
             if let Some(item_ts) = item_ts {
-                if item_key == key && item_ts <= ts {
+                if item_key != key {
+                    break;
+                }
+                if item_ts <= ts {
                     return value.as_ref();
                 }
             }
@@ -173,7 +176,6 @@ mod tests {
             let key_3 = Arc::new("key_3".to_owned());
             let key_4 = Arc::new("key_4".to_owned());
             let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
             let value_3 = "value_3".to_owned();
 
             let mut mem_table = MemTable::default();
@@ -182,16 +184,15 @@ mod tests {
             mem_table.insert(key_1.clone(), 1, Some(value_1.clone()));
             mem_table.insert(key_1.clone(), 2, Some(value_1.clone()));
 
-            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
             mem_table.insert(key_3.clone(), 0, Some(value_3.clone()));
 
             assert_eq!(mem_table.get(&key_1, &0), Some(&value_1));
             assert_eq!(mem_table.get(&key_1, &1), Some(&value_1));
             assert_eq!(mem_table.get(&key_1, &2), Some(&value_1));
 
-            assert_eq!(mem_table.get(&key_2, &0), Some(&value_2));
             assert_eq!(mem_table.get(&key_3, &0), Some(&value_3));
 
+            assert_eq!(mem_table.get(&key_2, &0), None);
             assert_eq!(mem_table.get(&key_4, &0), None);
             assert_eq!(mem_table.get(&key_1, &3), Some(&value_1));
         });
