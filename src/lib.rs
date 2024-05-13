@@ -6,7 +6,7 @@ pub mod serdes;
 pub mod transaction;
 pub mod wal;
 
-use std::{borrow::Borrow, error, future::Future, hash::Hash, io, mem, sync::Arc};
+use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 
 use consistent_hash::jump_consistent_hash;
 use crossbeam_queue::ArrayQueue;
@@ -139,15 +139,13 @@ where
         Ok(())
     }
 
-    async fn get<G, Q>(
+    async fn get<G>(
         &self,
-        key: &Q,
+        key: &Arc<K>,
         ts: &O::Timestamp,
         f: impl FnOnce(&V) -> G + Send + 'static,
     ) -> Option<G>
     where
-        Q: ?Sized + Ord + Hash + Sync + 'static,
-        Arc<K>: Borrow<Q>,
         G: Send + 'static,
         O::Timestamp: Sync,
     {
@@ -157,7 +155,7 @@ where
         // Safety: read-only would not break data.
         let (key, ts) = unsafe {
             (
-                mem::transmute::<_, &Q>(key),
+                mem::transmute::<_, &Arc<K>>(key),
                 mem::transmute::<_, &O::Timestamp>(ts),
             )
         };
@@ -228,15 +226,13 @@ pub trait GetWrite<K, V>: Oracle<K>
 where
     K: Ord,
 {
-    fn get<G, Q>(
+    fn get<G>(
         &self,
-        key: &Q,
+        key: &Arc<K>,
         ts: &Self::Timestamp,
         f: impl FnOnce(&V) -> G + Send + 'static,
     ) -> impl Future<Output = Option<G>>
     where
-        Q: ?Sized + Ord + Hash + Sync + 'static,
-        Arc<K>: Borrow<Q>,
         G: Send + 'static,
         Self::Timestamp: Sync;
 
@@ -274,15 +270,13 @@ where
         Ok(())
     }
 
-    async fn get<G, Q>(
+    async fn get<G>(
         &self,
-        key: &Q,
+        key: &Arc<K>,
         ts: &O::Timestamp,
         f: impl FnOnce(&V) -> G + Send + 'static,
     ) -> Option<G>
     where
-        Q: ?Sized + Ord + Hash + Sync + 'static,
-        Arc<K>: Borrow<Q>,
         G: Send + 'static,
         O::Timestamp: Sync,
     {
@@ -334,11 +328,11 @@ mod tests {
 
             t0.set(
                 "key0".into(),
-                t0.get(&"key1".to_owned(), |v| *v).await.unwrap(),
+                t0.get(&Arc::new("key1".to_owned()), |v| *v).await.unwrap(),
             );
             t1.set(
                 "key1".into(),
-                t1.get(&"key0".to_owned(), |v| *v).await.unwrap(),
+                t1.get(&Arc::new("key0".to_owned()), |v| *v).await.unwrap(),
             );
 
             t0.commit().await.unwrap();
@@ -383,20 +377,14 @@ mod tests {
 
             t0.set(
                 "key0".into(),
-                t0.get(&"key1".to_owned(), |v| *v).await.unwrap(),
+                t0.get(&Arc::new("key1".to_owned()), |v| *v).await.unwrap(),
             );
             t1.set(
                 "key0".into(),
-                t1.get(&"key0".to_owned(), |v| *v).await.unwrap(),
+                t1.get(&Arc::new("key0".to_owned()), |v| *v).await.unwrap(),
             );
-            t1.set(
-                "key2".into(),
-                2
-            );
-            t2.set(
-                "key2".into(),
-                3
-            );
+            t1.set("key2".into(), 2);
+            t2.set("key2".into(), 3);
 
             t0.commit().await.unwrap();
 
