@@ -8,7 +8,7 @@ use crate::{record::RecordType, wal::WalRecover};
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct InternalKey<K, T> {
     key: Arc<K>,
-    ts: Option<T>,
+    ts: T,
 }
 
 impl<K, T> PartialOrd<Self> for InternalKey<K, T>
@@ -29,12 +29,7 @@ where
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
             .cmp(&other.key)
-            .then_with(|| match (&self.ts, &other.ts) {
-                (Some(self_ts), Some(other_ts)) => self_ts.cmp(other_ts),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            })
+            .then_with(|| self.ts.cmp(&other.ts))
     }
 }
 
@@ -62,7 +57,7 @@ where
 impl<K, V, T> MemTable<K, V, T>
 where
     K: Ord,
-    T: Ord,
+    T: Ord + Copy,
 {
     pub(crate) async fn from_wal<W>(wal: &mut W) -> Result<Self, W::Error>
     where
@@ -120,39 +115,31 @@ where
 impl<K, V, T> MemTable<K, V, T>
 where
     K: Ord,
-    T: Ord,
+    T: Ord + Copy,
 {
     pub(crate) fn insert(&mut self, key: Arc<K>, ts: T, value: Option<V>) {
-        let _ = self.data.insert(InternalKey { key, ts: Some(ts) }, value);
+        let _ = self.data.insert(InternalKey { key, ts }, value);
     }
 
     pub(crate) fn get(&self, key: &Arc<K>, ts: &T) -> Option<&V> {
         let internal_key = InternalKey {
             key: key.clone(),
-            ts: None,
+            ts: *ts,
         };
 
-        for (
-            InternalKey {
-                key: item_key,
-                ts: item_ts,
-            },
-            value,
-        ) in self
-            .data
+        self.data
             .range((Bound::Unbounded, Bound::Included(&internal_key)))
-            .rev()
-        {
-            if let Some(item_ts) = item_ts {
-                if item_key != key {
-                    break;
-                }
-                if item_ts <= ts {
-                    return value.as_ref();
-                }
-            }
-        }
-        None
+            .next_back()
+            .and_then(
+                |(
+                    InternalKey {
+                        key: item_key,
+                        ts: item_ts,
+                    },
+                    value,
+                )| (item_ts <= ts && item_key == key).then(|| value.as_ref()),
+            )
+            .flatten()
     }
 }
 

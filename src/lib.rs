@@ -81,7 +81,7 @@ where
     K: Encode + Ord + Hash + Send + Sync + 'static,
     V: Encode + Send + 'static,
     O: Oracle<K>,
-    O::Timestamp: Encode + Send + Sync + 'static,
+    O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
 {
@@ -255,7 +255,7 @@ where
     K: Encode + Ord + Hash + Send + Sync + 'static,
     V: Encode + Send + 'static,
     O: Oracle<K>,
-    O::Timestamp: Encode + Send + Sync + 'static,
+    O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
 {
