@@ -10,6 +10,7 @@ use arrow::array::{GenericBinaryBuilder, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 
+use crate::record::EncodeError;
 use consistent_hash::jump_consistent_hash;
 use crossbeam_queue::ArrayQueue;
 use executor::shard::Shard;
@@ -215,7 +216,7 @@ where
 
         for (key, value) in mem_table.iter() {
             clear(&mut buf);
-            key.encode(&mut buf).await.unwrap();
+            key.encode(&mut buf).await.map_err(EncodeError::Key)?;
             key_builder.append_value(buf.get_ref());
 
             if let Some(value) = value {
@@ -229,7 +230,8 @@ where
         let keys = key_builder.finish();
         let values = value_builder.finish();
 
-        Ok(RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)]).unwrap())
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)])
+            .map_err(WriteError::Arrow)
     }
 }
 

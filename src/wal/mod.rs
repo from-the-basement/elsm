@@ -160,10 +160,12 @@ where
 pub enum WriteError<E: std::error::Error> {
     #[error("wal write encode error: {0}")]
     Encode(#[from] E),
-    #[error("wal write io error")]
+    #[error("wal write io error: {0}")]
     Io(#[source] std::io::Error),
     #[error("wal write max size exceeded")]
     MaxSizeExceeded,
+    #[error("wal write arrow error: {0}")]
+    Arrow(#[source] arrow::error::ArrowError),
 }
 
 #[derive(Debug, Error)]
