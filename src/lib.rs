@@ -7,7 +7,7 @@ pub mod transaction;
 pub mod wal;
 
 use arrow::array::{GenericBinaryBuilder, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 
 use crate::record::EncodeError;
@@ -16,12 +16,22 @@ use crossbeam_queue::ArrayQueue;
 use executor::shard::Shard;
 use futures::io::Cursor;
 use futures::{executor::block_on, AsyncWrite};
+use lazy_static::lazy_static;
 use mem_table::MemTable;
 use oracle::Oracle;
 use record::{Record, RecordType};
 use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
+
+lazy_static! {
+    pub static ref ELSM_SCHEMA: SchemaRef = {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::LargeBinary, false),
+            Field::new("value", DataType::LargeBinary, true),
+        ]))
+    };
+}
 
 pub type Offset = i64;
 
@@ -205,11 +215,6 @@ where
             buf.set_position(0);
         }
 
-        //TODO: static
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::LargeBinary, false),
-            Field::new("value", DataType::LargeBinary, true),
-        ]));
         let mut buf = Cursor::new(vec![0; 128]);
         let mut key_builder = GenericBinaryBuilder::<Offset>::new();
         let mut value_builder = GenericBinaryBuilder::<Offset>::new();
@@ -230,7 +235,7 @@ where
         let keys = key_builder.finish();
         let values = value_builder.finish();
 
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)])
+        RecordBatch::try_new(ELSM_SCHEMA.clone(), vec![Arc::new(keys), Arc::new(values)])
             .map_err(WriteError::Arrow)
     }
 }

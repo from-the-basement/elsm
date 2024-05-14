@@ -500,6 +500,7 @@ dependencies = [
  "executor",
  "futures",
  "fxhash",
+ "lazy_static",
  "pin-project-lite",
  "thiserror",
  "unsend",
