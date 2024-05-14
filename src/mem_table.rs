@@ -29,7 +29,7 @@ where
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
             .cmp(&other.key)
-            .then_with(|| self.ts.cmp(&other.ts))
+            .then_with(|| other.ts.cmp(&self.ts))
     }
 }
 
@@ -128,17 +128,11 @@ where
         };
 
         self.data
-            .range((Bound::Unbounded, Bound::Included(&internal_key)))
-            .next_back()
-            .and_then(
-                |(
-                    InternalKey {
-                        key: item_key,
-                        ts: item_ts,
-                    },
-                    value,
-                )| (item_ts <= ts && item_key == key).then(|| value.as_ref()),
-            )
+            .range((Bound::Included(&internal_key), Bound::Unbounded))
+            .next()
+            .and_then(|(InternalKey { key: item_key, .. }, value)| {
+                (item_key == key).then_some(value.as_ref())
+            })
             .flatten()
     }
 }
