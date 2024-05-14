@@ -1,5 +1,4 @@
 use std::{
-    borrow::Borrow,
     collections::{btree_map::Entry, BTreeMap},
     hash::Hash,
     sync::Arc,
@@ -35,11 +34,9 @@ where
         }
     }
 
-    pub async fn get<G, F, Q>(&self, key: &Q, f: F) -> Option<G>
+    pub async fn get<G, F>(&self, key: &Arc<K>, f: F) -> Option<G>
     where
-        Q: ?Sized + Hash + Ord + Send + Sync + 'static,
         F: FnOnce(&V) -> G + Send + 'static,
-        Arc<K>: Borrow<Q> + Send,
         G: Send + 'static,
     {
         match self.local.get(key).and_then(|v| v.as_ref()) {
