@@ -6,11 +6,14 @@ pub mod serdes;
 pub mod transaction;
 pub mod wal;
 
+use arrow::array::{GenericBinaryBuilder, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 
 use consistent_hash::jump_consistent_hash;
 use crossbeam_queue::ArrayQueue;
 use executor::shard::Shard;
+use futures::io::Cursor;
 use futures::{executor::block_on, AsyncWrite};
 use mem_table::MemTable;
 use oracle::Oracle;
@@ -18,6 +21,8 @@ use record::{Record, RecordType};
 use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
+
+pub type Offset = i64;
 
 #[derive(Debug)]
 pub struct DbOption {
@@ -47,7 +52,7 @@ where
     wal_manager: Arc<WalManager<WP>>,
     pub(crate) mutable_shards:
         Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
-    pub(crate) immutable: ArrayQueue<MemTable<K, V, O::Timestamp>>,
+    pub(crate) immutable: ArrayQueue<RecordBatch>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
@@ -132,7 +137,7 @@ where
             })
             .await?;
         if let Some(mem_table) = freeze {
-            if let Err(mem_table) = self.immutable.push(mem_table) {
+            if let Err(mem_table) = self.immutable.push(Self::freeze(mem_table).await?) {
                 let _ = mem_table;
             }
         }
@@ -189,6 +194,38 @@ where
                 self.write(RecordType::Last, key, ts, value).await
             }
         }
+    }
+
+    async fn freeze(
+        mem_table: MemTable<K, V, <O as Oracle<K>>::Timestamp>,
+    ) -> Result<RecordBatch, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
+        fn clear(buf: &mut Cursor<Vec<u8>>) {
+            buf.get_mut().clear();
+            buf.set_position(0);
+        }
+
+        //TODO: static
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::LargeBinary, false),
+            Field::new("value", DataType::LargeBinary, true),
+        ]));
+        let mut buf = Cursor::new(vec![0; 128]);
+        let mut key_builder = GenericBinaryBuilder::<Offset>::new();
+        let mut value_builder = GenericBinaryBuilder::<Offset>::new();
+
+        for (key, value) in mem_table.iter() {
+            clear(&mut buf);
+            key.encode(&mut buf).await.unwrap();
+            key_builder.append_value(buf.get_ref());
+
+            clear(&mut buf);
+            value.encode(&mut buf).await.unwrap();
+            value_builder.append_value(buf.get_ref());
+        }
+        let keys = key_builder.finish();
+        let values = value_builder.finish();
+
+        Ok(RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(values)]).unwrap())
     }
 }
 
@@ -294,13 +331,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::AsArray;
     use std::sync::Arc;
 
     use executor::ExecutorBuilder;
+    use futures::io::Cursor;
 
+    use crate::mem_table::MemTable;
+    use crate::serdes::Encode;
     use crate::{
         oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
-        DbOption,
+        DbOption, Offset,
     };
 
     #[test]
@@ -396,6 +437,58 @@ mod tests {
                 return;
             }
             panic!("unreachable");
+        });
+    }
+
+    #[test]
+    fn freeze() {
+        fn clear(buf: &mut Cursor<Vec<u8>>) {
+            buf.get_mut().clear();
+            buf.set_position(0);
+        }
+
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let key_1 = Arc::new("key_1".to_owned());
+            let key_2 = Arc::new("key_2".to_owned());
+            let value_1 = "value_1".to_owned();
+            let value_2 = "value_2".to_owned();
+
+            let mut mem_table = MemTable::default();
+
+            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
+            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
+
+            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
+                .await
+                .unwrap();
+
+            let keys = batch.column(0);
+            let values = batch.column(1);
+
+            let mut buf = Cursor::new(Vec::new());
+            key_1.encode(&mut buf).await.unwrap();
+            assert_eq!(
+                keys.as_binary::<Offset>().value(0),
+                buf.get_ref().as_slice()
+            );
+            clear(&mut buf);
+            key_2.encode(&mut buf).await.unwrap();
+            assert_eq!(
+                keys.as_binary::<Offset>().value(1),
+                buf.get_ref().as_slice()
+            );
+            clear(&mut buf);
+            Some(value_1).encode(&mut buf).await.unwrap();
+            assert_eq!(
+                values.as_binary::<Offset>().value(0),
+                buf.get_ref().as_slice()
+            );
+            clear(&mut buf);
+            Some(value_2).encode(&mut buf).await.unwrap();
+            assert_eq!(
+                values.as_binary::<Offset>().value(1),
+                buf.get_ref().as_slice()
+            );
         });
     }
 }
