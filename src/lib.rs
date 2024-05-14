@@ -5,6 +5,7 @@ pub(crate) mod oracle;
 pub(crate) mod record;
 pub mod serdes;
 pub mod transaction;
+pub(crate) mod utils;
 pub mod wal;
 
 use std::{
@@ -212,6 +213,74 @@ where
         }
 
         result
+    }
+
+    async fn range_scan<G>(
+        &self,
+        lower: Bound<Arc<K>>,
+        upper: Bound<Arc<K>>,
+        ts: &O::Timestamp,
+        f: impl FnOnce(&V) -> G + Send + Copy + 'static,
+    ) -> Vec<G>
+    where
+        G: Send + Sync + 'static,
+        O::Timestamp: Sync,
+    {
+        fn merge_sort<K, G>(mut arrays: Vec<Vec<CmpKeyItem<Arc<K>, Option<G>>>>) -> Vec<G>
+        where
+            K: Ord,
+        {
+            let mut heap = BinaryHeap::new();
+
+            for (i, array) in arrays.iter_mut().enumerate() {
+                if array.is_empty() {
+                    continue;
+                }
+                let val = array.remove(0);
+                heap.push(Reverse((val, i)));
+            }
+
+            let mut result = Vec::new();
+
+            while let Some(Reverse((CmpKeyItem { _value: value, .. }, idx))) = heap.pop() {
+                if let Some(value) = value {
+                    result.push(value);
+                }
+                if arrays[idx].is_empty() {
+                    continue;
+                }
+                let next_val = arrays[idx].remove(0);
+                heap.push(Reverse((next_val, idx)));
+            }
+
+            result
+        }
+        let mut arrarys = Vec::with_capacity(executor::worker_num());
+
+        for i in 0..executor::worker_num() {
+            let lower = lower.clone();
+            let upper = upper.clone();
+            let ts = *ts;
+
+            let items: Vec<_> = self
+                .mutable_shards
+                .with(i, move |local| async move {
+                    let guard = local.read().await;
+                    // TODO: MergeIterator
+                    guard
+                        .mutable
+                        .range(lower.as_ref(), upper.as_ref(), &ts)
+                        .map(|(k, v)| CmpKeyItem {
+                            key: k.clone(),
+                            _value: v.as_ref().map(f),
+                        })
+                        .collect()
+                })
+                .await;
+            arrarys.push(items);
+        }
+
+        merge_sort(arrarys)
     }
 
     async fn write_batch(
@@ -439,6 +508,43 @@ mod tests {
                 txn.get(&Arc::from("key1".to_string()), |v| *v).await,
                 Some(0)
             );
+        });
+    }
+
+    #[test]
+    fn range_scan() {
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption {
+                        max_wal_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                .unwrap(),
+            );
+
+            let mut txn = db.new_txn();
+            txn.set("key0".to_string(), 0);
+            txn.set("key1".to_string(), 1);
+            txn.set("key2".to_string(), 2);
+            txn.set("key3".to_string(), 3);
+            txn.commit().await.unwrap();
+
+            let items = db
+                .range_scan(
+                    Bound::Excluded(Arc::new("key0".to_string())),
+                    Bound::Excluded(Arc::new("key3".to_string())),
+                    &1,
+                    |v| *v,
+                )
+                .await;
+
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0], 1);
+            assert_eq!(items[1], 2);
         });
     }
 
