@@ -218,9 +218,13 @@ where
             key.encode(&mut buf).await.unwrap();
             key_builder.append_value(buf.get_ref());
 
-            clear(&mut buf);
-            value.encode(&mut buf).await.unwrap();
-            value_builder.append_value(buf.get_ref());
+            if let Some(value) = value {
+                clear(&mut buf);
+                value.encode(&mut buf).await.unwrap();
+                value_builder.append_value(buf.get_ref());
+            } else {
+                value_builder.append_null();
+            }
         }
         let keys = key_builder.finish();
         let values = value_builder.finish();
@@ -331,7 +335,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::AsArray;
+    use arrow::array::{Array, AsArray};
     use std::sync::Arc;
 
     use executor::ExecutorBuilder;
@@ -450,6 +454,7 @@ mod tests {
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let key_1 = Arc::new("key_1".to_owned());
             let key_2 = Arc::new("key_2".to_owned());
+            let key_3 = Arc::new("key_3".to_owned());
             let value_1 = "value_1".to_owned();
             let value_2 = "value_2".to_owned();
 
@@ -457,6 +462,7 @@ mod tests {
 
             mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
             mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
+            mem_table.insert(key_3.clone(), 0, None);
 
             let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
                 .await
@@ -478,17 +484,24 @@ mod tests {
                 buf.get_ref().as_slice()
             );
             clear(&mut buf);
-            Some(value_1).encode(&mut buf).await.unwrap();
+            key_3.encode(&mut buf).await.unwrap();
+            assert_eq!(
+                keys.as_binary::<Offset>().value(2),
+                buf.get_ref().as_slice()
+            );
+            clear(&mut buf);
+            value_1.encode(&mut buf).await.unwrap();
             assert_eq!(
                 values.as_binary::<Offset>().value(0),
                 buf.get_ref().as_slice()
             );
             clear(&mut buf);
-            Some(value_2).encode(&mut buf).await.unwrap();
+            value_2.encode(&mut buf).await.unwrap();
             assert_eq!(
                 values.as_binary::<Offset>().value(1),
                 buf.get_ref().as_slice()
             );
+            assert!(values.as_binary::<Offset>().is_null(2))
         });
     }
 }
