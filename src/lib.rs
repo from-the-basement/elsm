@@ -6,10 +6,12 @@ pub mod serdes;
 pub mod transaction;
 pub mod wal;
 
-use arrow::array::{GenericBinaryBuilder, RecordBatch};
+use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use std::collections::BTreeMap;
 use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 
+use crate::mem_table::InternalKey;
 use crate::record::EncodeError;
 use consistent_hash::jump_consistent_hash;
 use crossbeam_queue::ArrayQueue;
@@ -52,6 +54,36 @@ where
 }
 
 #[derive(Debug)]
+pub(crate) struct IndexBatch<K, T>
+where
+    K: Ord,
+    T: Ord,
+{
+    batch: RecordBatch,
+    index: BTreeMap<InternalKey<K, T>, u32>,
+}
+
+impl<K, T> IndexBatch<K, T>
+where
+    K: Ord,
+    T: Ord + Copy,
+{
+    pub(crate) fn find(&self, key: &Arc<K>, ts: &T) -> Option<&[u8]> {
+        self.index
+            .get(&InternalKey {
+                key: key.clone(),
+                ts: *ts,
+            })
+            .map(|offset| {
+                self.batch
+                    .column(1)
+                    .as_binary::<Offset>()
+                    .value(*offset as usize)
+            })
+    }
+}
+
+#[derive(Debug)]
 pub struct Db<K, V, O, WP>
 where
     K: Ord,
@@ -63,7 +95,7 @@ where
     wal_manager: Arc<WalManager<WP>>,
     pub(crate) mutable_shards:
         Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
-    pub(crate) immutable: ArrayQueue<RecordBatch>,
+    pub(crate) immutable: ArrayQueue<IndexBatch<K, O::Timestamp>>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
@@ -209,19 +241,23 @@ where
 
     async fn freeze(
         mem_table: MemTable<K, V, <O as Oracle<K>>::Timestamp>,
-    ) -> Result<RecordBatch, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
+    ) -> Result<
+        IndexBatch<K, O::Timestamp>,
+        WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>,
+    > {
         fn clear(buf: &mut Cursor<Vec<u8>>) {
             buf.get_mut().clear();
             buf.set_position(0);
         }
 
         let mut buf = Cursor::new(vec![0; 128]);
+        let mut index = BTreeMap::new();
         let mut key_builder = GenericBinaryBuilder::<Offset>::new();
         let mut value_builder = GenericBinaryBuilder::<Offset>::new();
 
-        for (key, value) in mem_table.iter() {
+        for (offset, (key, value)) in mem_table.data.into_iter().enumerate() {
             clear(&mut buf);
-            key.encode(&mut buf).await.map_err(EncodeError::Key)?;
+            key.key.encode(&mut buf).await.map_err(EncodeError::Key)?;
             key_builder.append_value(buf.get_ref());
 
             if let Some(value) = value {
@@ -231,12 +267,16 @@ where
             } else {
                 value_builder.append_null();
             }
+            index.insert(key, offset as u32);
         }
         let keys = key_builder.finish();
         let values = value_builder.finish();
 
-        RecordBatch::try_new(ELSM_SCHEMA.clone(), vec![Arc::new(keys), Arc::new(values)])
-            .map_err(WriteError::Arrow)
+        let batch =
+            RecordBatch::try_new(ELSM_SCHEMA.clone(), vec![Arc::new(keys), Arc::new(values)])
+                .map_err(WriteError::Arrow)?;
+
+        Ok(IndexBatch { batch, index })
     }
 }
 
@@ -342,7 +382,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, AsArray};
     use std::sync::Arc;
 
     use executor::ExecutorBuilder;
@@ -352,7 +391,7 @@ mod tests {
     use crate::serdes::Encode;
     use crate::{
         oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
-        DbOption, Offset,
+        DbOption,
     };
 
     #[test]
@@ -468,6 +507,7 @@ mod tests {
             let mut mem_table = MemTable::default();
 
             mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
+            mem_table.insert(key_1.clone(), 1, None);
             mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
             mem_table.insert(key_3.clone(), 0, None);
 
@@ -475,40 +515,14 @@ mod tests {
                 .await
                 .unwrap();
 
-            let keys = batch.column(0);
-            let values = batch.column(1);
-
             let mut buf = Cursor::new(Vec::new());
-            key_1.encode(&mut buf).await.unwrap();
-            assert_eq!(
-                keys.as_binary::<Offset>().value(0),
-                buf.get_ref().as_slice()
-            );
-            clear(&mut buf);
-            key_2.encode(&mut buf).await.unwrap();
-            assert_eq!(
-                keys.as_binary::<Offset>().value(1),
-                buf.get_ref().as_slice()
-            );
-            clear(&mut buf);
-            key_3.encode(&mut buf).await.unwrap();
-            assert_eq!(
-                keys.as_binary::<Offset>().value(2),
-                buf.get_ref().as_slice()
-            );
-            clear(&mut buf);
             value_1.encode(&mut buf).await.unwrap();
-            assert_eq!(
-                values.as_binary::<Offset>().value(0),
-                buf.get_ref().as_slice()
-            );
+            assert_eq!(batch.find(&key_1, &0), Some(buf.get_ref().as_slice()));
+            assert_eq!(batch.find(&key_1, &1), Some(vec![].as_slice()));
             clear(&mut buf);
             value_2.encode(&mut buf).await.unwrap();
-            assert_eq!(
-                values.as_binary::<Offset>().value(1),
-                buf.get_ref().as_slice()
-            );
-            assert!(values.as_binary::<Offset>().is_null(2))
+            assert_eq!(batch.find(&key_2, &0), Some(buf.get_ref().as_slice()));
+            assert_eq!(batch.find(&key_3, &0), Some(vec![].as_slice()));
         });
     }
 }
