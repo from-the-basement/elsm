@@ -7,6 +7,7 @@ use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU32, Ordering},
 };
+use std::error::Error;
 
 use async_stream::stream;
 use checksum::{HashReader, HashWriter};
@@ -166,6 +167,8 @@ pub enum WriteError<E: std::error::Error> {
     MaxSizeExceeded,
     #[error("wal write arrow error: {0}")]
     Arrow(#[source] arrow::error::ArrowError),
+    #[error("wal write internal error: {0}")]
+    Internal(#[source] Box<dyn Error + Send + Sync + 'static>),
 }
 
 #[derive(Debug, Error)]

@@ -257,12 +257,16 @@ where
 
         for (offset, (key, value)) in mem_table.data.into_iter().enumerate() {
             clear(&mut buf);
-            key.key.encode(&mut buf).await.map_err(EncodeError::Key)?;
+            key.key.encode(&mut buf)
+                .await
+                .map_err(|err| WriteError::Internal(Box::new(err)))?;
             key_builder.append_value(buf.get_ref());
 
             if let Some(value) = value {
                 clear(&mut buf);
-                value.encode(&mut buf).await.unwrap();
+                value.encode(&mut buf)
+                    .await
+                    .map_err(|err| WriteError::Internal(Box::new(err)))?;
                 value_builder.append_value(buf.get_ref());
             } else {
                 value_builder.append_null();
