@@ -453,6 +453,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::Bound;
     use std::sync::Arc;
 
     use executor::ExecutorBuilder;
