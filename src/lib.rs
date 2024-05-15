@@ -16,13 +16,25 @@ use std::{
     io, mem,
     sync::Arc,
 };
+use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use std::collections::BTreeMap;
+use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
+use std::pin::pin;
+use std::{error, future::Future, hash::Hash, mem, sync::Arc};
 
 use arrow::{
     array::{GenericBinaryBuilder, RecordBatch},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use async_lock::RwLock;
+use crate::mem_table::InternalKey;
+use crate::record::EncodeError;
+use crate::serdes::Decode;
+use crate::wal::WalRecover;
 use consistent_hash::jump_consistent_hash;
+use crossbeam_queue::ArrayQueue;
+use executor::futures::{AsyncRead, StreamExt};
 use executor::shard::Shard;
 use futures::{executor::block_on, io::Cursor, AsyncWrite};
 use lazy_static::lazy_static;
@@ -86,7 +98,11 @@ impl<K, V, O, WP> Db<K, V, O, WP>
         WP: WalProvider,
         WP::File: AsyncWrite + AsyncRead,
 {
-    pub async fn new(oracle: O, wal_provider: WP, option: DbOption) -> Result<Self, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
+    pub async fn new(
+        oracle: O,
+        wal_provider: WP,
+        option: DbOption,
+    ) -> Result<Self, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
         let wal_manager = Arc::new(WalManager::new(wal_provider, option.max_wal_size));
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
@@ -107,9 +123,14 @@ impl<K, V, O, WP> Db<K, V, O, WP>
         while let Some(file) = file_stream.next().await {
             let file = file.map_err(|err| WriteError::Internal(Box::new(err)))?;
 
-            db.recover(&mut wal_manager.pack_wal_file(file).await.map_err(WriteError::Io)?)
-                .await
-                .map_err(|err| WriteError::Internal(Box::new(err)))?;
+            db.recover(
+                &mut wal_manager
+                    .pack_wal_file(file)
+                    .await
+                    .map_err(WriteError::Io)?,
+            )
+            .await
+            .map_err(|err| WriteError::Internal(Box::new(err)))?;
         }
 
         Ok(db)
@@ -419,14 +440,13 @@ mod tests {
     use std::sync::Arc;
 
     use executor::ExecutorBuilder;
-    use futures::io::Cursor;
     use tempfile::TempDir;
 
+    use crate::wal::provider::fs::Fs;
     use crate::{
         mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
         transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
     };
-    use crate::wal::provider::fs::Fs;
 
     #[test]
     fn read_committed() {
@@ -617,8 +637,8 @@ mod tests {
                         immutable_chunk_num: 1,
                     },
                 )
-                    .await
-                    .unwrap(),
+                .await
+                .unwrap(),
             );
 
             let mut txn = db.new_txn();
@@ -637,14 +657,20 @@ mod tests {
                         immutable_chunk_num: 1,
                     },
                 )
-                    .await
-                    .unwrap(),
+                .await
+                .unwrap(),
             );
 
             assert_eq!(
-                db.get(&Arc::new("key0".to_string()), &1, |v: &String| v.clone()).await,
+                db.get(&Arc::new("key0".to_string()), &1, |v: &String| v.clone())
+                    .await,
                 Some("value0".to_string()),
-            )
+            );
+            assert_eq!(
+                db.get(&Arc::new("key1".to_string()), &1, |v: &String| v.clone())
+                    .await,
+                Some("value1".to_string()),
+            );
         });
     }
 }
