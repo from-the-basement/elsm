@@ -78,14 +78,15 @@ where
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
-where
-    K: Ord + Send + Sync,
-    V: Send,
-    O: Oracle<K>,
-    O::Timestamp: Send,
-    WP: WalProvider + Send,
+    where
+        K: Encode + Decode + Ord + Hash + Send + Sync + 'static + Debug,
+        V: Encode + Decode + Send + 'static,
+        O: Oracle<K>,
+        O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
+        WP: WalProvider,
+        WP::File: AsyncWrite + AsyncRead,
 {
-    pub fn new(oracle: O, wal_provider: WP, option: DbOption) -> io::Result<Self> {
+    pub async fn new(oracle: O, wal_provider: WP, option: DbOption) -> Result<Self, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
         let wal_manager = Arc::new(WalManager::new(wal_provider, option.max_wal_size));
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
@@ -93,13 +94,25 @@ where
                 wal: block_on(wal_manager.create_wal_file()).unwrap(),
             })
         });
-        Ok(Db {
+
+        let mut db = Db {
             option,
             oracle,
-            wal_manager,
+            wal_manager: wal_manager.clone(),
             mutable_shards,
             immutable: RwLock::new(VecDeque::new()),
-        })
+        };
+        let mut file_stream = pin!(wal_manager.wal_provider.list());
+
+        while let Some(file) = file_stream.next().await {
+            let file = file.map_err(|err| WriteError::Internal(Box::new(err)))?;
+
+            db.recover(&mut wal_manager.pack_wal_file(file).await.map_err(WriteError::Io)?)
+                .await
+                .map_err(|err| WriteError::Internal(Box::new(err)))?;
+        }
+
+        Ok(db)
     }
 }
 
@@ -283,6 +296,25 @@ where
 
         Ok(IndexBatch { batch, index })
     }
+
+    async fn recover<W>(&mut self, wal: &mut W) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>>
+        where
+            W: WalRecover<Arc<K>, V, O::Timestamp>,
+    {
+        let mut stream = pin!(wal.recover());
+        while let Some(record) = stream.next().await {
+            let Record {
+                record_type,
+                key,
+                ts,
+                value,
+            } = record.map_err(|err| WriteError::Internal(Box::new(err)))?;
+
+            // FIXME: Repeatedly write to WAL
+            self.write(record_type, key, ts, value).await?;
+        }
+        Ok(())
+    }
 }
 
 impl<K, V, O, WP> Oracle<K> for Db<K, V, O, WP>
@@ -388,11 +420,13 @@ mod tests {
 
     use executor::ExecutorBuilder;
     use futures::io::Cursor;
+    use tempfile::TempDir;
 
     use crate::{
         mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
         transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
     };
+    use crate::wal::provider::fs::Fs;
 
     #[test]
     fn read_committed() {
@@ -406,6 +440,7 @@ mod tests {
                         immutable_chunk_num: 1,
                     },
                 )
+                .await
                 .unwrap(),
             );
 
@@ -454,6 +489,7 @@ mod tests {
                         immutable_chunk_num: 1,
                     },
                 )
+                .await
                 .unwrap(),
             );
 
@@ -564,6 +600,51 @@ mod tests {
             value_2.encode(&mut buf).await.unwrap();
             assert_eq!(batch.find(&key_2, &0), Some(buf.get_ref().as_slice()));
             assert_eq!(batch.find(&key_3, &0), Some(vec![].as_slice()));
+        });
+    }
+
+    #[test]
+    fn recover_from_wal() {
+        let temp_dir = TempDir::new().unwrap();
+
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    Fs::new(temp_dir.path()).unwrap(),
+                    DbOption {
+                        max_wal_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                    .await
+                    .unwrap(),
+            );
+
+            let mut txn = db.new_txn();
+            txn.set("key0".to_string(), "value0".to_string());
+            txn.set("key1".to_string(), "value1".to_string());
+            txn.commit().await.unwrap();
+
+            drop(db);
+
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    Fs::new(temp_dir.path()).unwrap(),
+                    DbOption {
+                        max_wal_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                    .await
+                    .unwrap(),
+            );
+
+            assert_eq!(
+                db.get(&Arc::new("key0".to_string()), &1, |v: &String| v.clone()).await,
+                Some("value0".to_string()),
+            )
         });
     }
 }
