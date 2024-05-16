@@ -20,6 +20,8 @@ use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::collections::BTreeMap;
 use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
+use async_lock::Mutex;
+use std::ops::DerefMut;
 use std::pin::pin;
 use std::{error, future::Future, hash::Hash, mem, sync::Arc};
 
@@ -65,13 +67,12 @@ pub struct DbOption {
 }
 
 #[derive(Debug)]
-struct MutableShard<K, V, T, W>
+struct MutableShard<K, V, T>
 where
     K: Ord,
     T: Ord,
 {
     mutable: MemTable<K, V, T>,
-    wal: WalFile<W, Arc<K>, V, T>,
 }
 
 #[derive(Debug)]
@@ -87,16 +88,20 @@ where
     pub(crate) mutable_shards:
         Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
     pub(crate) immutable: RwLock<VecDeque<IndexBatch<K, O::Timestamp>>>,
+    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp>>>,
+    pub(crate) immutable: ArrayQueue<IndexBatch<K, O::Timestamp>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
-    where
-        K: Encode + Decode + Ord + Hash + Send + Sync + 'static + Debug,
-        V: Encode + Decode + Send + 'static,
-        O: Oracle<K>,
-        O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
-        WP: WalProvider,
-        WP::File: AsyncWrite + AsyncRead,
+where
+    K: Encode + Decode + Ord + Hash + Send + Sync + 'static,
+    V: Encode + Decode + Send + 'static,
+    O: Oracle<K>,
+    O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
+    WP: WalProvider,
+    WP::File: AsyncWrite + AsyncRead,
 {
     pub async fn new(
         oracle: O,
@@ -107,9 +112,9 @@ impl<K, V, O, WP> Db<K, V, O, WP>
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
                 mutable: MemTable::default(),
-                wal: block_on(wal_manager.create_wal_file()).unwrap(),
             })
         });
+        let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
         let mut db = Db {
             option,
@@ -117,6 +122,7 @@ impl<K, V, O, WP> Db<K, V, O, WP>
             wal_manager: wal_manager.clone(),
             mutable_shards,
             immutable: RwLock::new(VecDeque::new()),
+            wal,
         };
         let mut file_stream = pin!(wal_manager.wal_provider.list());
 
@@ -160,12 +166,14 @@ where
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(&key), executor::worker_num()) as usize;
         let wal_manager = self.wal_manager.clone();
+        let wal = self.wal.clone();
         let freeze = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
                 let mut local = local.write().await;
-                let result = local
-                    .wal
+                let result = wal
+                    .lock()
+                    .await
                     .write(Record::new(record_type, &key, &ts, value.as_ref()))
                     .await;
                 match result {
@@ -179,13 +187,17 @@ where
                                 .create_wal_file()
                                 .await
                                 .map_err(WriteError::Io)?;
+                            {
+                                let mut guard = wal.lock().await;
+                                mem::swap(guard.deref_mut(), &mut wal_file);
+                            }
+                            wal_file.close().await.map_err(WriteError::Io)?;
                             let mut mem_table = MemTable::default();
                             mem_table.insert(key, ts, value);
 
                             mem::swap(&mut local.wal, &mut wal_file);
                             mem::swap(&mut local.mutable, &mut mem_table);
 
-                            wal_file.close().await.map_err(WriteError::Io)?;
                             Ok(Some(mem_table))
                         } else {
                             Err(e)
