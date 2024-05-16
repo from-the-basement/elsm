@@ -8,8 +8,8 @@ use crate::{record::RecordType, wal::WalRecover};
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct InternalKey<K, T> {
-    key: Arc<K>,
-    ts: T,
+    pub(crate) key: Arc<K>,
+    pub(crate) ts: T,
 }
 
 impl<K, T> PartialOrd<Self> for InternalKey<K, T>
@@ -40,7 +40,7 @@ where
     K: Ord,
     T: Ord,
 {
-    data: BTreeMap<InternalKey<K, T>, Option<V>>,
+    pub(crate) data: BTreeMap<InternalKey<K, T>, Option<V>>,
     max_ts: T,
 }
 
