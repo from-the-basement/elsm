@@ -18,9 +18,8 @@ use std::{
 };
 use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use std::collections::BTreeMap;
-use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 use async_lock::Mutex;
+use std::collections::BTreeMap;
 use std::ops::DerefMut;
 use std::pin::pin;
 use std::{error, future::Future, hash::Hash, mem, sync::Arc};
@@ -31,7 +30,6 @@ use arrow::{
 };
 use async_lock::RwLock;
 use crate::mem_table::InternalKey;
-use crate::record::EncodeError;
 use crate::serdes::Decode;
 use crate::wal::WalRecover;
 use consistent_hash::jump_consistent_hash;
@@ -88,8 +86,6 @@ where
     pub(crate) mutable_shards:
         Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
     pub(crate) immutable: RwLock<VecDeque<IndexBatch<K, O::Timestamp>>>,
-    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp>>>,
-    pub(crate) immutable: ArrayQueue<IndexBatch<K, O::Timestamp>>,
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
 }
@@ -330,9 +326,12 @@ where
         Ok(IndexBatch { batch, index })
     }
 
-    async fn recover<W>(&mut self, wal: &mut W) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>>
-        where
-            W: WalRecover<Arc<K>, V, O::Timestamp>,
+    async fn recover<W>(
+        &mut self,
+        wal: &mut W,
+    ) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>>
+    where
+        W: WalRecover<Arc<K>, V, O::Timestamp>,
     {
         let mut stream = pin!(wal.recover());
         while let Some(record) = stream.next().await {
@@ -453,13 +452,17 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use executor::futures::io::Cursor;
     use executor::ExecutorBuilder;
     use tempfile::TempDir;
 
+    use crate::mem_table::MemTable;
     use crate::wal::provider::fs::Fs;
     use crate::{
         mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
         transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
+        oracle::LocalOracle, serdes::Encode, transaction::CommitError,
+        wal::provider::in_mem::InMemProvider, Db, DbOption,
     };
 
     #[test]
