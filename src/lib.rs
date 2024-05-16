@@ -23,6 +23,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use async_lock::RwLock;
+use crate::mem_table::InternalKey;
 use consistent_hash::jump_consistent_hash;
 use executor::shard::Shard;
 use futures::{executor::block_on, io::Cursor, AsyncWrite};
@@ -33,6 +34,7 @@ use record::{Record, RecordType};
 use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
+use crate::utils::CmpKeyItem;
 
 use crate::{index_batch::IndexBatch, serdes::Decode};
 
