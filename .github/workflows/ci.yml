@@ -33,12 +33,10 @@ jobs:
         with:
           command: check
 
-
       - name: Run cargo build
         uses: actions-rs/cargo@v1
         with:
           command: build
-
 
       - name: Run cargo test
         uses: actions-rs/cargo@v1
@@ -53,7 +51,7 @@ jobs:
       - name: Install latest nightly
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
           override: true
           components: rustfmt, clippy
 
