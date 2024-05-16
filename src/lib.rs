@@ -1,4 +1,5 @@
 mod consistent_hash;
+mod index_batch;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
@@ -6,19 +7,24 @@ pub mod serdes;
 pub mod transaction;
 pub mod wal;
 
-use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use async_lock::RwLock;
-use std::collections::{BTreeMap, Bound};
-use std::fmt::Debug;
-use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    error,
+    fmt::Debug,
+    future::Future,
+    hash::Hash,
+    io, mem,
+    sync::Arc,
+};
 
-use crate::mem_table::InternalKey;
-use crate::serdes::Decode;
+use arrow::{
+    array::{GenericBinaryBuilder, RecordBatch},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+};
+use async_lock::RwLock;
 use consistent_hash::jump_consistent_hash;
 use executor::shard::Shard;
-use futures::io::Cursor;
-use futures::{executor::block_on, AsyncWrite};
+use futures::{executor::block_on, io::Cursor, AsyncWrite};
 use lazy_static::lazy_static;
 use mem_table::MemTable;
 use oracle::Oracle;
@@ -26,6 +32,8 @@ use record::{Record, RecordType};
 use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
+
+use crate::{index_batch::IndexBatch, serdes::Decode};
 
 lazy_static! {
     pub static ref ELSM_SCHEMA: SchemaRef = {
@@ -55,40 +63,6 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct IndexBatch<K, T>
-where
-    K: Ord,
-    T: Ord,
-{
-    batch: RecordBatch,
-    index: BTreeMap<InternalKey<K, T>, u32>,
-}
-
-impl<K, T> IndexBatch<K, T>
-where
-    K: Ord,
-    T: Ord + Copy,
-{
-    pub(crate) fn find(&self, key: &Arc<K>, ts: &T) -> Option<&[u8]> {
-        let internal_key = InternalKey {
-            key: key.clone(),
-            ts: *ts,
-        };
-        self.index
-            .range((Bound::Included(&internal_key), Bound::Unbounded))
-            .next()
-            .and_then(|(InternalKey { key: item_key, .. }, offset)| {
-                (item_key == key).then(|| {
-                    self.batch
-                        .column(1)
-                        .as_binary::<Offset>()
-                        .value(*offset as usize)
-                })
-            })
-    }
-}
-
-#[derive(Debug)]
 pub struct Db<K, V, O, WP>
 where
     K: Ord,
@@ -100,7 +74,7 @@ where
     wal_manager: Arc<WalManager<WP>>,
     pub(crate) mutable_shards:
         Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
-    pub(crate) immutable: RwLock<Vec<IndexBatch<K, O::Timestamp>>>,
+    pub(crate) immutable: RwLock<VecDeque<IndexBatch<K, O::Timestamp>>>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
@@ -124,7 +98,7 @@ where
             oracle,
             wal_manager,
             mutable_shards,
-            immutable: RwLock::new(Vec::new()),
+            immutable: RwLock::new(VecDeque::new()),
         })
     }
 }
@@ -190,7 +164,7 @@ where
             self.immutable
                 .write()
                 .await
-                .push(Self::freeze(mem_table).await?);
+                .push_back(Self::freeze(mem_table).await?);
         }
         Ok(())
     }
@@ -421,12 +395,9 @@ mod tests {
     use executor::ExecutorBuilder;
     use futures::io::Cursor;
 
-    use crate::mem_table::MemTable;
-    use crate::record::RecordType;
-    use crate::serdes::Encode;
     use crate::{
-        oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
-        DbOption,
+        mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
+        transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
     };
 
     #[test]
