@@ -13,29 +13,22 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    io, mem,
+    mem,
+    ops::DerefMut,
+    pin::pin,
     sync::Arc,
 };
-use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use async_lock::Mutex;
-use std::collections::BTreeMap;
-use std::ops::DerefMut;
-use std::pin::pin;
-use std::{error, future::Future, hash::Hash, mem, sync::Arc};
 
 use arrow::{
     array::{GenericBinaryBuilder, RecordBatch},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
-use async_lock::RwLock;
-use crate::mem_table::InternalKey;
-use crate::serdes::Decode;
-use crate::wal::WalRecover;
+use async_lock::{Mutex, RwLock};
 use consistent_hash::jump_consistent_hash;
-use crossbeam_queue::ArrayQueue;
-use executor::futures::{AsyncRead, StreamExt};
-use executor::shard::Shard;
+use executor::{
+    futures::{AsyncRead, StreamExt},
+    shard::Shard,
+};
 use futures::{executor::block_on, io::Cursor, AsyncWrite};
 use lazy_static::lazy_static;
 use mem_table::MemTable;
@@ -45,7 +38,7 @@ use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
-use crate::{index_batch::IndexBatch, serdes::Decode};
+use crate::{index_batch::IndexBatch, serdes::Decode, wal::WalRecover};
 
 lazy_static! {
     pub static ref ELSM_SCHEMA: SchemaRef = {
@@ -83,8 +76,7 @@ where
     option: DbOption,
     pub(crate) oracle: O,
     wal_manager: Arc<WalManager<WP>>,
-    pub(crate) mutable_shards:
-        Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
+    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp>>>,
     pub(crate) immutable: RwLock<VecDeque<IndexBatch<K, O::Timestamp>>>,
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
@@ -191,7 +183,6 @@ where
                             let mut mem_table = MemTable::default();
                             mem_table.insert(key, ts, value);
 
-                            mem::swap(&mut local.wal, &mut wal_file);
                             mem::swap(&mut local.mutable, &mut mem_table);
 
                             Ok(Some(mem_table))
@@ -452,17 +443,17 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use executor::futures::io::Cursor;
-    use executor::ExecutorBuilder;
+    use executor::{futures::io::Cursor, ExecutorBuilder};
     use tempfile::TempDir;
 
-    use crate::mem_table::MemTable;
-    use crate::wal::provider::fs::Fs;
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
-        transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
-        oracle::LocalOracle, serdes::Encode, transaction::CommitError,
-        wal::provider::in_mem::InMemProvider, Db, DbOption,
+        mem_table::MemTable,
+        oracle::LocalOracle,
+        record::RecordType,
+        serdes::Encode,
+        transaction::CommitError,
+        wal::provider::{fs::Fs, in_mem::InMemProvider},
+        Db, DbOption,
     };
 
     #[test]
@@ -581,6 +572,7 @@ mod tests {
                         immutable_chunk_num: 1,
                     },
                 )
+                .await
                 .unwrap(),
             );
 

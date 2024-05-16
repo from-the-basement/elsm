@@ -1,7 +1,6 @@
 mod checksum;
 pub mod provider;
 
-use std::error::Error;
 use std::{
     error::Error,
     future::Future,

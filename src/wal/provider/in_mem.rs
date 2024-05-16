@@ -1,4 +1,3 @@
-use async_stream::stream;
 use std::{
     io,
     pin::{pin, Pin},
@@ -6,6 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use async_stream::stream;
 use crossbeam_queue::SegQueue;
 use executor::futures::Stream;
 use futures::{io::Cursor, ready, AsyncRead, AsyncWrite};

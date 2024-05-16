@@ -1,11 +1,13 @@
+use std::{
+    fs,
+    fs::OpenOptions,
+    io,
+    path::{Path, PathBuf},
+};
+
 use async_stream::stream;
 use executor::futures::Stream;
 use regex::Regex;
-use std::fs::OpenOptions;
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
 
 use super::WalProvider;
 
