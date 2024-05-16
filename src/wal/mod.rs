@@ -2,12 +2,12 @@ mod checksum;
 pub mod provider;
 
 use std::{
+    error::Error,
     future::Future,
     io,
     marker::PhantomData,
     sync::atomic::{AtomicU32, Ordering},
 };
-use std::error::Error;
 
 use async_stream::stream;
 use checksum::{HashReader, HashWriter};

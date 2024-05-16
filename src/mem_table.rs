@@ -1,6 +1,11 @@
-use std::cmp::Ordering;
-use std::collections::btree_map;
-use std::{cmp, collections::BTreeMap, ops::Bound, pin::pin, sync::Arc};
+use std::{
+    cmp,
+    cmp::Ordering,
+    collections::{btree_map, BTreeMap},
+    ops::Bound,
+    pin::pin,
+    sync::Arc,
+};
 
 use futures::StreamExt;
 
@@ -190,7 +195,8 @@ where
     }
 }
 
-/// determine whether the [`MemTableIterator::next`] element is repeated by getting the next item in advance
+/// determine whether the [`MemTableIterator::next`] element is repeated by getting the next item in
+/// advance
 pub(crate) struct MemTableIterator<'a, K, V, T>
 where
     K: Ord,
@@ -225,8 +231,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Bound;
-    use std::sync::Arc;
+    use std::{ops::Bound, sync::Arc};
 
     use futures::{executor::block_on, io::Cursor};
 
