@@ -324,15 +324,17 @@ where
     {
         let mut stream = pin!(wal.recover());
         while let Some(record) = stream.next().await {
-            let Record {
-                record_type,
+            let mut record_type = RecordType::First;
+            let Record { key, ts, value, .. } =
+                record.map_err(|err| WriteError::Internal(Box::new(err)))?;
+
+            self.write(
+                mem::replace(&mut record_type, RecordType::Middle),
                 key,
                 ts,
                 value,
-            } = record.map_err(|err| WriteError::Internal(Box::new(err)))?;
-
-            // FIXME: Repeatedly write to WAL
-            self.write(record_type, key, ts, value).await?;
+            )
+            .await?;
         }
         Ok(())
     }
