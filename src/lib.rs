@@ -169,24 +169,21 @@ where
         Ok(())
     }
 
-    async fn get<G>(
-        &self,
-        key: &Arc<K>,
-        ts: &O::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + 'static + Copy,
-    ) -> Option<G>
+    async fn get<G, F>(&self, key: &Arc<K>, ts: &O::Timestamp, f: F) -> Option<G>
     where
         G: Send + 'static,
         O::Timestamp: Sync,
+        F: Fn(&V) -> G + Sync + 'static,
     {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(key), executor::worker_num()) as usize;
 
         // Safety: read-only would not break data.
-        let (key, ts) = unsafe {
+        let (key, ts, f) = unsafe {
             (
                 mem::transmute::<_, &Arc<K>>(key),
                 mem::transmute::<_, &O::Timestamp>(ts),
+                mem::transmute::<_, &'static F>(&f),
             )
         };
 
@@ -322,15 +319,16 @@ pub trait GetWrite<K, V>: Oracle<K>
 where
     K: Ord,
 {
-    fn get<G>(
+    fn get<G, F>(
         &self,
         key: &Arc<K>,
         ts: &Self::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + 'static + Copy,
+        f: F,
     ) -> impl Future<Output = Option<G>>
     where
         G: Send + 'static,
-        Self::Timestamp: Sync;
+        Self::Timestamp: Sync,
+        F: Fn(&V) -> G + Sync + 'static;
 
     fn write(
         &self,
@@ -366,15 +364,11 @@ where
         Ok(())
     }
 
-    async fn get<G>(
-        &self,
-        key: &Arc<K>,
-        ts: &O::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + 'static + Copy,
-    ) -> Option<G>
+    async fn get<G, F>(&self, key: &Arc<K>, ts: &O::Timestamp, f: F) -> Option<G>
     where
         G: Send + 'static,
         O::Timestamp: Sync,
+        F: Fn(&V) -> G + Sync + 'static,
     {
         Db::get(self, key, ts, f).await
     }
