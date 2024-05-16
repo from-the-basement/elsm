@@ -36,7 +36,7 @@ where
 
     pub async fn get<G, F>(&self, key: &Arc<K>, f: F) -> Option<G>
     where
-        F: FnOnce(&V) -> G + Send + 'static,
+        F: FnOnce(&V) -> G + Send + 'static + Copy,
         G: Send + 'static,
     {
         match self.local.get(key).and_then(|v| v.as_ref()) {

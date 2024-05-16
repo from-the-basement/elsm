@@ -8,13 +8,14 @@ pub mod wal;
 
 use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use std::collections::BTreeMap;
+use async_lock::RwLock;
+use std::collections::{BTreeMap, Bound};
+use std::fmt::Debug;
 use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
 
 use crate::mem_table::InternalKey;
-use crate::record::EncodeError;
+use crate::serdes::Decode;
 use consistent_hash::jump_consistent_hash;
-use crossbeam_queue::ArrayQueue;
 use executor::shard::Shard;
 use futures::io::Cursor;
 use futures::{executor::block_on, AsyncWrite};
@@ -69,16 +70,20 @@ where
     T: Ord + Copy,
 {
     pub(crate) fn find(&self, key: &Arc<K>, ts: &T) -> Option<&[u8]> {
+        let internal_key = InternalKey {
+            key: key.clone(),
+            ts: *ts,
+        };
         self.index
-            .get(&InternalKey {
-                key: key.clone(),
-                ts: *ts,
-            })
-            .map(|offset| {
-                self.batch
-                    .column(1)
-                    .as_binary::<Offset>()
-                    .value(*offset as usize)
+            .range((Bound::Included(&internal_key), Bound::Unbounded))
+            .next()
+            .and_then(|(InternalKey { key: item_key, .. }, offset)| {
+                (item_key == key).then(|| {
+                    self.batch
+                        .column(1)
+                        .as_binary::<Offset>()
+                        .value(*offset as usize)
+                })
             })
     }
 }
@@ -95,7 +100,7 @@ where
     wal_manager: Arc<WalManager<WP>>,
     pub(crate) mutable_shards:
         Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp, WP::File>>>,
-    pub(crate) immutable: ArrayQueue<IndexBatch<K, O::Timestamp>>,
+    pub(crate) immutable: RwLock<Vec<IndexBatch<K, O::Timestamp>>>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
@@ -119,7 +124,7 @@ where
             oracle,
             wal_manager,
             mutable_shards,
-            immutable: ArrayQueue::new(1),
+            immutable: RwLock::new(Vec::new()),
         })
     }
 }
@@ -127,7 +132,7 @@ where
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Send + 'static,
+    V: Encode + Decode + Send + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
@@ -167,6 +172,8 @@ where
                                 .await
                                 .map_err(WriteError::Io)?;
                             let mut mem_table = MemTable::default();
+                            mem_table.insert(key, ts, value);
+
                             mem::swap(&mut local.wal, &mut wal_file);
                             mem::swap(&mut local.mutable, &mut mem_table);
 
@@ -180,9 +187,10 @@ where
             })
             .await?;
         if let Some(mem_table) = freeze {
-            if let Err(mem_table) = self.immutable.push(Self::freeze(mem_table).await?) {
-                let _ = mem_table;
-            }
+            self.immutable
+                .write()
+                .await
+                .push(Self::freeze(mem_table).await?);
         }
         Ok(())
     }
@@ -191,7 +199,7 @@ where
         &self,
         key: &Arc<K>,
         ts: &O::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + 'static,
+        f: impl FnOnce(&V) -> G + Send + 'static + Copy,
     ) -> Option<G>
     where
         G: Send + 'static,
@@ -208,11 +216,31 @@ where
             )
         };
 
-        self.mutable_shards
+        let mut result = self
+            .mutable_shards
             .with(consistent_hash, move |local| async move {
                 local.read().await.mutable.get(key, ts).map(f)
             })
-            .await
+            .await;
+        if result.is_none() {
+            let guard = self.immutable.read().await;
+
+            for index_batch in guard.iter().rev() {
+                if let Some(bytes) = index_batch.find(key, ts) {
+                    if bytes.is_empty() {
+                        return None;
+                    }
+                    let mut cursor = Cursor::new(bytes);
+
+                    if let Ok(value) = V::decode(&mut cursor).await {
+                        result = Some(f(&value));
+                        break;
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     async fn write_batch(
@@ -257,14 +285,16 @@ where
 
         for (offset, (key, value)) in mem_table.data.into_iter().enumerate() {
             clear(&mut buf);
-            key.key.encode(&mut buf)
+            key.key
+                .encode(&mut buf)
                 .await
                 .map_err(|err| WriteError::Internal(Box::new(err)))?;
             key_builder.append_value(buf.get_ref());
 
             if let Some(value) = value {
                 clear(&mut buf);
-                value.encode(&mut buf)
+                value
+                    .encode(&mut buf)
                     .await
                     .map_err(|err| WriteError::Internal(Box::new(err)))?;
                 value_builder.append_value(buf.get_ref());
@@ -322,7 +352,7 @@ where
         &self,
         key: &Arc<K>,
         ts: &Self::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + 'static,
+        f: impl FnOnce(&V) -> G + Send + 'static + Copy,
     ) -> impl Future<Output = Option<G>>
     where
         G: Send + 'static,
@@ -345,7 +375,7 @@ where
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
     K: Encode + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Send + 'static,
+    V: Encode + Decode + Send + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
@@ -366,7 +396,7 @@ where
         &self,
         key: &Arc<K>,
         ts: &O::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + 'static,
+        f: impl FnOnce(&V) -> G + Send + 'static + Copy,
     ) -> Option<G>
     where
         G: Send + 'static,
@@ -392,6 +422,7 @@ mod tests {
     use futures::io::Cursor;
 
     use crate::mem_table::MemTable;
+    use crate::record::RecordType;
     use crate::serdes::Encode;
     use crate::{
         oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
@@ -491,6 +522,47 @@ mod tests {
                 return;
             }
             panic!("unreachable");
+        });
+    }
+
+    #[test]
+    fn read_from_immut_table() {
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let key_1 = Arc::new("key_1".to_owned());
+            let key_2 = Arc::new("key_2".to_owned());
+            let value_1 = "value_1".to_owned();
+            let value_2 = "value_2".to_owned();
+
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption {
+                        // TIPS: kv size in test case is 17
+                        max_wal_size: 20,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                .unwrap(),
+            );
+
+            db.write(RecordType::Full, key_1.clone(), 0, Some(value_1.clone()))
+                .await
+                .unwrap();
+            db.write(RecordType::Full, key_1.clone(), 1, None)
+                .await
+                .unwrap();
+            db.write(RecordType::Full, key_2.clone(), 0, None)
+                .await
+                .unwrap();
+            db.write(RecordType::Full, key_2.clone(), 1, Some(value_2.clone()))
+                .await
+                .unwrap();
+
+            assert_eq!(db.get(&key_1, &0, |v| v.clone()).await, Some(value_1));
+            assert_eq!(db.get(&key_1, &1, |v| v.clone()).await, None);
+            assert_eq!(db.get(&key_2, &0, |v| v.clone()).await, None);
+            assert_eq!(db.get(&key_2, &1, |v| v.clone()).await, Some(value_2));
         });
     }
 
