@@ -8,14 +8,21 @@ pub mod transaction;
 pub(crate) mod utils;
 pub mod wal;
 
-use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use std::collections::{BinaryHeap, Bound, BTreeMap};
-use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
-use std::cmp::Reverse;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, Bound, VecDeque},
+    error,
+    future::Future,
+    hash::Hash,
+    io, mem,
+    sync::Arc,
+};
 
+use arrow::{
+    array::{GenericBinaryBuilder, RecordBatch},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+};
 use async_lock::RwLock;
-use crate::mem_table::InternalKey;
 use consistent_hash::jump_consistent_hash;
 use executor::shard::Shard;
 use futures::{executor::block_on, io::Cursor, AsyncWrite};
@@ -27,9 +34,7 @@ use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
-use crate::{mem_table::InternalKey, utils::CmpKeyItem};
-
-use crate::{index_batch::IndexBatch, serdes::Decode};
+use crate::{index_batch::IndexBatch, serdes::Decode, utils::CmpKeyItem};
 
 lazy_static! {
     pub static ref ELSM_SCHEMA: SchemaRef = {
@@ -449,8 +454,8 @@ mod tests {
     use futures::io::Cursor;
 
     use crate::{
-        oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
-        DbOption,
+        mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
+        transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
     };
 
     #[test]
