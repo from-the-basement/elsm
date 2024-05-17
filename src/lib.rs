@@ -8,20 +8,12 @@ pub mod transaction;
 pub(crate) mod utils;
 pub mod wal;
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    error,
-    fmt::Debug,
-    future::Future,
-    hash::Hash,
-    io, mem,
-    sync::Arc,
-};
+use arrow::array::{AsArray, GenericBinaryBuilder, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use std::collections::{BinaryHeap, Bound, BTreeMap};
+use std::{error, future::Future, hash::Hash, io, mem, sync::Arc};
+use std::cmp::Reverse;
 
-use arrow::{
-    array::{GenericBinaryBuilder, RecordBatch},
-    datatypes::{DataType, Field, Schema, SchemaRef},
-};
 use async_lock::RwLock;
 use crate::mem_table::InternalKey;
 use consistent_hash::jump_consistent_hash;
@@ -34,7 +26,8 @@ use record::{Record, RecordType};
 use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
-use crate::utils::CmpKeyItem;
+
+use crate::{mem_table::InternalKey, utils::CmpKeyItem};
 
 use crate::{index_batch::IndexBatch, serdes::Decode};
 
@@ -257,32 +250,27 @@ where
 
             result
         }
-        let mut arrarys = Vec::with_capacity(executor::worker_num());
-
-        for i in 0..executor::worker_num() {
+        let arrays = futures::future::join_all((0..executor::worker_num()).map(|i| {
             let lower = lower.clone();
             let upper = upper.clone();
             let ts = *ts;
 
-            let items: Vec<_> = self
-                .mutable_shards
-                .with(i, move |local| async move {
-                    let guard = local.read().await;
-                    // TODO: MergeIterator
-                    guard
-                        .mutable
-                        .range(lower.as_ref(), upper.as_ref(), &ts)
-                        .map(|(k, v)| CmpKeyItem {
-                            key: k.clone(),
-                            _value: v.as_ref().map(f),
-                        })
-                        .collect()
-                })
-                .await;
-            arrarys.push(items);
-        }
+            self.mutable_shards.with(i, move |local| async move {
+                let guard = local.read().await;
+                // TODO: MergeIterator
+                guard
+                    .mutable
+                    .range(lower.as_ref(), upper.as_ref(), &ts)
+                    .map(|(k, v)| CmpKeyItem {
+                        key: k.clone(),
+                        _value: v.as_ref().map(f),
+                    })
+                    .collect()
+            })
+        }))
+        .await;
 
-        merge_sort(arrarys)
+        merge_sort(arrays)
     }
 
     async fn write_batch(
@@ -455,15 +443,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::Bound;
-    use std::sync::Arc;
+    use std::{collections::Bound, sync::Arc};
 
     use executor::ExecutorBuilder;
     use futures::io::Cursor;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
-        transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
+        oracle::LocalOracle, transaction::CommitError, wal::provider::in_mem::InMemProvider, Db,
+        DbOption,
     };
 
     #[test]
