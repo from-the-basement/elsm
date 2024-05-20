@@ -9,7 +9,7 @@ use std::{
 
 use futures::StreamExt;
 
-use crate::{record::RecordType, wal::WalRecover};
+use crate::{record::RecordType, serdes::Decode, wal::WalRecover, EIterator};
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct InternalKey<K, T> {
@@ -66,6 +66,7 @@ impl<K, V, T> MemTable<K, V, T>
 where
     K: Ord,
     T: Ord + Copy + Default,
+    V: Decode,
 {
     pub(crate) async fn from_wal<W>(wal: &mut W) -> Result<Self, W::Error>
     where
@@ -124,14 +125,15 @@ where
 impl<K, V, T> MemTable<K, V, T>
 where
     K: Ord,
-    T: Ord + Copy,
+    T: Ord + Copy + Default,
+    V: Decode,
 {
     pub(crate) fn insert(&mut self, key: Arc<K>, ts: T, value: Option<V>) {
         let _ = self.data.insert(InternalKey { key, ts }, value);
         self.max_ts = cmp::max(self.max_ts, ts);
     }
 
-    pub(crate) fn get(&self, key: &Arc<K>, ts: &T) -> Option<&V> {
+    pub(crate) fn get(&self, key: &Arc<K>, ts: &T) -> Option<Option<&V>> {
         let internal_key = InternalKey {
             key: key.clone(),
             ts: *ts,
@@ -143,10 +145,9 @@ where
             .and_then(|(InternalKey { key: item_key, .. }, value)| {
                 (item_key == key).then_some(value.as_ref())
             })
-            .flatten()
     }
 
-    pub(crate) fn iter(&self) -> MemTableIterator<K, V, T> {
+    pub(crate) async fn iter(&self) -> Result<MemTableIterator<K, V, T>, V::Error> {
         let mut iterator = MemTableIterator {
             inner: self
                 .data
@@ -157,46 +158,40 @@ where
             ts: self.max_ts,
         };
         // filling first item
-        let _ = iterator.next();
+        let _ = iterator.try_next().await?;
 
-        iterator
+        Ok(iterator)
     }
 
-    pub(crate) fn range(
+    pub(crate) async fn range(
         &self,
-        lower: Bound<&Arc<K>>,
-        upper: Bound<&Arc<K>>,
+        lower: &Arc<K>,
+        upper: &Arc<K>,
         ts: &T,
-    ) -> MemTableIterator<K, V, T> {
+    ) -> Result<MemTableIterator<K, V, T>, V::Error> {
         let mut iterator = MemTableIterator {
             inner: self.data.range((
-                lower.map(|k| InternalKey {
-                    key: k.clone(),
+                Bound::Included(InternalKey {
+                    key: lower.clone(),
                     ts: *ts,
                 }),
-                upper.map(|k| InternalKey {
-                    key: k.clone(),
-                    ts: *ts,
+                Bound::Included(InternalKey {
+                    key: upper.clone(),
+                    ts: T::default(),
                 }),
             )),
             item_buf: None,
             ts: *ts,
         };
         // filling first item
-        let _ = iterator.next();
-        // only 'Bound::Excluded' and higher ts will cause the first element to be repeated
-        if let (Bound::Excluded(lower), Some((key, _))) = (lower, &iterator.item_buf) {
-            if lower == *key {
-                let _ = iterator.next();
-            }
-        }
+        let _ = iterator.try_next().await?;
 
-        iterator
+        Ok(iterator)
     }
 }
 
-/// determine whether the [`MemTableIterator::next`] element is repeated by getting the next item in
-/// advance
+/// determine whether the [`MemTableIterator::try_next`] element is repeated by getting the next
+/// item in advance
 pub(crate) struct MemTableIterator<'a, K, V, T>
 where
     K: Ord,
@@ -207,14 +202,15 @@ where
     ts: T,
 }
 
-impl<'a, K, V, T> Iterator for MemTableIterator<'a, K, V, T>
+impl<'a, K, V, T> EIterator<K, V::Error> for MemTableIterator<'a, K, V, T>
 where
     K: Ord,
-    T: Ord,
+    T: Ord + Copy,
+    V: Decode,
 {
     type Item = (&'a Arc<K>, &'a Option<V>);
 
-    fn next(&mut self) -> Option<Self::Item> {
+    async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
         for (InternalKey { key, ts }, value) in self.inner.by_ref() {
             if ts <= &self.ts
                 && matches!(
@@ -222,16 +218,16 @@ where
                     Some(true) | None
                 )
             {
-                return self.item_buf.replace((key, value));
+                return Ok(self.item_buf.replace((key, value)));
             }
         }
-        self.item_buf.take()
+        Ok(self.item_buf.take())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Bound, sync::Arc};
+    use std::sync::Arc;
 
     use futures::{executor::block_on, io::Cursor};
 
@@ -239,6 +235,7 @@ mod tests {
     use crate::{
         record::{Record, RecordType},
         wal::{WalFile, WalWrite},
+        EIterator,
     };
 
     #[test]
@@ -259,15 +256,15 @@ mod tests {
 
             mem_table.insert(key_3.clone(), 0, Some(value_3.clone()));
 
-            assert_eq!(mem_table.get(&key_1, &0), Some(&value_1));
-            assert_eq!(mem_table.get(&key_1, &1), Some(&value_1));
-            assert_eq!(mem_table.get(&key_1, &2), Some(&value_1));
+            assert_eq!(mem_table.get(&key_1, &0), Some(Some(&value_1)));
+            assert_eq!(mem_table.get(&key_1, &1), Some(Some(&value_1)));
+            assert_eq!(mem_table.get(&key_1, &2), Some(Some(&value_1)));
 
-            assert_eq!(mem_table.get(&key_3, &0), Some(&value_3));
+            assert_eq!(mem_table.get(&key_3, &0), Some(Some(&value_3)));
 
             assert_eq!(mem_table.get(&key_2, &0), None);
             assert_eq!(mem_table.get(&key_4, &0), None);
-            assert_eq!(mem_table.get(&key_1, &3), Some(&value_1));
+            assert_eq!(mem_table.get(&key_1, &3), Some(Some(&value_1)));
         });
     }
 
@@ -286,17 +283,23 @@ mod tests {
 
             mem_table.insert(key_2.clone(), 0, Some(value_1.clone()));
 
-            let mut iterator = mem_table.iter();
+            let mut iterator = mem_table.iter().await.unwrap();
 
-            assert_eq!(iterator.next(), Some((&key_1, &Some(value_2))));
-            assert_eq!(iterator.next(), Some((&key_2, &Some(value_1))));
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_1, &Some(value_2)))
+            );
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_2, &Some(value_1)))
+            );
 
             drop(iterator);
             mem_table.insert(key_1.clone(), 3, None);
 
-            let mut iterator = mem_table.iter();
+            let mut iterator = mem_table.iter().await.unwrap();
 
-            assert_eq!(iterator.next(), Some((&key_1, &None)));
+            assert_eq!(iterator.try_next().await.unwrap(), Some((&key_1, &None)));
         });
     }
 
@@ -320,20 +323,37 @@ mod tests {
             mem_table.insert(key_3.clone(), 0, Some(value_3.clone()));
             mem_table.insert(key_4.clone(), 0, Some(value_4.clone()));
 
-            let mut iterator = mem_table.iter();
+            let mut iterator = mem_table.iter().await.unwrap();
 
-            assert_eq!(iterator.next(), Some((&key_1, &Some(value_1.clone()))));
-            assert_eq!(iterator.next(), Some((&key_2, &Some(value_3.clone()))));
-            assert_eq!(iterator.next(), Some((&key_3, &Some(value_3.clone()))));
-            assert_eq!(iterator.next(), Some((&key_4, &Some(value_4.clone()))));
-            assert_eq!(iterator.next(), None);
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_1, &Some(value_1.clone())))
+            );
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_2, &Some(value_3.clone())))
+            );
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_3, &Some(value_3.clone())))
+            );
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_4, &Some(value_4.clone())))
+            );
+            assert_eq!(iterator.try_next().await.unwrap(), None);
 
-            let mut iterator =
-                mem_table.range(Bound::Excluded(&key_1), Bound::Excluded(&key_4), &0);
+            let mut iterator = mem_table.range(&key_2, &key_3, &0).await.unwrap();
 
-            assert_eq!(iterator.next(), Some((&key_2, &Some(value_2))));
-            assert_eq!(iterator.next(), Some((&key_3, &Some(value_3))));
-            assert_eq!(iterator.next(), None);
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_2, &Some(value_2)))
+            );
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&key_3, &Some(value_3)))
+            );
+            assert_eq!(iterator.try_next().await.unwrap(), None);
         });
     }
 
@@ -354,7 +374,7 @@ mod tests {
                 let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
                 let mem_table: MemTable<String, String, u64> =
                     MemTable::from_wal(&mut wal).await.unwrap();
-                assert_eq!(mem_table.get(&key, &0), Some(&value));
+                assert_eq!(mem_table.get(&key, &0), Some(Some(&value)));
             }
         });
     }

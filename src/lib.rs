@@ -1,5 +1,6 @@
 mod consistent_hash;
 mod index_batch;
+mod iterator;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
@@ -10,8 +11,9 @@ pub mod wal;
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, Bound, VecDeque},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
     error,
+    fmt::Debug,
     future::Future,
     hash::Hash,
     io, mem,
@@ -106,12 +108,13 @@ where
 
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
-    K: Encode + Ord + Hash + Send + Sync + 'static,
+    K: Encode + Ord + Hash + Send + Sync + 'static + Debug,
     V: Encode + Decode + Send + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
+    io::Error: From<<V as Decode>::Error>,
 {
     pub fn new_txn(self: &Arc<Self>) -> Transaction<K, V, Self> {
         Transaction::new(self.clone())
@@ -188,45 +191,37 @@ where
             )
         };
 
-        let mut result = self
+        if let Some(value) = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
-                local.read().await.mutable.get(key, ts).map(f)
+                local.read().await.mutable.get(key, ts).map(|v| v.map(f))
             })
-            .await;
-        if result.is_none() {
-            let guard = self.immutable.read().await;
+            .await
+        {
+            return value;
+        }
+        let guard = self.immutable.read().await;
 
-            for index_batch in guard.iter().rev() {
-                if let Some(bytes) = index_batch.find(key, ts) {
-                    if bytes.is_empty() {
-                        return None;
-                    }
-                    let mut cursor = Cursor::new(bytes);
-
-                    if let Ok(value) = V::decode(&mut cursor).await {
-                        result = Some(f(&value));
-                        break;
-                    }
-                }
+        for index_batch in guard.iter().rev() {
+            if let Ok(Some(value)) = index_batch.find(key, ts).await {
+                return value.map(|v| f(&v));
             }
         }
-
-        result
+        None
     }
 
     async fn range_scan<G>(
         &self,
-        lower: Bound<Arc<K>>,
-        upper: Bound<Arc<K>>,
+        lower: &Arc<K>,
+        upper: &Arc<K>,
         ts: &O::Timestamp,
         f: impl FnOnce(&V) -> G + Send + Copy + 'static,
-    ) -> Vec<G>
+    ) -> Result<Vec<(Arc<K>, G)>, <V as Decode>::Error>
     where
         G: Send + Sync + 'static,
         O::Timestamp: Sync,
     {
-        fn merge_sort<K, G>(mut arrays: Vec<Vec<CmpKeyItem<Arc<K>, Option<G>>>>) -> Vec<G>
+        fn merge_sort<K, G>(mut arrays: Vec<Vec<CmpKeyItem<Arc<K>, Option<G>>>>) -> Vec<(Arc<K>, G)>
         where
             K: Ord,
         {
@@ -242,9 +237,9 @@ where
 
             let mut result = Vec::new();
 
-            while let Some(Reverse((CmpKeyItem { _value: value, .. }, idx))) = heap.pop() {
+            while let Some(Reverse((CmpKeyItem { key, _value: value }, idx))) = heap.pop() {
                 if let Some(value) = value {
-                    result.push(value);
+                    result.push((key, value));
                 }
                 if arrays[idx].is_empty() {
                     continue;
@@ -255,27 +250,30 @@ where
 
             result
         }
-        let arrays = futures::future::join_all((0..executor::worker_num()).map(|i| {
+        let arrays = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
             let lower = lower.clone();
             let upper = upper.clone();
             let ts = *ts;
 
             self.mutable_shards.with(i, move |local| async move {
                 let guard = local.read().await;
+                let mut items = Vec::new();
+
                 // TODO: MergeIterator
-                guard
-                    .mutable
-                    .range(lower.as_ref(), upper.as_ref(), &ts)
-                    .map(|(k, v)| CmpKeyItem {
+                let mut iter = guard.mutable.range(&lower, &upper, &ts).await?;
+
+                while let Some((k, v)) = iter.try_next().await? {
+                    items.push(CmpKeyItem {
                         key: k.clone(),
                         _value: v.as_ref().map(f),
-                    })
-                    .collect()
+                    });
+                }
+                Ok(items)
             })
         }))
-        .await;
+        .await?;
 
-        merge_sort(arrays)
+        Ok(merge_sort(arrays))
     }
 
     async fn write_batch(
@@ -410,12 +408,13 @@ where
 
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
-    K: Encode + Ord + Hash + Send + Sync + 'static,
+    K: Encode + Ord + Hash + Send + Sync + 'static + Debug,
     V: Encode + Decode + Send + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
+    io::Error: From<<V as Decode>::Error>,
 {
     async fn write(
         &self,
@@ -446,16 +445,26 @@ where
     }
 }
 
+pub trait EIterator<K, E>
+where
+    K: Ord,
+    E: From<io::Error> + std::error::Error + Send + Sync + 'static,
+{
+    type Item;
+
+    #[allow(async_fn_in_trait)]
+    async fn try_next(&mut self) -> Result<Option<Self::Item>, E>;
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::Bound, sync::Arc};
+    use std::sync::Arc;
 
     use executor::ExecutorBuilder;
-    use futures::io::Cursor;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, record::RecordType, serdes::Encode,
-        transaction::CommitError, wal::provider::in_mem::InMemProvider, Db, DbOption,
+        mem_table::MemTable, oracle::LocalOracle, record::RecordType, transaction::CommitError,
+        wal::provider::in_mem::InMemProvider, Db, DbOption,
     };
 
     #[test]
@@ -530,16 +539,17 @@ mod tests {
 
             let items = db
                 .range_scan(
-                    Bound::Excluded(Arc::new("key0".to_string())),
-                    Bound::Excluded(Arc::new("key3".to_string())),
+                    &Arc::new("key1".to_string()),
+                    &Arc::new("key2".to_string()),
                     &1,
                     |v| *v,
                 )
-                .await;
+                .await
+                .unwrap();
 
             assert_eq!(items.len(), 2);
-            assert_eq!(items[0], 1);
-            assert_eq!(items[1], 2);
+            assert_eq!(items[0], (Arc::new("key1".to_string()), 1));
+            assert_eq!(items[1], (Arc::new("key2".to_string()), 2));
         });
     }
 
@@ -634,11 +644,6 @@ mod tests {
 
     #[test]
     fn freeze() {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let key_1 = Arc::new("key_1".to_owned());
             let key_2 = Arc::new("key_2".to_owned());
@@ -657,14 +662,17 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut buf = Cursor::new(Vec::new());
-            value_1.encode(&mut buf).await.unwrap();
-            assert_eq!(batch.find(&key_1, &0), Some(buf.get_ref().as_slice()));
-            assert_eq!(batch.find(&key_1, &1), Some(vec![].as_slice()));
-            clear(&mut buf);
-            value_2.encode(&mut buf).await.unwrap();
-            assert_eq!(batch.find(&key_2, &0), Some(buf.get_ref().as_slice()));
-            assert_eq!(batch.find(&key_3, &0), Some(vec![].as_slice()));
+            assert_eq!(
+                batch.find::<String>(&key_1, &0).await.unwrap(),
+                Some(Some(value_1))
+            );
+            assert_eq!(batch.find::<String>(&key_1, &1).await.unwrap(), Some(None));
+
+            assert_eq!(
+                batch.find::<String>(&key_2, &0).await.unwrap(),
+                Some(Some(value_2))
+            );
+            assert_eq!(batch.find::<String>(&key_3, &0).await.unwrap(), Some(None));
         });
     }
 }

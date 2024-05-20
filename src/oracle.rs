@@ -1,5 +1,6 @@
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashSet},
+    fmt::Debug,
     hash::Hash,
     ops::Bound,
     sync::{
@@ -14,7 +15,7 @@ pub trait Oracle<K>: Sized
 where
     K: Ord,
 {
-    type Timestamp: Ord + Clone + Default;
+    type Timestamp: Ord + Clone + Default + Debug;
 
     fn start_read(&self) -> Self::Timestamp;
 
