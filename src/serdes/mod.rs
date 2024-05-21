@@ -33,7 +33,7 @@ impl<T: Encode> Encode for &T {
 }
 
 pub trait Decode: Sized {
-    type Error: From<io::Error> + std::error::Error + 'static + Sync + Send;
+    type Error: From<io::Error> + std::error::Error + Send + Sync + 'static;
 
     fn decode<R>(reader: &mut R) -> impl Future<Output = Result<Self, Self::Error>>
     where

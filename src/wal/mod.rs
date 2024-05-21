@@ -25,7 +25,7 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct WalManager<WP> {
-    wal_provider: WP,
+    pub(crate) wal_provider: WP,
     file_id: AtomicU32,
     file_max_size: usize,
 }
@@ -45,6 +45,14 @@ where
     pub(crate) async fn create_wal_file<K, V, T>(&self) -> io::Result<WalFile<WP::File, K, V, T>> {
         let file_id = self.file_id.fetch_add(1, Ordering::Relaxed);
         let file = self.wal_provider.open(file_id).await?;
+
+        self.pack_wal_file(file).await
+    }
+
+    pub(crate) async fn pack_wal_file<K, V, T>(
+        &self,
+        file: WP::File,
+    ) -> io::Result<WalFile<WP::File, K, V, T>> {
         Ok(WalFile::new(file, self.file_max_size))
     }
 }
@@ -66,7 +74,7 @@ where
 }
 
 pub trait WalRecover<K, V, T> {
-    type Error: std::error::Error + 'static;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn recover(&mut self) -> impl Stream<Item = Result<Record<K, V, T>, Self::Error>>;
 }

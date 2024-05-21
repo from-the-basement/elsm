@@ -5,7 +5,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use async_stream::stream;
 use crossbeam_queue::SegQueue;
+use executor::futures::Stream;
 use futures::{io::Cursor, ready, AsyncRead, AsyncWrite};
 
 use super::WalProvider;
@@ -29,6 +31,15 @@ impl WalProvider for InMemProvider {
             buf: Some(Cursor::new(Vec::new())),
             wals: self.wals.clone(),
         })
+    }
+
+    fn list(&self) -> impl Stream<Item = io::Result<Self::File>> {
+        stream! {
+            yield Ok(Buf {
+                buf: Some(Cursor::new(Vec::new())),
+                wals: self.wals.clone(),
+            })
+        }
     }
 }
 
