@@ -23,8 +23,8 @@ where
 
 impl<K, T> IndexBatch<K, T>
 where
-    K: Ord + Debug,
-    T: Ord + Copy + Default + Debug,
+    K: Ord,
+    T: Ord + Copy + Default,
 {
     pub(crate) async fn find<V>(&self, key: &Arc<K>, ts: &T) -> Result<Option<Option<V>>, V::Error>
     where
@@ -50,8 +50,8 @@ where
 
     pub(crate) async fn range<V, G, F>(
         &self,
-        lower: Bound<&Arc<K>>,
-        upper: Bound<&Arc<K>>,
+        lower: &Arc<K>,
+        upper: &Arc<K>,
         ts: &T,
         f: F,
     ) -> Result<IndexBatchIterator<K, T, V, G, F>, V::Error>
@@ -63,12 +63,12 @@ where
         let mut iterator = IndexBatchIterator {
             batch: &self.batch,
             inner: self.index.range((
-                lower.map(|k| InternalKey {
-                    key: k.clone(),
+                Bound::Included(&InternalKey {
+                    key: lower.clone(),
                     ts: *ts,
                 }),
-                upper.map(|k| InternalKey {
-                    key: k.clone(),
+                Bound::Included(&InternalKey {
+                    key: upper.clone(),
                     ts: T::default(),
                 }),
             )),
@@ -79,12 +79,7 @@ where
         };
         // filling first item
         let _ = iterator.try_next().await?;
-        // only 'Bound::Excluded' and higher ts will cause the first element to be repeated
-        if let (Bound::Excluded(lower), Some((key, _))) = (lower, &iterator.item_buf) {
-            if lower.as_ref() == *key {
-                let _ = iterator.try_next().await?;
-            }
-        }
+
         Ok(iterator)
     }
 
@@ -113,7 +108,7 @@ where
     F: Fn(&V) -> G + Sync + 'static,
 {
     batch: &'a RecordBatch,
-    item_buf: Option<(&'a K, Option<G>)>,
+    item_buf: Option<(&'a Arc<K>, Option<G>)>,
     inner: Range<'a, InternalKey<K, T>, u32>,
     ts: T,
     f: F,
@@ -122,30 +117,114 @@ where
 
 impl<'a, K, T, V, G, F> EIterator<K, V::Error> for IndexBatchIterator<'a, K, T, V, G, F>
 where
-    K: Ord + Debug,
-    T: Ord + Copy + Default + Debug,
+    K: Ord,
+    T: Ord + Copy + Default,
     V: Decode,
     G: Send + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = (&'a K, Option<G>);
+    type Item = (&'a Arc<K>, Option<G>);
 
     async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
         for (InternalKey { key, ts }, offset) in self.inner.by_ref() {
             if ts <= &self.ts
                 && matches!(
-                    self.item_buf.as_ref().map(|(k, _)| *k != key.as_ref()),
+                    self.item_buf.as_ref().map(|(k, _)| *k != key),
                     Some(true) | None
                 )
             {
                 let g = IndexBatch::<K, T>::decode_value::<V>(self.batch, *offset)
                     .await?
                     .map(|v| (self.f)(&v));
-                if let Some(value) = self.item_buf.replace((key, g)) {
-                    return Ok(Some(value));
-                }
+                return Ok(self.item_buf.replace((key, g)));
             }
         }
         Ok(self.item_buf.take())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use executor::ExecutorBuilder;
+    use futures::executor::block_on;
+
+    use crate::{
+        mem_table::MemTable, oracle::LocalOracle, wal::provider::in_mem::InMemProvider, Db,
+        EIterator,
+    };
+
+    #[test]
+    fn find() {
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let key_1 = Arc::new("key_1".to_owned());
+            let key_2 = Arc::new("key_2".to_owned());
+            let key_3 = Arc::new("key_3".to_owned());
+            let value_1 = "value_1".to_owned();
+            let value_2 = "value_2".to_owned();
+
+            let mut mem_table = MemTable::default();
+
+            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
+            mem_table.insert(key_1.clone(), 1, None);
+            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
+            mem_table.insert(key_3.clone(), 0, None);
+
+            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                batch.find::<String>(&key_1, &0).await.unwrap(),
+                Some(Some(value_1))
+            );
+            assert_eq!(batch.find::<String>(&key_1, &1).await.unwrap(), Some(None));
+
+            assert_eq!(
+                batch.find::<String>(&key_2, &0).await.unwrap(),
+                Some(Some(value_2))
+            );
+            assert_eq!(batch.find::<String>(&key_3, &0).await.unwrap(), Some(None));
+        });
+    }
+
+    #[test]
+    fn range() {
+        block_on(async {
+            let key_0 = Arc::new("key_0".to_owned());
+            let key_1 = Arc::new("key_1".to_owned());
+            let key_2 = Arc::new("key_2".to_owned());
+            let key_3 = Arc::new("key_3".to_owned());
+            let value_1 = "value_1".to_owned();
+            let value_2 = "value_2".to_owned();
+
+            let mut mem_table = MemTable::default();
+
+            mem_table.insert(key_0.clone(), 0, None);
+            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
+            mem_table.insert(key_1.clone(), 1, None);
+            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
+            mem_table.insert(key_3.clone(), 0, None);
+
+            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
+                .await
+                .unwrap();
+
+            let mut iterator = batch
+                .range(&key_1, &key_2, &1, |v: &String| v.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&Arc::new("key_1".to_owned()), None))
+            );
+            assert_eq!(
+                iterator.try_next().await.unwrap(),
+                Some((&Arc::new("key_2".to_owned()), Some(value_2)))
+            );
+            assert_eq!(iterator.try_next().await.unwrap(), None);
+        })
     }
 }

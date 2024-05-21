@@ -1,74 +1,76 @@
-use std::{marker::PhantomData, ptr::NonNull, sync::Arc};
+use std::{io, marker::PhantomData, ptr::NonNull, sync::Arc};
 
-use crate::{serdes::Decode, EIterator};
+use crate::EIterator;
 
-unsafe impl<K, V, G, F> Send for BufIterator<'_, K, V, G, F>
+unsafe impl<K, V, E> Send for BufIterator<'_, K, V, E>
 where
     K: Ord + Sync,
-    V: Decode + Sync,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    V: Sync,
+    E: Sync,
 {
 }
-unsafe impl<K, V, G, F> Sync for BufIterator<'_, K, V, G, F>
+unsafe impl<K, V, E> Sync for BufIterator<'_, K, V, E>
 where
     K: Ord + Sync,
-    V: Decode + Sync,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    V: Sync,
+    E: Sync,
 {
 }
 
-struct BufIterator<'a, K, V, G, F>
+pub(crate) struct BufIterator<'a, K, V, E>
 where
     K: Ord,
-    V: Decode,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
 {
     inner: NonNull<Vec<(Arc<K>, Option<V>)>>,
     pos: usize,
-    f: F,
-    _p: PhantomData<&'a ()>,
+    _p: PhantomData<&'a E>,
 }
 
-impl<'a, K, V, G, F> BufIterator<'a, K, V, G, F>
+impl<'a, K, V, E> BufIterator<'a, K, V, E>
 where
     K: Ord,
-    V: Decode,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    V: 'a,
 {
+    pub(crate) fn new(items: Vec<(Arc<K>, Option<V>)>) -> Self {
+        BufIterator {
+            inner: Box::leak(Box::new(items)).into(),
+            pos: 0,
+            _p: Default::default(),
+        }
+    }
+
     unsafe fn inner(&self) -> &'a [(Arc<K>, Option<V>)] {
         self.inner.as_ref()
     }
+
+    unsafe fn take_item(&mut self) -> (&'a Arc<K>, Option<V>) {
+        let value = self.inner.as_mut()[self.pos].1.take();
+        let key = &self.inner.as_ref()[self.pos].0;
+
+        (key, value)
+    }
 }
 
-impl<'a, K, V, G, F> EIterator<K, V::Error> for BufIterator<'a, K, V, G, F>
+impl<'a, K, V, E> EIterator<K, E> for BufIterator<'a, K, V, E>
 where
     K: Ord + 'a,
-    V: Decode + 'a,
-    G: Send + 'static + Sync + Clone,
-    F: Fn(&V) -> G + Sync + 'static,
+    V: 'a,
+    E: From<io::Error> + std::error::Error + Send + Sync + 'static,
 {
-    type Item = (&'a Arc<K>, Option<G>);
+    type Item = (&'a Arc<K>, Option<V>);
 
-    async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
+    async fn try_next(&mut self) -> Result<Option<Self::Item>, E> {
         Ok(unsafe { self.pos < self.inner().len() }.then(|| {
-            let (k, v) = &unsafe { self.inner() }[self.pos];
+            let result = unsafe { self.take_item() };
             self.pos += 1;
-
-            (k, v.as_ref().map(|v| (self.f)(v)))
+            result
         }))
     }
 }
 
-impl<K, V, G, F> Drop for BufIterator<'_, K, V, G, F>
+impl<K, V, E> Drop for BufIterator<'_, K, V, E>
 where
     K: Ord,
-    V: Decode,
-    G: Send + 'static + Sync,
-    F: Fn(&V) -> G + Sync + 'static,
 {
     fn drop(&mut self) {
         unsafe { drop(Box::from_raw(self.inner.as_ptr())) }
@@ -77,7 +79,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io, sync::Arc};
 
     use futures::executor::block_on;
 
@@ -90,16 +92,10 @@ mod tests {
             let key_2 = Arc::new("key_2".to_owned());
             let value_1 = "value_1".to_owned();
 
-            let mut iter = BufIterator {
-                inner: Box::leak(Box::new(vec![
-                    (key_1.clone(), Some(value_1.clone())),
-                    (key_2.clone(), None),
-                ]))
-                .into(),
-                pos: 0,
-                f: |v: &String| v.clone(),
-                _p: Default::default(),
-            };
+            let mut iter: BufIterator<String, String, io::Error> = BufIterator::new(vec![
+                (key_1.clone(), Some(value_1.clone())),
+                (key_2.clone(), None),
+            ]);
 
             assert_eq!(
                 iter.try_next().await.unwrap(),

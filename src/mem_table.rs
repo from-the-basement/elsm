@@ -147,7 +147,11 @@ where
             })
     }
 
-    pub(crate) async fn iter(&self) -> Result<MemTableIterator<K, V, T>, V::Error> {
+    pub(crate) async fn iter<G, F>(&self, f: F) -> Result<MemTableIterator<K, V, T, G, F>, V::Error>
+    where
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + 'static,
+    {
         let mut iterator = MemTableIterator {
             inner: self
                 .data
@@ -156,6 +160,7 @@ where
                 ),
             item_buf: None,
             ts: self.max_ts,
+            f,
         };
         // filling first item
         let _ = iterator.try_next().await?;
@@ -163,12 +168,17 @@ where
         Ok(iterator)
     }
 
-    pub(crate) async fn range(
+    pub(crate) async fn range<G, F>(
         &self,
         lower: &Arc<K>,
         upper: &Arc<K>,
         ts: &T,
-    ) -> Result<MemTableIterator<K, V, T>, V::Error> {
+        f: F,
+    ) -> Result<MemTableIterator<K, V, T, G, F>, V::Error>
+    where
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + 'static,
+    {
         let mut iterator = MemTableIterator {
             inner: self.data.range((
                 Bound::Included(InternalKey {
@@ -182,6 +192,7 @@ where
             )),
             item_buf: None,
             ts: *ts,
+            f,
         };
         // filling first item
         let _ = iterator.try_next().await?;
@@ -192,23 +203,28 @@ where
 
 /// determine whether the [`MemTableIterator::try_next`] element is repeated by getting the next
 /// item in advance
-pub(crate) struct MemTableIterator<'a, K, V, T>
+pub(crate) struct MemTableIterator<'a, K, V, T, G, F>
 where
     K: Ord,
     T: Ord,
+    G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
 {
     inner: btree_map::Range<'a, InternalKey<K, T>, Option<V>>,
-    item_buf: Option<(&'a Arc<K>, &'a Option<V>)>,
+    item_buf: Option<(&'a Arc<K>, Option<G>)>,
     ts: T,
+    f: F,
 }
 
-impl<'a, K, V, T> EIterator<K, V::Error> for MemTableIterator<'a, K, V, T>
+impl<'a, K, V, T, G, F> EIterator<K, V::Error> for MemTableIterator<'a, K, V, T, G, F>
 where
     K: Ord,
     T: Ord + Copy,
     V: Decode,
+    G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = (&'a Arc<K>, &'a Option<V>);
+    type Item = (&'a Arc<K>, Option<G>);
 
     async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
         for (InternalKey { key, ts }, value) in self.inner.by_ref() {
@@ -218,7 +234,9 @@ where
                     Some(true) | None
                 )
             {
-                return Ok(self.item_buf.replace((key, value)));
+                return Ok(self
+                    .item_buf
+                    .replace((key, value.as_ref().map(|v| (self.f)(v)))));
             }
         }
         Ok(self.item_buf.take())
@@ -283,23 +301,23 @@ mod tests {
 
             mem_table.insert(key_2.clone(), 0, Some(value_1.clone()));
 
-            let mut iterator = mem_table.iter().await.unwrap();
+            let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_1, &Some(value_2)))
+                Some((&key_1, Some(value_2)))
             );
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_2, &Some(value_1)))
+                Some((&key_2, Some(value_1)))
             );
 
             drop(iterator);
             mem_table.insert(key_1.clone(), 3, None);
 
-            let mut iterator = mem_table.iter().await.unwrap();
+            let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
-            assert_eq!(iterator.try_next().await.unwrap(), Some((&key_1, &None)));
+            assert_eq!(iterator.try_next().await.unwrap(), Some((&key_1, None)));
         });
     }
 
@@ -323,35 +341,38 @@ mod tests {
             mem_table.insert(key_3.clone(), 0, Some(value_3.clone()));
             mem_table.insert(key_4.clone(), 0, Some(value_4.clone()));
 
-            let mut iterator = mem_table.iter().await.unwrap();
+            let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_1, &Some(value_1.clone())))
+                Some((&key_1, Some(value_1.clone())))
             );
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_2, &Some(value_3.clone())))
+                Some((&key_2, Some(value_3.clone())))
             );
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_3, &Some(value_3.clone())))
+                Some((&key_3, Some(value_3.clone())))
             );
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_4, &Some(value_4.clone())))
+                Some((&key_4, Some(value_4.clone())))
             );
             assert_eq!(iterator.try_next().await.unwrap(), None);
 
-            let mut iterator = mem_table.range(&key_2, &key_3, &0).await.unwrap();
+            let mut iterator = mem_table
+                .range(&key_2, &key_3, &0, |v| v.clone())
+                .await
+                .unwrap();
 
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_2, &Some(value_2)))
+                Some((&key_2, Some(value_2)))
             );
             assert_eq!(
                 iterator.try_next().await.unwrap(),
-                Some((&key_3, &Some(value_3)))
+                Some((&key_3, Some(value_3)))
             );
             assert_eq!(iterator.try_next().await.unwrap(), None);
         });

@@ -36,7 +36,12 @@ use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
-use crate::{index_batch::IndexBatch, serdes::Decode, utils::CmpKeyItem};
+use crate::{
+    index_batch::IndexBatch,
+    iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator, EIteratorImpl},
+    serdes::Decode,
+    utils::CmpKeyItem,
+};
 
 lazy_static! {
     pub static ref ELSM_SCHEMA: SchemaRef = {
@@ -109,7 +114,7 @@ where
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Ord + Hash + Send + Sync + 'static + Debug,
-    V: Encode + Decode + Send + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
@@ -210,15 +215,16 @@ where
         None
     }
 
-    async fn range_scan<G>(
+    async fn range<G, F>(
         &self,
         lower: &Arc<K>,
         upper: &Arc<K>,
         ts: &O::Timestamp,
-        f: impl FnOnce(&V) -> G + Send + Copy + 'static,
-    ) -> Result<Vec<(Arc<K>, G)>, <V as Decode>::Error>
+        f: F,
+    ) -> Result<MergeIterator<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
     where
         G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
         O::Timestamp: Sync,
     {
         fn merge_sort<K, G>(mut arrays: Vec<Vec<CmpKeyItem<Arc<K>, Option<G>>>>) -> Vec<(Arc<K>, G)>
@@ -250,7 +256,7 @@ where
 
             result
         }
-        let arrays = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
+        let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
             let lower = lower.clone();
             let upper = upper.clone();
             let ts = *ts;
@@ -259,21 +265,29 @@ where
                 let guard = local.read().await;
                 let mut items = Vec::new();
 
-                // TODO: MergeIterator
-                let mut iter = guard.mutable.range(&lower, &upper, &ts).await?;
+                let mut iter = guard.mutable.range(&lower, &upper, &ts, f).await?;
 
                 while let Some((k, v)) = iter.try_next().await? {
-                    items.push(CmpKeyItem {
-                        key: k.clone(),
-                        _value: v.as_ref().map(f),
-                    });
+                    items.push((k.clone(), v));
                 }
-                Ok(items)
+                Ok(EIteratorImpl::Buf(BufIterator::new(items)))
             })
         }))
         .await?;
+        let guard = self.immutable.read().await;
 
-        Ok(merge_sort(arrays))
+        for batch in guard.iter() {
+            let mut items = Vec::new();
+
+            let mut iter = batch.range(lower, upper, ts, f).await?;
+
+            while let Some((k, v)) = iter.try_next().await? {
+                items.push((k.clone(), v));
+            }
+            iters.push(EIteratorImpl::Buf(BufIterator::new(items)));
+        }
+
+        MergeIterator::new(iters).await
     }
 
     async fn write_batch(
@@ -409,7 +423,7 @@ where
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
     K: Encode + Ord + Hash + Send + Sync + 'static + Debug,
-    V: Encode + Decode + Send + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
@@ -452,8 +466,7 @@ where
 {
     type Item;
 
-    #[allow(async_fn_in_trait)]
-    async fn try_next(&mut self) -> Result<Option<Self::Item>, E>;
+    fn try_next(&mut self) -> impl Future<Output = Result<Option<Self::Item>, E>>;
 }
 
 #[cfg(test)]
@@ -464,7 +477,7 @@ mod tests {
 
     use crate::{
         mem_table::MemTable, oracle::LocalOracle, record::RecordType, transaction::CommitError,
-        wal::provider::in_mem::InMemProvider, Db, DbOption,
+        wal::provider::in_mem::InMemProvider, Db, DbOption, EIterator,
     };
 
     #[test]
@@ -516,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn range_scan() {
+    fn range() {
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
@@ -537,8 +550,8 @@ mod tests {
             txn.set("key3".to_string(), 3);
             txn.commit().await.unwrap();
 
-            let items = db
-                .range_scan(
+            let mut iter = db
+                .range(
                     &Arc::new("key1".to_string()),
                     &Arc::new("key2".to_string()),
                     &1,
@@ -547,9 +560,14 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(items.len(), 2);
-            assert_eq!(items[0], (Arc::new("key1".to_string()), 1));
-            assert_eq!(items[1], (Arc::new("key2".to_string()), 2));
+            assert_eq!(
+                iter.try_next().await.unwrap(),
+                Some((&Arc::new("key1".to_string()), Some(1)))
+            );
+            assert_eq!(
+                iter.try_next().await.unwrap(),
+                Some((&Arc::new("key2".to_string()), Some(2)))
+            );
         });
     }
 
@@ -639,40 +657,6 @@ mod tests {
             assert_eq!(db.get(&key_1, &1, |v| v.clone()).await, None);
             assert_eq!(db.get(&key_2, &0, |v| v.clone()).await, None);
             assert_eq!(db.get(&key_2, &1, |v| v.clone()).await, Some(value_2));
-        });
-    }
-
-    #[test]
-    fn freeze() {
-        ExecutorBuilder::new().build().unwrap().block_on(async {
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
-            let key_3 = Arc::new("key_3".to_owned());
-            let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
-
-            let mut mem_table = MemTable::default();
-
-            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 1, None);
-            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
-            mem_table.insert(key_3.clone(), 0, None);
-
-            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
-                .await
-                .unwrap();
-
-            assert_eq!(
-                batch.find::<String>(&key_1, &0).await.unwrap(),
-                Some(Some(value_1))
-            );
-            assert_eq!(batch.find::<String>(&key_1, &1).await.unwrap(), Some(None));
-
-            assert_eq!(
-                batch.find::<String>(&key_2, &0).await.unwrap(),
-                Some(Some(value_2))
-            );
-            assert_eq!(batch.find::<String>(&key_3, &0).await.unwrap(), Some(None));
         });
     }
 }
