@@ -170,8 +170,8 @@ where
 
     pub(crate) async fn range<G, F>(
         &self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
     ) -> Result<MemTableIterator<K, V, T, G, F>, V::Error>
@@ -181,14 +181,22 @@ where
     {
         let mut iterator = MemTableIterator {
             inner: self.data.range((
-                Bound::Included(InternalKey {
-                    key: lower.clone(),
-                    ts: *ts,
-                }),
-                Bound::Included(InternalKey {
-                    key: upper.clone(),
-                    ts: T::default(),
-                }),
+                lower
+                    .map(|k| {
+                        Bound::Included(InternalKey {
+                            key: k.clone(),
+                            ts: *ts,
+                        })
+                    })
+                    .unwrap_or(Bound::Unbounded),
+                upper
+                    .map(|k| {
+                        Bound::Included(InternalKey {
+                            key: k.clone(),
+                            ts: T::default(),
+                        })
+                    })
+                    .unwrap_or(Bound::Unbounded),
             )),
             item_buf: None,
             ts: *ts,
@@ -362,7 +370,7 @@ mod tests {
             assert_eq!(iterator.try_next().await.unwrap(), None);
 
             let mut iterator = mem_table
-                .range(&key_2, &key_3, &0, |v| v.clone())
+                .range(Some(&key_2), Some(&key_3), &0, |v| v.clone())
                 .await
                 .unwrap();
 

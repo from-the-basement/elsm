@@ -250,8 +250,8 @@ where
 
     async fn range<G, F>(
         &self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         ts: &O::Timestamp,
         f: F,
     ) -> Result<MergeIterator<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
@@ -267,8 +267,8 @@ where
 
     pub(crate) async fn inner_range<G, F>(
         &self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
     ) -> Result<Vec<EIteratorImpl<K, <O as Oracle<K>>::Timestamp, V, G, F>>, <V as Decode>::Error>
@@ -277,15 +277,18 @@ where
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
     {
         let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
-            let lower = lower.clone();
-            let upper = upper.clone();
+            let lower = lower.cloned();
+            let upper = upper.cloned();
             let ts = *ts;
 
             self.mutable_shards.with(i, move |local| async move {
                 let guard = local.read().await;
                 let mut items = Vec::new();
 
-                let mut iter = guard.mutable.range(&lower, &upper, &ts, f).await?;
+                let mut iter = guard
+                    .mutable
+                    .range(lower.as_ref(), upper.as_ref(), &ts, f)
+                    .await?;
 
                 while let Some((k, v)) = iter.try_next().await? {
                     items.push((k.clone(), v));
@@ -465,8 +468,8 @@ where
 
     fn inner_range<'a, G, F>(
         &'a self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         ts: &Self::Timestamp,
         f: F,
     ) -> impl Future<
@@ -519,8 +522,8 @@ where
 
     async fn inner_range<'a, G, F>(
         &'a self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
     ) -> Result<Vec<EIteratorImpl<'a, K, <O as Oracle<K>>::Timestamp, V, G, F>>, <V as Decode>::Error>
@@ -633,8 +636,8 @@ mod tests {
 
             let mut iter = db
                 .range(
-                    &Arc::new("key1".to_string()),
-                    &Arc::new("key2".to_string()),
+                    Some(&Arc::new("key1".to_string())),
+                    Some(&Arc::new("key2".to_string())),
                     &1,
                     |v| *v,
                 )
@@ -661,8 +664,8 @@ mod tests {
 
             let mut iter = txn_1
                 .range(
-                    &Arc::new("key1".to_string()),
-                    &Arc::new("key4".to_string()),
+                    Some(&Arc::new("key1".to_string())),
+                    Some(&Arc::new("key4".to_string())),
                     |v| *v,
                 )
                 .await

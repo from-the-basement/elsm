@@ -88,8 +88,8 @@ where
 
     pub async fn range<G, F>(
         &self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         f: F,
     ) -> Result<MergeIterator<K, DB::Timestamp, V, G, F>, V::Error>
     where
@@ -103,8 +103,12 @@ where
         let range = self
             .local
             .range::<Arc<K>, (Bound<&Arc<K>>, Bound<&Arc<K>>)>((
-                Bound::Included(lower),
-                Bound::Included(upper),
+                lower
+                    .map(Bound::Included)
+                    .unwrap_or(Bound::Unbounded),
+                upper
+                    .map(Bound::Included)
+                    .unwrap_or(Bound::Unbounded),
             ));
         let iter = TransactionIter {
             range,

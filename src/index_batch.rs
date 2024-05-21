@@ -50,8 +50,8 @@ where
 
     pub(crate) async fn range<V, G, F>(
         &self,
-        lower: &Arc<K>,
-        upper: &Arc<K>,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
     ) -> Result<IndexBatchIterator<K, T, V, G, F>, V::Error>
@@ -63,14 +63,22 @@ where
         let mut iterator = IndexBatchIterator {
             batch: &self.batch,
             inner: self.index.range((
-                Bound::Included(&InternalKey {
-                    key: lower.clone(),
-                    ts: *ts,
-                }),
-                Bound::Included(&InternalKey {
-                    key: upper.clone(),
-                    ts: T::default(),
-                }),
+                lower
+                    .map(|k| {
+                        Bound::Included(InternalKey {
+                            key: k.clone(),
+                            ts: *ts,
+                        })
+                    })
+                    .unwrap_or(Bound::Unbounded),
+                upper
+                    .map(|k| {
+                        Bound::Included(InternalKey {
+                            key: k.clone(),
+                            ts: T::default(),
+                        })
+                    })
+                    .unwrap_or(Bound::Unbounded),
             )),
             item_buf: None,
             ts: *ts,
@@ -212,7 +220,7 @@ mod tests {
                 .unwrap();
 
             let mut iterator = batch
-                .range(&key_1, &key_2, &1, |v: &String| v.clone())
+                .range(Some(&key_1), Some(&key_2), &1, |v: &String| v.clone())
                 .await
                 .unwrap();
 
