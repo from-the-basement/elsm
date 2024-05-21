@@ -10,8 +10,7 @@ pub(crate) mod utils;
 pub mod wal;
 
 use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     error,
     fmt::Debug,
     future::Future,
@@ -40,7 +39,6 @@ use crate::{
     index_batch::IndexBatch,
     iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator, EIteratorImpl},
     serdes::Decode,
-    utils::CmpKeyItem,
 };
 
 lazy_static! {
@@ -227,35 +225,22 @@ where
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
         O::Timestamp: Sync,
     {
-        fn merge_sort<K, G>(mut arrays: Vec<Vec<CmpKeyItem<Arc<K>, Option<G>>>>) -> Vec<(Arc<K>, G)>
-        where
-            K: Ord,
-        {
-            let mut heap = BinaryHeap::new();
+        let iters = self.inner_range(lower, upper, ts, f).await?;
 
-            for (i, array) in arrays.iter_mut().enumerate() {
-                if array.is_empty() {
-                    continue;
-                }
-                let val = array.remove(0);
-                heap.push(Reverse((val, i)));
-            }
+        MergeIterator::new(iters).await
+    }
 
-            let mut result = Vec::new();
-
-            while let Some(Reverse((CmpKeyItem { key, _value: value }, idx))) = heap.pop() {
-                if let Some(value) = value {
-                    result.push((key, value));
-                }
-                if arrays[idx].is_empty() {
-                    continue;
-                }
-                let next_val = arrays[idx].remove(0);
-                heap.push(Reverse((next_val, idx)));
-            }
-
-            result
-        }
+    pub(crate) async fn inner_range<G, F>(
+        &self,
+        lower: &Arc<K>,
+        upper: &Arc<K>,
+        ts: &<O as Oracle<K>>::Timestamp,
+        f: F,
+    ) -> Result<Vec<EIteratorImpl<K, <O as Oracle<K>>::Timestamp, V, G, F>>, <V as Decode>::Error>
+    where
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+    {
         let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
             let lower = lower.clone();
             let upper = upper.clone();
@@ -286,8 +271,7 @@ where
             }
             iters.push(EIteratorImpl::Buf(BufIterator::new(items)));
         }
-
-        MergeIterator::new(iters).await
+        Ok(iters)
     }
 
     async fn write_batch(
@@ -394,6 +378,7 @@ where
 pub trait GetWrite<K, V>: Oracle<K>
 where
     K: Ord,
+    V: Decode,
 {
     fn get<G, F>(
         &self,
@@ -418,6 +403,21 @@ where
         &self,
         kvs: impl ExactSizeIterator<Item = (Arc<K>, Self::Timestamp, Option<V>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
+
+    fn inner_range<'a, G, F>(
+        &'a self,
+        lower: &Arc<K>,
+        upper: &Arc<K>,
+        ts: &Self::Timestamp,
+        f: F,
+    ) -> impl Future<
+        Output = Result<Vec<EIteratorImpl<'a, K, Self::Timestamp, V, G, F>>, <V as Decode>::Error>,
+    >
+    where
+        K: 'a,
+        V: 'a,
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy;
 }
 
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
@@ -457,6 +457,22 @@ where
         Db::write_batch(self, kvs).await?;
         Ok(())
     }
+
+    async fn inner_range<'a, G, F>(
+        &'a self,
+        lower: &Arc<K>,
+        upper: &Arc<K>,
+        ts: &<O as Oracle<K>>::Timestamp,
+        f: F,
+    ) -> Result<Vec<EIteratorImpl<'a, K, <O as Oracle<K>>::Timestamp, V, G, F>>, <V as Decode>::Error>
+    where
+        K: 'a,
+        V: 'a,
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+    {
+        Db::inner_range(self, lower, upper, ts, f).await
+    }
 }
 
 pub trait EIterator<K, E>
@@ -476,7 +492,7 @@ mod tests {
     use executor::ExecutorBuilder;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, record::RecordType, transaction::CommitError,
+        oracle::LocalOracle, record::RecordType, transaction::CommitError,
         wal::provider::in_mem::InMemProvider, Db, DbOption, EIterator,
     };
 
@@ -567,6 +583,41 @@ mod tests {
             assert_eq!(
                 iter.try_next().await.unwrap(),
                 Some((&Arc::new("key2".to_string()), Some(2)))
+            );
+
+            let mut txn_1 = db.new_txn();
+            txn_1.set("key5".to_string(), 5);
+            txn_1.set("key4".to_string(), 4);
+
+            let mut txn_2 = db.new_txn();
+            txn_2.set("key5".to_string(), 4);
+            txn_2.set("key4".to_string(), 5);
+            txn_2.commit().await.unwrap();
+
+            let mut iter = txn_1
+                .range(
+                    &Arc::new("key1".to_string()),
+                    &Arc::new("key4".to_string()),
+                    |v| *v,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                iter.try_next().await.unwrap(),
+                Some((&Arc::new("key1".to_string()), Some(1)))
+            );
+            assert_eq!(
+                iter.try_next().await.unwrap(),
+                Some((&Arc::new("key2".to_string()), Some(2)))
+            );
+            assert_eq!(
+                iter.try_next().await.unwrap(),
+                Some((&Arc::new("key3".to_string()), Some(3)))
+            );
+            assert_eq!(
+                iter.try_next().await.unwrap(),
+                Some((&Arc::new("key4".to_string()), Some(4)))
             );
         });
     }

@@ -15,7 +15,7 @@ pub trait Oracle<K>: Sized
 where
     K: Ord,
 {
-    type Timestamp: Ord + Clone + Default + Debug;
+    type Timestamp: Ord + Clone + Copy + Default + Debug;
 
     fn start_read(&self) -> Self::Timestamp;
 

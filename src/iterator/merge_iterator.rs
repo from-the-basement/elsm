@@ -2,7 +2,7 @@ use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
 use crate::{iterator::EIteratorImpl, serdes::Decode, utils::CmpKeyItem, EIterator};
 
-pub(crate) struct MergeIterator<'a, K, T, V, G, F>
+pub struct MergeIterator<'a, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,

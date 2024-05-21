@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     index_batch::IndexBatchIterator, iterator::buf_iterator::BufIterator,
-    mem_table::MemTableIterator, serdes::Decode, EIterator,
+    mem_table::MemTableIterator, serdes::Decode, transaction::TransactionIter, EIterator,
 };
 
 pub(crate) mod buf_iterator;
@@ -19,6 +19,7 @@ where
     Buf(BufIterator<'a, K, G, V::Error>),
     IndexBatch(IndexBatchIterator<'a, K, T, V, G, F>),
     MemTable(MemTableIterator<'a, K, V, T, G, F>),
+    TransactionInner(TransactionIter<'a, K, V, G, F, V::Error>),
 }
 
 impl<'a, K, T, V, G, F> EIteratorImpl<'a, K, T, V, G, F>
@@ -34,6 +35,7 @@ where
             EIteratorImpl::Buf(iter) => iter.try_next().await,
             EIteratorImpl::IndexBatch(iter) => iter.try_next().await,
             EIteratorImpl::MemTable(iter) => iter.try_next().await,
+            EIteratorImpl::TransactionInner(iter) => iter.try_next().await,
         }
     }
 }
