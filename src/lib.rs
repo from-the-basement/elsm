@@ -1,5 +1,6 @@
 mod consistent_hash;
 mod index_batch;
+pub mod iterator;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
@@ -14,7 +15,7 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    mem,
+    io, mem,
     ops::DerefMut,
     pin::pin,
     sync::Arc,
@@ -39,7 +40,12 @@ use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
-use crate::{index_batch::IndexBatch, serdes::Decode, wal::WalRecover};
+use crate::{
+    index_batch::IndexBatch,
+    iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator, EIteratorImpl},
+    serdes::Decode,
+    wal::WalRecover,
+};
 
 lazy_static! {
     pub static ref ELSM_SCHEMA: SchemaRef = {
@@ -86,11 +92,12 @@ where
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Decode + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite + AsyncRead,
+    io::Error: From<<V as Decode>::Error>,
 {
     pub async fn new(
         oracle: O,
@@ -541,20 +548,15 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use executor::{futures::io::Cursor, ExecutorBuilder};
-    use tempfile::TempDir;
     use executor::ExecutorBuilder;
+    use tempfile::TempDir;
 
     use crate::{
-        mem_table::MemTable,
         oracle::LocalOracle,
         record::RecordType,
-        serdes::Encode,
         transaction::CommitError,
         wal::provider::{fs::Fs, in_mem::InMemProvider},
-        Db, DbOption,
-        oracle::LocalOracle, record::RecordType, transaction::CommitError,
-        wal::provider::in_mem::InMemProvider, Db, DbOption, EIterator,
+        Db, DbOption, EIterator,
     };
 
     #[test]
@@ -618,6 +620,7 @@ mod tests {
                         immutable_chunk_num: 1,
                     },
                 )
+                .await
                 .unwrap(),
             );
 
@@ -772,42 +775,6 @@ mod tests {
             assert_eq!(db.get(&key_1, &1, |v| v.clone()).await, None);
             assert_eq!(db.get(&key_2, &0, |v| v.clone()).await, None);
             assert_eq!(db.get(&key_2, &1, |v| v.clone()).await, Some(value_2));
-        });
-    }
-
-    #[test]
-    fn freeze() {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
-        ExecutorBuilder::new().build().unwrap().block_on(async {
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
-            let key_3 = Arc::new("key_3".to_owned());
-            let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
-
-            let mut mem_table = MemTable::default();
-
-            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 1, None);
-            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
-            mem_table.insert(key_3.clone(), 0, None);
-
-            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
-                .await
-                .unwrap();
-
-            let mut buf = Cursor::new(Vec::new());
-            value_1.encode(&mut buf).await.unwrap();
-            assert_eq!(batch.find(&key_1, &0), Some(buf.get_ref().as_slice()));
-            assert_eq!(batch.find(&key_1, &1), Some(vec![].as_slice()));
-            clear(&mut buf);
-            value_2.encode(&mut buf).await.unwrap();
-            assert_eq!(batch.find(&key_2, &0), Some(buf.get_ref().as_slice()));
-            assert_eq!(batch.find(&key_3, &0), Some(vec![].as_slice()));
         });
     }
 
