@@ -30,7 +30,7 @@ where
 
 impl<K, V, DB> Transaction<K, V, DB>
 where
-    K: Hash + Ord,
+    K: Hash + Ord + Send + Sync,
     V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
     DB::Timestamp: Send + Sync,
@@ -134,13 +134,14 @@ where
     F: Fn(&V) -> G + Sync + 'static,
     E: From<io::Error> + std::error::Error + Send + Sync + 'static,
 {
-    type Item = Result<(&'a Arc<K>, Option<G>), E>;
+    type Item = Result<(Arc<K>, Option<G>), E>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.get_unchecked_mut() };
         Poll::Ready(
-            self.range
+            this.range
                 .next()
-                .map(|(key, value)| (key, value.as_ref().map(|v| (self.f)(v))))
+                .map(|(key, value)| (key.clone(), value.as_ref().map(|v| (this.f)(v))))
                 .map(Ok),
         )
     }

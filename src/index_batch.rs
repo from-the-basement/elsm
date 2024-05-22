@@ -56,13 +56,13 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<Pin<Box<IndexBatchIterator<K, T, V, G, F>>>, V::Error>
+    ) -> Result<Pin<Box<IndexBatchStream<K, T, V, G, F>>>, V::Error>
     where
         V: Decode + Sync + Send,
         G: Send + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = Box::pin(IndexBatchIterator {
+        let mut iterator = Box::pin(IndexBatchStream {
             batch: &self.batch,
             inner: self.index.range((
                 lower
@@ -109,7 +109,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct IndexBatchIterator<'a, K, T, V, G, F>
+pub(crate) struct IndexBatchStream<'a, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,
@@ -118,14 +118,14 @@ where
     F: Fn(&V) -> G + Sync + 'static,
 {
     batch: &'a RecordBatch,
-    item_buf: Option<(&'a Arc<K>, Option<G>)>,
+    item_buf: Option<(Arc<K>, Option<G>)>,
     inner: Range<'a, InternalKey<K, T>, u32>,
     ts: T,
     f: F,
     _p: PhantomData<V>,
 }
 
-impl<'a, K, T, V, G, F> Stream for IndexBatchIterator<'a, K, T, V, G, F>
+impl<'a, K, T, V, G, F> Stream for IndexBatchStream<'a, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,
@@ -133,23 +133,24 @@ where
     G: Send + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = Result<(&'a Arc<K>, Option<G>), V::Error>;
+    type Item = Result<(Arc<K>, Option<G>), V::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        for (InternalKey { key, ts }, offset) in self.inner.by_ref() {
-            if ts <= &self.ts
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        for (InternalKey { key, ts }, offset) in this.inner.by_ref() {
+            if ts <= &this.ts
                 && matches!(
-                    self.item_buf.as_ref().map(|(k, _)| *k != key),
+                    this.item_buf.as_ref().map(|(k, _)| k != key),
                     Some(true) | None
                 )
             {
                 let mut future =
-                    Box::pin(IndexBatch::<K, T>::decode_value::<V>(self.batch, *offset));
+                    Box::pin(IndexBatch::<K, T>::decode_value::<V>(this.batch, *offset));
 
                 return match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(option)) => Poll::Ready(
-                        self.item_buf
-                            .replace((key, option.map(|v| (self.f)(&v))))
+                        this.item_buf
+                            .replace((key.clone(), option.map(|v| (this.f)(&v))))
                             .map(Ok),
                     ),
                     Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
@@ -157,7 +158,7 @@ where
                 };
             }
         }
-        Poll::Ready(self.item_buf.take().map(Ok))
+        Poll::Ready(this.item_buf.take().map(Ok))
     }
 }
 
@@ -235,11 +236,11 @@ mod tests {
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (&Arc::new("key_1".to_owned()), None)
+                (Arc::new("key_1".to_owned()), None)
             );
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (&Arc::new("key_2".to_owned()), Some(value_2))
+                (Arc::new("key_2".to_owned()), Some(value_2))
             );
             assert!(iterator.next().await.is_none())
         })

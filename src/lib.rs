@@ -42,7 +42,7 @@ use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 use crate::{
     index_batch::IndexBatch,
-    iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator},
+    iterator::{buf_iterator::BufStream, merge_iterator::MergeIterator},
     serdes::Decode,
     wal::WalRecover,
 };
@@ -265,14 +265,14 @@ where
         MergeIterator::new(iters).await
     }
 
-    pub(crate) async fn inner_range<G, F>(
-        &self,
+    pub(crate) async fn inner_range<'s, G, F>(
+        &'s self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
     ) -> Result<
-        Vec<Pin<Box<dyn Stream<Item = Result<(&Arc<K>, Option<G>), <V as Decode>::Error>>>>>,
+        Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), <V as Decode>::Error>> + Send>>>,
         <V as Decode>::Error,
     >
     where
@@ -300,7 +300,17 @@ where
 
                     items.push((k.clone(), v));
                 }
-                Ok(Box::pin(BufIterator::new(items)))
+                Ok(Box::pin(BufStream::new(items))
+                    as Pin<
+                        Box<
+                            dyn futures::Stream<
+                                    Item = std::result::Result<
+                                        (std::sync::Arc<K>, std::option::Option<G>),
+                                        <V as serdes::Decode>::Error,
+                                    >,
+                                > + Send,
+                        >,
+                    >)
             })
         }))
         .await?;
@@ -316,7 +326,17 @@ where
 
                 items.push((k.clone(), v));
             }
-            iters.push(Box::pin(BufIterator::new(items)));
+            iters.push(Box::pin(BufStream::new(items))
+                as Pin<
+                    Box<
+                        dyn futures::Stream<
+                                Item = std::result::Result<
+                                    (std::sync::Arc<K>, std::option::Option<G>),
+                                    <V as serdes::Decode>::Error,
+                                >,
+                            > + Send,
+                    >,
+                >);
         }
         Ok(iters)
     }
@@ -475,21 +495,19 @@ where
         kvs: impl ExactSizeIterator<Item = (Arc<K>, Self::Timestamp, Option<V>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
-    fn inner_range<'a, G, F>(
-        &'a self,
+    fn inner_range<G, F>(
+        &self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         ts: &Self::Timestamp,
         f: F,
     ) -> impl Future<
         Output = Result<
-            Vec<Pin<Box<dyn Stream<Item = Result<(&'a Arc<K>, Option<G>), V::Error>>>>>,
+            Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), V::Error>> + Send>>>,
             <V as Decode>::Error,
         >,
     >
     where
-        K: 'a,
-        V: 'a,
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy;
 }
@@ -532,19 +550,17 @@ where
         Ok(())
     }
 
-    async fn inner_range<'a, G, F>(
-        &'a self,
+    async fn inner_range<G, F>(
+        &self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
     ) -> Result<
-        Vec<Pin<Box<dyn Stream<Item = Result<(&'a Arc<K>, Option<G>), <V as Decode>::Error>>>>>,
+        Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), <V as Decode>::Error>> + Send>>>,
         <V as Decode>::Error,
     >
     where
-        K: 'a,
-        V: 'a,
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
     {
@@ -661,11 +677,11 @@ mod tests {
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (&Arc::new("key1".to_string()), Some(1))
+                (Arc::new("key1".to_string()), Some(1))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (&Arc::new("key2".to_string()), Some(2))
+                (Arc::new("key2".to_string()), Some(2))
             );
 
             let mut txn_1 = db.new_txn();
@@ -688,19 +704,19 @@ mod tests {
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (&Arc::new("key1".to_string()), Some(1))
+                (Arc::new("key1".to_string()), Some(1))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (&Arc::new("key2".to_string()), Some(2))
+                (Arc::new("key2".to_string()), Some(2))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (&Arc::new("key3".to_string()), Some(3))
+                (Arc::new("key3".to_string()), Some(3))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (&Arc::new("key4".to_string()), Some(4))
+                (Arc::new("key4".to_string()), Some(4))
             );
         });
     }

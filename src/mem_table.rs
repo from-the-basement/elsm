@@ -152,12 +152,12 @@ where
     pub(crate) async fn iter<G, F>(
         &self,
         f: F,
-    ) -> Result<Pin<Box<MemTableIterator<K, V, T, G, F>>>, V::Error>
+    ) -> Result<Pin<Box<MemTableStream<K, V, T, G, F>>>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = Box::pin(MemTableIterator {
+        let mut iterator = Box::pin(MemTableStream {
             inner: self
                 .data
                 .range::<InternalKey<K, T>, (Bound<InternalKey<K, T>>, Bound<InternalKey<K, T>>)>(
@@ -179,12 +179,12 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<Pin<Box<MemTableIterator<K, V, T, G, F>>>, V::Error>
+    ) -> Result<Pin<Box<MemTableStream<K, V, T, G, F>>>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = Box::pin(MemTableIterator {
+        let mut iterator = Box::pin(MemTableStream {
             inner: self.data.range((
                 lower
                     .map(|k| {
@@ -216,7 +216,7 @@ where
 
 /// determine whether the [`MemTableIterator::try_next`] element is repeated by getting the next
 /// item in advance
-pub(crate) struct MemTableIterator<'a, K, V, T, G, F>
+pub(crate) struct MemTableStream<'a, K, V, T, G, F>
 where
     K: Ord,
     T: Ord,
@@ -229,7 +229,7 @@ where
     f: F,
 }
 
-impl<'a, K, V, T, G, F> Stream for MemTableIterator<'a, K, V, T, G, F>
+impl<'a, K, V, T, G, F> Stream for MemTableStream<'a, K, V, T, G, F>
 where
     K: Ord,
     T: Ord + Copy,
@@ -240,21 +240,22 @@ where
     type Item = Result<(&'a Arc<K>, Option<G>), V::Error>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        for (InternalKey { key, ts }, value) in self.inner.by_ref() {
-            if ts <= &self.ts
+        let this = unsafe { self.get_unchecked_mut() };
+        for (InternalKey { key, ts }, value) in this.inner.by_ref() {
+            if ts <= &this.ts
                 && matches!(
-                    self.item_buf.as_ref().map(|(k, _)| *k != key),
+                    this.item_buf.as_ref().map(|(k, _)| *k != key),
                     Some(true) | None
                 )
             {
                 return Poll::Ready(
-                    self.item_buf
-                        .replace((key, value.as_ref().map(|v| (self.f)(v))))
+                    this.item_buf
+                        .replace((key, value.as_ref().map(|v| (this.f)(v))))
                         .map(Ok),
                 );
             }
         }
-        Poll::Ready(self.item_buf.take().map(Ok))
+        Poll::Ready(this.item_buf.take().map(Ok))
     }
 }
 
