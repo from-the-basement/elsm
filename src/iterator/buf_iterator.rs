@@ -1,4 +1,13 @@
-use std::{io, marker::PhantomData, ptr::NonNull, sync::Arc};
+use std::{
+    io,
+    marker::PhantomData,
+    pin::Pin,
+    ptr::NonNull,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
+use executor::futures::Stream;
 
 use crate::EIterator;
 
@@ -64,6 +73,23 @@ where
             let result = unsafe { self.take_item() };
             self.pos += 1;
             result
+        }))
+    }
+}
+
+impl<'a, K, V, E> Stream for BufIterator<'a, K, V, E>
+where
+    K: Ord + 'a,
+    V: 'a,
+    E: From<io::Error> + std::error::Error + Send + Sync + 'static,
+{
+    type Item = Result<(&'a Arc<K>, Option<V>), E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(unsafe { self.pos < self.inner().len() }.then(|| {
+            let result = unsafe { self.take_item() };
+            self.pos += 1;
+            Ok(result)
         }))
     }
 }

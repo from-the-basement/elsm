@@ -3,13 +3,15 @@ use std::{
     fmt::Debug,
     iter::Iterator,
     marker::PhantomData,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 use arrow::array::{AsArray, RecordBatch};
-use executor::futures::util::io::Cursor;
+use executor::futures::{util::io::Cursor, FutureExt, Stream, StreamExt};
 
-use crate::{mem_table::InternalKey, serdes::Decode, EIterator, Offset};
+use crate::{mem_table::InternalKey, serdes::Decode, Offset};
 
 #[derive(Debug)]
 pub(crate) struct IndexBatch<K, T>
@@ -28,7 +30,7 @@ where
 {
     pub(crate) async fn find<V>(&self, key: &Arc<K>, ts: &T) -> Result<Option<Option<V>>, V::Error>
     where
-        V: Decode,
+        V: Decode + Sync + Send,
     {
         let internal_key = InternalKey {
             key: key.clone(),
@@ -54,13 +56,13 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<IndexBatchIterator<K, T, V, G, F>, V::Error>
+    ) -> Result<Pin<Box<IndexBatchIterator<K, T, V, G, F>>>, V::Error>
     where
-        V: Decode,
+        V: Decode + Sync + Send,
         G: Send + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = IndexBatchIterator {
+        let mut iterator = Box::pin(IndexBatchIterator {
             batch: &self.batch,
             inner: self.index.range((
                 lower
@@ -84,16 +86,16 @@ where
             ts: *ts,
             f,
             _p: Default::default(),
-        };
+        });
         // filling first item
-        let _ = iterator.try_next().await?;
+        let _ = iterator.next().await;
 
         Ok(iterator)
     }
 
     async fn decode_value<V>(batch: &RecordBatch, offset: u32) -> Result<Option<V>, V::Error>
     where
-        V: Decode,
+        V: Decode + Sync + Send,
     {
         let bytes = batch.column(1).as_binary::<Offset>().value(offset as usize);
 
@@ -123,17 +125,17 @@ where
     _p: PhantomData<V>,
 }
 
-impl<'a, K, T, V, G, F> EIterator<K, V::Error> for IndexBatchIterator<'a, K, T, V, G, F>
+impl<'a, K, T, V, G, F> Stream for IndexBatchIterator<'a, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,
-    V: Decode,
+    V: Decode + Send + Sync,
     G: Send + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = (&'a Arc<K>, Option<G>);
+    type Item = Result<(&'a Arc<K>, Option<G>), V::Error>;
 
-    async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         for (InternalKey { key, ts }, offset) in self.inner.by_ref() {
             if ts <= &self.ts
                 && matches!(
@@ -141,13 +143,21 @@ where
                     Some(true) | None
                 )
             {
-                let g = IndexBatch::<K, T>::decode_value::<V>(self.batch, *offset)
-                    .await?
-                    .map(|v| (self.f)(&v));
-                return Ok(self.item_buf.replace((key, g)));
+                let mut future =
+                    Box::pin(IndexBatch::<K, T>::decode_value::<V>(self.batch, *offset));
+
+                return match future.as_mut().poll(cx) {
+                    Poll::Ready(Ok(option)) => Poll::Ready(
+                        self.item_buf
+                            .replace((key, option.map(|v| (self.f)(&v))))
+                            .map(Ok),
+                    ),
+                    Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
+                    Poll::Pending => Poll::Pending,
+                };
             }
         }
-        Ok(self.item_buf.take())
+        Poll::Ready(self.item_buf.take().map(Ok))
     }
 }
 
@@ -155,12 +165,11 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use executor::ExecutorBuilder;
+    use executor::{futures::StreamExt, ExecutorBuilder};
     use futures::executor::block_on;
 
     use crate::{
         mem_table::MemTable, oracle::LocalOracle, wal::provider::in_mem::InMemProvider, Db,
-        EIterator,
     };
 
     #[test]
@@ -225,14 +234,14 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_1".to_owned()), None))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_1".to_owned()), None)
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_2".to_owned()), Some(value_2)))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_2".to_owned()), Some(value_2))
             );
-            assert_eq!(iterator.try_next().await.unwrap(), None);
+            assert!(iterator.next().await.is_none())
         })
     }
 }

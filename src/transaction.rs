@@ -4,16 +4,16 @@ use std::{
     io,
     marker::PhantomData,
     ops::Bound,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
 
+use executor::futures::Stream;
 use thiserror::Error;
 
 use crate::{
-    iterator::{merge_iterator::MergeIterator, EIteratorImpl},
-    oracle::WriteConflict,
-    serdes::Decode,
-    EIterator, GetWrite,
+    iterator::merge_iterator::MergeIterator, oracle::WriteConflict, serdes::Decode, GetWrite,
 };
 
 #[derive(Debug)]
@@ -31,7 +31,7 @@ where
 impl<K, V, DB> Transaction<K, V, DB>
 where
     K: Hash + Ord,
-    V: Decode,
+    V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
     DB::Timestamp: Send + Sync,
 {
@@ -91,7 +91,7 @@ where
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         f: F,
-    ) -> Result<MergeIterator<K, DB::Timestamp, V, G, F>, V::Error>
+    ) -> Result<MergeIterator<K, V, G>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Send + Sync + 'static + Copy,
@@ -103,19 +103,15 @@ where
         let range = self
             .local
             .range::<Arc<K>, (Bound<&Arc<K>>, Bound<&Arc<K>>)>((
-                lower
-                    .map(Bound::Included)
-                    .unwrap_or(Bound::Unbounded),
-                upper
-                    .map(Bound::Included)
-                    .unwrap_or(Bound::Unbounded),
+                lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
+                upper.map(Bound::Included).unwrap_or(Bound::Unbounded),
             ));
         let iter = TransactionIter {
             range,
             f,
             _p: Default::default(),
         };
-        iters.insert(0, EIteratorImpl::TransactionInner(iter));
+        iters.insert(0, Box::pin(iter));
 
         MergeIterator::new(iters).await
     }
@@ -131,20 +127,22 @@ where
     _p: PhantomData<E>,
 }
 
-impl<'a, K, V, E, G, F> EIterator<K, E> for TransactionIter<'a, K, V, G, F, E>
+impl<'a, K, V, E, G, F> Stream for TransactionIter<'a, K, V, G, F, E>
 where
     K: Ord,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
     E: From<io::Error> + std::error::Error + Send + Sync + 'static,
 {
-    type Item = (&'a Arc<K>, Option<G>);
+    type Item = Result<(&'a Arc<K>, Option<G>), E>;
 
-    async fn try_next(&mut self) -> Result<Option<Self::Item>, E> {
-        Ok(self
-            .range
-            .next()
-            .map(|(key, value)| (key, value.as_ref().map(|v| (self.f)(v)))))
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(
+            self.range
+                .next()
+                .map(|(key, value)| (key, value.as_ref().map(|v| (self.f)(v))))
+                .map(Ok),
+        )
     }
 }
 

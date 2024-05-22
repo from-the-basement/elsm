@@ -17,7 +17,7 @@ use std::{
     hash::Hash,
     io, mem,
     ops::DerefMut,
-    pin::pin,
+    pin::{pin, Pin},
     sync::Arc,
 };
 
@@ -28,7 +28,7 @@ use arrow::{
 use async_lock::{Mutex, RwLock};
 use consistent_hash::jump_consistent_hash;
 use executor::{
-    futures::{AsyncRead, StreamExt},
+    futures::{AsyncRead, Stream, StreamExt},
     shard::Shard,
 };
 use futures::{executor::block_on, io::Cursor, AsyncWrite};
@@ -42,7 +42,7 @@ use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 use crate::{
     index_batch::IndexBatch,
-    iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator, EIteratorImpl},
+    iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator},
     serdes::Decode,
     wal::WalRecover,
 };
@@ -254,7 +254,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &O::Timestamp,
         f: F,
-    ) -> Result<MergeIterator<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
+    ) -> Result<MergeIterator<K, V, G>, <V as Decode>::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -271,7 +271,10 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<Vec<EIteratorImpl<K, <O as Oracle<K>>::Timestamp, V, G, F>>, <V as Decode>::Error>
+    ) -> Result<
+        Vec<Pin<Box<dyn Stream<Item = Result<(&Arc<K>, Option<G>), <V as Decode>::Error>>>>>,
+        <V as Decode>::Error,
+    >
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -285,15 +288,19 @@ where
                 let guard = local.read().await;
                 let mut items = Vec::new();
 
-                let mut iter = guard
-                    .mutable
-                    .range(lower.as_ref(), upper.as_ref(), &ts, f)
-                    .await?;
+                let mut iter = Box::pin(
+                    guard
+                        .mutable
+                        .range(lower.as_ref(), upper.as_ref(), &ts, f)
+                        .await?,
+                );
 
-                while let Some((k, v)) = iter.try_next().await? {
+                while let Some(item) = iter.next().await {
+                    let (k, v) = item?;
+
                     items.push((k.clone(), v));
                 }
-                Ok(EIteratorImpl::Buf(BufIterator::new(items)))
+                Ok(Box::pin(BufIterator::new(items)))
             })
         }))
         .await?;
@@ -302,12 +309,14 @@ where
         for batch in guard.iter() {
             let mut items = Vec::new();
 
-            let mut iter = batch.range(lower, upper, ts, f).await?;
+            let mut iter = Box::pin(batch.range(lower, upper, ts, f).await?);
 
-            while let Some((k, v)) = iter.try_next().await? {
+            while let Some(item) = iter.next().await {
+                let (k, v) = item?;
+
                 items.push((k.clone(), v));
             }
-            iters.push(EIteratorImpl::Buf(BufIterator::new(items)));
+            iters.push(Box::pin(BufIterator::new(items)));
         }
         Ok(iters)
     }
@@ -473,7 +482,10 @@ where
         ts: &Self::Timestamp,
         f: F,
     ) -> impl Future<
-        Output = Result<Vec<EIteratorImpl<'a, K, Self::Timestamp, V, G, F>>, <V as Decode>::Error>,
+        Output = Result<
+            Vec<Pin<Box<dyn Stream<Item = Result<(&'a Arc<K>, Option<G>), V::Error>>>>>,
+            <V as Decode>::Error,
+        >,
     >
     where
         K: 'a,
@@ -526,7 +538,10 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<Vec<EIteratorImpl<'a, K, <O as Oracle<K>>::Timestamp, V, G, F>>, <V as Decode>::Error>
+    ) -> Result<
+        Vec<Pin<Box<dyn Stream<Item = Result<(&'a Arc<K>, Option<G>), <V as Decode>::Error>>>>>,
+        <V as Decode>::Error,
+    >
     where
         K: 'a,
         V: 'a,
@@ -551,7 +566,7 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use executor::ExecutorBuilder;
+    use executor::{futures::StreamExt, ExecutorBuilder};
     use tempfile::TempDir;
 
     use crate::{
@@ -559,7 +574,7 @@ mod tests {
         record::RecordType,
         transaction::CommitError,
         wal::provider::{fs::Fs, in_mem::InMemProvider},
-        Db, DbOption, EIterator,
+        Db, DbOption,
     };
 
     #[test]
@@ -645,12 +660,12 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                iter.try_next().await.unwrap(),
-                Some((&Arc::new("key1".to_string()), Some(1)))
+                iter.next().await.unwrap().unwrap(),
+                (&Arc::new("key1".to_string()), Some(1))
             );
             assert_eq!(
-                iter.try_next().await.unwrap(),
-                Some((&Arc::new("key2".to_string()), Some(2)))
+                iter.next().await.unwrap().unwrap(),
+                (&Arc::new("key2".to_string()), Some(2))
             );
 
             let mut txn_1 = db.new_txn();
@@ -672,20 +687,20 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                iter.try_next().await.unwrap(),
-                Some((&Arc::new("key1".to_string()), Some(1)))
+                iter.next().await.unwrap().unwrap(),
+                (&Arc::new("key1".to_string()), Some(1))
             );
             assert_eq!(
-                iter.try_next().await.unwrap(),
-                Some((&Arc::new("key2".to_string()), Some(2)))
+                iter.next().await.unwrap().unwrap(),
+                (&Arc::new("key2".to_string()), Some(2))
             );
             assert_eq!(
-                iter.try_next().await.unwrap(),
-                Some((&Arc::new("key3".to_string()), Some(3)))
+                iter.next().await.unwrap().unwrap(),
+                (&Arc::new("key3".to_string()), Some(3))
             );
             assert_eq!(
-                iter.try_next().await.unwrap(),
-                Some((&Arc::new("key4".to_string()), Some(4)))
+                iter.next().await.unwrap().unwrap(),
+                (&Arc::new("key4".to_string()), Some(4))
             );
         });
     }

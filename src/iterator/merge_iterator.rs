@@ -1,61 +1,71 @@
-use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use crate::{iterator::EIteratorImpl, serdes::Decode, utils::CmpKeyItem, EIterator};
+use executor::futures::StreamExt;
+use futures::Stream;
 
-pub struct MergeIterator<'a, K, T, V, G, F>
+use crate::{serdes::Decode, utils::CmpKeyItem};
+
+pub struct MergeIterator<'a, K, V, G>
 where
     K: Ord,
-    T: Ord + Copy + Default,
-    V: Decode,
+    V: Decode + Send + Sync,
     G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
 {
     #[allow(clippy::type_complexity)]
     heap: BinaryHeap<Reverse<(CmpKeyItem<&'a Arc<K>, Option<G>>, usize)>>,
-    iters: Vec<EIteratorImpl<'a, K, T, V, G, F>>,
+    iters: Vec<Pin<Box<dyn Stream<Item = Result<(&'a Arc<K>, Option<G>), V::Error>>>>>,
     item_buf: Option<(&'a Arc<K>, Option<G>)>,
 }
 
-impl<'a, K, T, V, G, F> MergeIterator<'a, K, T, V, G, F>
+impl<'a, K, V, G> MergeIterator<'a, K, V, G>
 where
     K: Ord,
-    T: Ord + Copy + Default,
-    V: Decode,
+    V: Decode + Send + Sync,
     G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
 {
     pub(crate) async fn new(
-        mut iters: Vec<EIteratorImpl<'a, K, T, V, G, F>>,
+        mut iters: Vec<Pin<Box<dyn Stream<Item = Result<(&'a Arc<K>, Option<G>), V::Error>>>>>,
     ) -> Result<Self, V::Error> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
-            if let Some((key, value)) = iter.try_next().await? {
+            if let Some(result) = iter.next().await {
+                let (key, value) = result?;
+
                 heap.push(Reverse((CmpKeyItem { key, _value: value }, i)));
             }
         }
-        let mut iterator = MergeIterator {
+        let mut iterator = Box::pin(MergeIterator {
             iters,
             heap,
             item_buf: None,
-        };
-        let _ = iterator.try_next().await?;
+        });
+        let _ = iterator.next().await;
 
-        Ok(iterator)
+        unsafe {
+            let raw: *mut MergeIterator<K, V, G> =
+                Box::into_raw(Pin::into_inner_unchecked(iterator));
+
+            Ok(*Box::from_raw(raw))
+        }
     }
 }
 
-impl<'a, K, T, V, G, F> EIterator<K, V::Error> for MergeIterator<'a, K, T, V, G, F>
+impl<'a, K, V, G> Stream for MergeIterator<'a, K, V, G>
 where
     K: Ord,
-    T: Ord + Copy + Default,
-    V: Decode,
+    V: Decode + Send + Sync,
     G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = (&'a Arc<K>, Option<G>);
+    type Item = Result<(&'a Arc<K>, Option<G>), V::Error>;
 
-    async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         while let Some(Reverse((
             CmpKeyItem {
                 key: item_key,
@@ -64,19 +74,24 @@ where
             idx,
         ))) = self.heap.pop()
         {
-            if let Some((key, value)) = self.iters[idx].try_next().await? {
-                self.heap
-                    .push(Reverse((CmpKeyItem { key, _value: value }, idx)));
+            match self.iters[idx].poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    let (key, value) = item?;
+                    self.heap
+                        .push(Reverse((CmpKeyItem { key, _value: value }, idx)));
 
-                if let Some((buf_key, _)) = &self.item_buf {
-                    if *buf_key == item_key {
-                        continue;
+                    if let Some((buf_key, _)) = &self.item_buf {
+                        if *buf_key == item_key {
+                            continue;
+                        }
                     }
                 }
-            }
-            return Ok(self.item_buf.replace((item_key, item_value)));
+                Poll::Ready(None) => (),
+                Poll::Pending => return Poll::Pending,
+            };
+            return Poll::Ready(self.item_buf.replace((item_key, item_value)).map(Ok));
         }
-        Ok(self.item_buf.take())
+        Poll::Ready(self.item_buf.take().map(Ok))
     }
 }
 
@@ -84,12 +99,10 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use executor::futures::StreamExt;
     use futures::executor::block_on;
 
-    use crate::{
-        iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator, EIteratorImpl},
-        EIterator,
-    };
+    use crate::iterator::{buf_iterator::BufIterator, merge_iterator::MergeIterator};
 
     #[test]
     fn iter() {
@@ -108,38 +121,37 @@ mod tests {
                 (Arc::new("key_6".to_owned()), None),
             ]);
 
-            let mut iterator =
-                MergeIterator::<String, u64, String, String, fn(&String) -> String>::new(vec![
-                    EIteratorImpl::<String, u64, String, String, _>::Buf(iter_3),
-                    EIteratorImpl::<String, u64, String, String, _>::Buf(iter_2),
-                    EIteratorImpl::<String, u64, String, String, _>::Buf(iter_1),
-                ])
-                .await
-                .unwrap();
+            let mut iterator = MergeIterator::<String, String, String>::new(vec![
+                Box::pin(iter_3),
+                Box::pin(iter_2),
+                Box::pin(iter_1),
+            ])
+            .await
+            .unwrap();
 
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_1".to_owned()), None))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_1".to_owned()), None)
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_2".to_owned()), Some("value_2".to_owned())))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_2".to_owned()), Some("value_2".to_owned()))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_3".to_owned()), None))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_3".to_owned()), None)
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_4".to_owned()), None))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_4".to_owned()), None)
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_5".to_owned()), Some("value_3".to_owned())))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_5".to_owned()), Some("value_3".to_owned()))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&Arc::new("key_6".to_owned()), None))
+                iterator.next().await.unwrap().unwrap(),
+                (&Arc::new("key_6".to_owned()), None)
             );
         });
     }

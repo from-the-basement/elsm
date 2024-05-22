@@ -3,13 +3,15 @@ use std::{
     cmp::Ordering,
     collections::{btree_map, BTreeMap},
     ops::Bound,
-    pin::pin,
+    pin::{pin, Pin},
     sync::Arc,
+    task::{Context, Poll},
 };
 
+use executor::futures::Stream;
 use futures::StreamExt;
 
-use crate::{record::RecordType, serdes::Decode, wal::WalRecover, EIterator};
+use crate::{record::RecordType, serdes::Decode, wal::WalRecover};
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct InternalKey<K, T> {
@@ -147,12 +149,15 @@ where
             })
     }
 
-    pub(crate) async fn iter<G, F>(&self, f: F) -> Result<MemTableIterator<K, V, T, G, F>, V::Error>
+    pub(crate) async fn iter<G, F>(
+        &self,
+        f: F,
+    ) -> Result<Pin<Box<MemTableIterator<K, V, T, G, F>>>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = MemTableIterator {
+        let mut iterator = Box::pin(MemTableIterator {
             inner: self
                 .data
                 .range::<InternalKey<K, T>, (Bound<InternalKey<K, T>>, Bound<InternalKey<K, T>>)>(
@@ -161,9 +166,9 @@ where
             item_buf: None,
             ts: self.max_ts,
             f,
-        };
+        });
         // filling first item
-        let _ = iterator.try_next().await?;
+        let _ = iterator.next().await;
 
         Ok(iterator)
     }
@@ -174,12 +179,12 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<MemTableIterator<K, V, T, G, F>, V::Error>
+    ) -> Result<Pin<Box<MemTableIterator<K, V, T, G, F>>>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = MemTableIterator {
+        let mut iterator = Box::pin(MemTableIterator {
             inner: self.data.range((
                 lower
                     .map(|k| {
@@ -201,9 +206,9 @@ where
             item_buf: None,
             ts: *ts,
             f,
-        };
+        });
         // filling first item
-        let _ = iterator.try_next().await?;
+        let _ = iterator.next().await;
 
         Ok(iterator)
     }
@@ -224,7 +229,7 @@ where
     f: F,
 }
 
-impl<'a, K, V, T, G, F> EIterator<K, V::Error> for MemTableIterator<'a, K, V, T, G, F>
+impl<'a, K, V, T, G, F> Stream for MemTableIterator<'a, K, V, T, G, F>
 where
     K: Ord,
     T: Ord + Copy,
@@ -232,9 +237,9 @@ where
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = (&'a Arc<K>, Option<G>);
+    type Item = Result<(&'a Arc<K>, Option<G>), V::Error>;
 
-    async fn try_next(&mut self) -> Result<Option<Self::Item>, V::Error> {
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         for (InternalKey { key, ts }, value) in self.inner.by_ref() {
             if ts <= &self.ts
                 && matches!(
@@ -242,12 +247,14 @@ where
                     Some(true) | None
                 )
             {
-                return Ok(self
-                    .item_buf
-                    .replace((key, value.as_ref().map(|v| (self.f)(v)))));
+                return Poll::Ready(
+                    self.item_buf
+                        .replace((key, value.as_ref().map(|v| (self.f)(v))))
+                        .map(Ok),
+                );
             }
         }
-        Ok(self.item_buf.take())
+        Poll::Ready(self.item_buf.take().map(Ok))
     }
 }
 
@@ -255,13 +262,13 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use executor::futures::StreamExt;
     use futures::{executor::block_on, io::Cursor};
 
     use super::MemTable;
     use crate::{
         record::{Record, RecordType},
         wal::{WalFile, WalWrite},
-        EIterator,
     };
 
     #[test]
@@ -312,12 +319,12 @@ mod tests {
             let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_1, Some(value_2)))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_1, Some(value_2))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_2, Some(value_1)))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_2, Some(value_1))
             );
 
             drop(iterator);
@@ -325,7 +332,7 @@ mod tests {
 
             let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
-            assert_eq!(iterator.try_next().await.unwrap(), Some((&key_1, None)));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (&key_1, None));
         });
     }
 
@@ -352,22 +359,22 @@ mod tests {
             let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_1, Some(value_1.clone())))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_1, Some(value_1.clone()))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_2, Some(value_3.clone())))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_2, Some(value_3.clone()))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_3, Some(value_3.clone())))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_3, Some(value_3.clone()))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_4, Some(value_4.clone())))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_4, Some(value_4.clone()))
             );
-            assert_eq!(iterator.try_next().await.unwrap(), None);
+            assert!(iterator.next().await.is_none());
 
             let mut iterator = mem_table
                 .range(Some(&key_2), Some(&key_3), &0, |v| v.clone())
@@ -375,14 +382,14 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_2, Some(value_2)))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_2, Some(value_2))
             );
             assert_eq!(
-                iterator.try_next().await.unwrap(),
-                Some((&key_3, Some(value_3)))
+                iterator.next().await.unwrap().unwrap(),
+                (&key_3, Some(value_3))
             );
-            assert_eq!(iterator.try_next().await.unwrap(), None);
+            assert!(iterator.next().await.is_none())
         });
     }
 
