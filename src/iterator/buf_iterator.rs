@@ -85,12 +85,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
-    use std::pin::{pin, Pin};
-    use std::sync::Arc;
+    use std::{
+        convert::Infallible,
+        pin::{pin, Pin},
+        sync::Arc,
+    };
 
-    use futures::executor::block_on;
-    use futures::StreamExt;
+    use futures::{executor::block_on, StreamExt};
 
     use crate::iterator::buf_iterator::BufStream;
 

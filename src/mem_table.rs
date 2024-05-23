@@ -214,8 +214,6 @@ where
     }
 }
 
-/// determine whether the [`MemTableIterator::try_next`] element is repeated by getting the next
-/// item in advance
 pub(crate) struct MemTableStream<'a, K, V, T, G, F>
 where
     K: Ord,

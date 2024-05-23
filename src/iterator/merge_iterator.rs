@@ -9,7 +9,7 @@ use std::{
 use executor::futures::StreamExt;
 use futures::Stream;
 
-use crate::{serdes::Decode, utils::CmpKeyItem};
+use crate::{iterator::PinStream, serdes::Decode, utils::CmpKeyItem};
 
 pub struct MergeIterator<'stream, K, V, G>
 where
@@ -19,7 +19,7 @@ where
 {
     #[allow(clippy::type_complexity)]
     heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<K>, Option<G>>, usize)>>,
-    iters: Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), V::Error>> + Send + 'stream>>>,
+    iters: Vec<PinStream<'stream, K, G, V::Error>>,
     item_buf: Option<(Arc<K>, Option<G>)>,
 }
 
@@ -30,9 +30,7 @@ where
     G: Send + Sync + 'static,
 {
     pub(crate) async fn new(
-        mut iters: Vec<
-            Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), V::Error>> + Send + 'stream>>,
-        >,
+        mut iters: Vec<PinStream<'stream, K, G, V::Error>>,
     ) -> Result<Self, V::Error> {
         let mut heap = BinaryHeap::new();
 
