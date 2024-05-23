@@ -1,10 +1,10 @@
 mod consistent_hash;
-mod index_batch;
-pub mod iterator;
+pub(crate) mod index_batch;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
 pub mod serdes;
+pub mod stream;
 pub mod transaction;
 pub(crate) mod utils;
 pub mod wal;
@@ -17,7 +17,7 @@ use std::{
     hash::Hash,
     io, mem,
     ops::DerefMut,
-    pin::{pin, Pin},
+    pin::pin,
     sync::Arc,
 };
 
@@ -28,7 +28,7 @@ use arrow::{
 use async_lock::{Mutex, RwLock};
 use consistent_hash::jump_consistent_hash;
 use executor::{
-    futures::{AsyncRead, Stream, StreamExt},
+    futures::{AsyncRead, StreamExt},
     shard::Shard,
 };
 use futures::{executor::block_on, io::Cursor, AsyncWrite};
@@ -42,8 +42,8 @@ use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 use crate::{
     index_batch::IndexBatch,
-    iterator::{buf_iterator::BufStream, merge_iterator::MergeIterator},
     serdes::Decode,
+    stream::{buf_stream::BufStream, merge_stream::MergeIterator, EStreamImpl},
     wal::WalRecover,
 };
 
@@ -254,7 +254,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &O::Timestamp,
         f: F,
-    ) -> Result<MergeIterator<K, V, G>, <V as Decode>::Error>
+    ) -> Result<MergeIterator<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -262,7 +262,7 @@ where
     {
         let iters = self.inner_range(lower, upper, ts, f).await?;
 
-        MergeIterator::new(iters).await
+        unsafe { MergeIterator::new(iters) }.await
     }
 
     pub(crate) async fn inner_range<'s, G, F>(
@@ -271,10 +271,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<
-        Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), <V as Decode>::Error>> + Send>>>,
-        <V as Decode>::Error,
-    >
+    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -300,17 +297,7 @@ where
 
                     items.push((k.clone(), v));
                 }
-                Ok(Box::pin(BufStream::new(items))
-                    as Pin<
-                        Box<
-                            dyn futures::Stream<
-                                    Item = std::result::Result<
-                                        (std::sync::Arc<K>, std::option::Option<G>),
-                                        <V as serdes::Decode>::Error,
-                                    >,
-                                > + Send,
-                        >,
-                    >)
+                Ok(EStreamImpl::Buf(BufStream::new(items)))
             })
         }))
         .await?;
@@ -326,17 +313,7 @@ where
 
                 items.push((k.clone(), v));
             }
-            iters.push(Box::pin(BufStream::new(items))
-                as Pin<
-                    Box<
-                        dyn futures::Stream<
-                                Item = std::result::Result<
-                                    (std::sync::Arc<K>, std::option::Option<G>),
-                                    <V as serdes::Decode>::Error,
-                                >,
-                            > + Send,
-                    >,
-                >);
+            iters.push(EStreamImpl::Buf(BufStream::new(items)));
         }
         Ok(iters)
     }
@@ -495,19 +472,19 @@ where
         kvs: impl ExactSizeIterator<Item = (Arc<K>, Self::Timestamp, Option<V>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
-    fn inner_range<G, F>(
-        &self,
+    fn inner_range<'a, G, F>(
+        &'a self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         ts: &Self::Timestamp,
         f: F,
     ) -> impl Future<
-        Output = Result<
-            Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), V::Error>> + Send>>>,
-            <V as Decode>::Error,
-        >,
+        Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, <V as Decode>::Error>,
     >
     where
+        K: 'a,
+        Self::Timestamp: 'a,
+        V: 'a,
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy;
 }
@@ -550,17 +527,17 @@ where
         Ok(())
     }
 
-    async fn inner_range<G, F>(
-        &self,
+    async fn inner_range<'a, G, F>(
+        &'a self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<
-        Vec<Pin<Box<dyn Stream<Item = Result<(Arc<K>, Option<G>), <V as Decode>::Error>> + Send>>>,
-        <V as Decode>::Error,
-    >
+    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
     where
+        K: 'a,
+        Self::Timestamp: 'a,
+        V: 'a,
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
     {

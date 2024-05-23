@@ -93,7 +93,7 @@ mod tests {
 
     use futures::{executor::block_on, StreamExt};
 
-    use crate::iterator::buf_iterator::BufStream;
+    use crate::stream::buf_stream::BufStream;
 
     #[test]
 

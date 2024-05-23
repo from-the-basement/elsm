@@ -13,7 +13,10 @@ use executor::futures::Stream;
 use thiserror::Error;
 
 use crate::{
-    iterator::merge_iterator::MergeIterator, oracle::WriteConflict, serdes::Decode, GetWrite,
+    oracle::WriteConflict,
+    serdes::Decode,
+    stream::{merge_stream::MergeIterator, EStreamImpl},
+    GetWrite,
 };
 
 #[derive(Debug)]
@@ -91,7 +94,7 @@ where
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         f: F,
-    ) -> Result<MergeIterator<K, V, G>, V::Error>
+    ) -> Result<MergeIterator<K, DB::Timestamp, V, G, F>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Send + Sync + 'static + Copy,
@@ -106,18 +109,18 @@ where
                 lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
                 upper.map(Bound::Included).unwrap_or(Bound::Unbounded),
             ));
-        let iter = TransactionIter {
+        let iter = TransactionStream {
             range,
             f,
             _p: Default::default(),
         };
-        iters.insert(0, Box::pin(iter));
+        iters.insert(0, EStreamImpl::TransactionInner(iter));
 
-        MergeIterator::new(iters).await
+        unsafe { MergeIterator::new(iters).await }
     }
 }
 
-pub(crate) struct TransactionIter<'a, K, V, G, F, E>
+pub(crate) struct TransactionStream<'a, K, V, G, F, E>
 where
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
@@ -127,7 +130,7 @@ where
     _p: PhantomData<E>,
 }
 
-impl<'a, K, V, E, G, F> Stream for TransactionIter<'a, K, V, G, F, E>
+impl<'a, K, V, E, G, F> Stream for TransactionStream<'a, K, V, G, F, E>
 where
     K: Ord,
     G: Send + Sync + 'static,

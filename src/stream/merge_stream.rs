@@ -9,33 +9,38 @@ use std::{
 use executor::futures::StreamExt;
 use futures::Stream;
 
-use crate::{iterator::PinStream, serdes::Decode, utils::CmpKeyItem};
+use crate::{serdes::Decode, stream::EStreamImpl, utils::CmpKeyItem};
 
-pub struct MergeIterator<'stream, K, V, G>
+pub struct MergeIterator<'stream, K, T, V, G, F>
 where
     K: Ord,
+    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
 {
     #[allow(clippy::type_complexity)]
     heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<K>, Option<G>>, usize)>>,
-    iters: Vec<PinStream<'stream, K, G, V::Error>>,
+    iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
     item_buf: Option<(Arc<K>, Option<G>)>,
 }
 
-impl<'stream, K, V, G> MergeIterator<'stream, K, V, G>
+impl<'stream, K, T, V, G, F> MergeIterator<'stream, K, T, V, G, F>
 where
     K: Ord,
+    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
 {
-    pub(crate) async fn new(
-        mut iters: Vec<PinStream<'stream, K, G, V::Error>>,
+    pub(crate) async unsafe fn new(
+        mut iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
     ) -> Result<Self, V::Error> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
-            if let Some(result) = iter.next().await {
+            // WARNING: Pin security cannot be guaranteed here
+            if let Some(result) = unsafe { Pin::new_unchecked(iter) }.next().await {
                 let (key, value) = result?;
 
                 heap.push(Reverse((CmpKeyItem { key, _value: value }, i)));
@@ -49,7 +54,7 @@ where
         let _ = iterator.next().await;
 
         unsafe {
-            let raw: *mut MergeIterator<K, V, G> =
+            let raw: *mut MergeIterator<K, T, V, G, F> =
                 Box::into_raw(Pin::into_inner_unchecked(iterator));
 
             Ok(*Box::from_raw(raw))
@@ -57,11 +62,13 @@ where
     }
 }
 
-impl<'stream, K, V, G> Stream for MergeIterator<'stream, K, V, G>
+impl<'stream, K, T, V, G, F> Stream for MergeIterator<'stream, K, T, V, G, F>
 where
     K: Ord,
+    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
 {
     type Item = Result<(Arc<K>, Option<G>), V::Error>;
 
@@ -75,7 +82,7 @@ where
             idx,
         ))) = this.heap.pop()
         {
-            match this.iters[idx].poll_next(cx) {
+            match unsafe { Pin::new_unchecked(&mut this.iters[idx]) }.poll_next(cx) {
                 Poll::Ready(Some(item)) => {
                     let (key, value) = item?;
                     this.heap
@@ -103,7 +110,7 @@ mod tests {
     use executor::futures::StreamExt;
     use futures::executor::block_on;
 
-    use crate::iterator::{buf_iterator::BufStream, merge_iterator::MergeIterator};
+    use crate::stream::{buf_stream::BufStream, merge_stream::MergeIterator, EStreamImpl};
 
     #[test]
     fn iter() {
@@ -122,13 +129,15 @@ mod tests {
                 (Arc::new("key_6".to_owned()), None),
             ]);
 
-            let mut iterator = MergeIterator::<String, String, String>::new(vec![
-                Box::pin(iter_3),
-                Box::pin(iter_2),
-                Box::pin(iter_1),
-            ])
-            .await
-            .unwrap();
+            let mut iterator = unsafe {
+                MergeIterator::<String, u64, String, String, fn(&String) -> String>::new(vec![
+                    EStreamImpl::Buf(iter_3),
+                    EStreamImpl::Buf(iter_2),
+                    EStreamImpl::Buf(iter_1),
+                ])
+                .await
+                .unwrap()
+            };
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
