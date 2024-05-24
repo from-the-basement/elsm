@@ -285,7 +285,7 @@ where
                 let guard = local.read().await;
                 let mut items = Vec::new();
 
-                let mut iter = Box::pin(
+                let mut iter = pin!(
                     guard
                         .mutable
                         .range(lower.as_ref(), upper.as_ref(), &ts, f)
@@ -306,9 +306,9 @@ where
         for batch in guard.iter() {
             let mut items = Vec::new();
 
-            let mut iter = Box::pin(batch.range(lower, upper, ts, f).await?);
+            let mut stream = pin!(batch.range(lower, upper, ts, f).await?);
 
-            while let Some(item) = iter.next().await {
+            while let Some(item) = stream.next().await {
                 let (k, v) = item?;
 
                 items.push((k.clone(), v));
@@ -443,7 +443,7 @@ where
     }
 }
 
-pub trait GetWrite<K, V>: Oracle<K>
+pub(crate) trait GetWrite<K, V>: Oracle<K>
 where
     K: Ord,
     V: Decode,

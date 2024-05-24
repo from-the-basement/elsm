@@ -66,7 +66,7 @@ where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = Box::pin(MemTableStream {
+        let mut iterator = MemTableStream {
             inner: self
                 .data
                 .range::<InternalKey<K, T>, (Bound<InternalKey<K, T>>, Bound<InternalKey<K, T>>)>(
@@ -75,16 +75,14 @@ where
             item_buf: None,
             ts: self.max_ts,
             f,
-        });
-        // filling first item
-        let _ = iterator.next().await;
-
-        unsafe {
-            let raw: *mut MemTableStream<K, T, V, G, F> =
-                Box::into_raw(Pin::into_inner_unchecked(iterator));
-
-            Ok(*Box::from_raw(raw))
+        };
+        {
+            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            // filling first item
+            let _ = iterator.next().await;
         }
+
+        Ok(iterator)
     }
 
     pub(crate) async fn range<G, F>(
@@ -98,7 +96,7 @@ where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = Box::pin(MemTableStream {
+        let mut iterator = MemTableStream {
             inner: self.data.range((
                 lower
                     .map(|k| {
@@ -120,16 +118,15 @@ where
             item_buf: None,
             ts: *ts,
             f,
-        });
-        // filling first item
-        let _ = iterator.next().await;
+        };
 
-        unsafe {
-            let raw: *mut MemTableStream<K, T, V, G, F> =
-                Box::into_raw(Pin::into_inner_unchecked(iterator));
-
-            Ok(*Box::from_raw(raw))
+        {
+            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            // filling first item
+            let _ = iterator.next().await;
         }
+
+        Ok(iterator)
     }
 }
 

@@ -6,6 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use arrow::array::iterator;
 use executor::futures::StreamExt;
 use futures::Stream;
 
@@ -46,19 +47,18 @@ where
                 heap.push(Reverse((CmpKeyItem { key, _value: value }, i)));
             }
         }
-        let mut iterator = Box::pin(MergeStream {
+        let mut iterator = MergeStream {
             iters,
             heap,
             item_buf: None,
-        });
-        let _ = iterator.next().await;
+        };
 
-        unsafe {
-            let raw: *mut MergeStream<K, T, V, G, F> =
-                Box::into_raw(Pin::into_inner_unchecked(iterator));
-
-            Ok(*Box::from_raw(raw))
+        {
+            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            let _ = iterator.next().await;
         }
+
+        Ok(iterator)
     }
 }
 

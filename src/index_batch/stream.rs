@@ -2,7 +2,7 @@ use std::{
     collections::{btree_map::Range, Bound},
     future::Future,
     marker::PhantomData,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -48,8 +48,7 @@ where
                     Some(true) | None
                 )
             {
-                let mut future =
-                    Box::pin(IndexBatch::<K, T>::decode_value::<V>(this.batch, *offset));
+                let mut future = pin!(IndexBatch::<K, T>::decode_value::<V>(this.batch, *offset));
 
                 return match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(option)) => Poll::Ready(
@@ -83,7 +82,7 @@ where
         G: Send + 'static,
         F: Fn(&V) -> G + Sync + 'static,
     {
-        let mut iterator = Box::pin(IndexBatchStream {
+        let mut iterator = IndexBatchStream {
             batch: &self.batch,
             inner: self.index.range((
                 lower
@@ -107,16 +106,15 @@ where
             ts: *ts,
             f,
             _p: Default::default(),
-        });
-        // filling first item
-        let _ = iterator.next().await;
+        };
 
-        unsafe {
-            let raw: *mut IndexBatchStream<K, T, V, G, F> =
-                Box::into_raw(Pin::into_inner_unchecked(iterator));
-
-            Ok(*Box::from_raw(raw))
+        {
+            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            // filling first item
+            let _ = iterator.next().await;
         }
+
+        Ok(iterator)
     }
 }
 
