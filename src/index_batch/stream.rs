@@ -77,7 +77,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<Pin<Box<IndexBatchStream<K, T, V, G, F>>>, V::Error>
+    ) -> Result<IndexBatchStream<K, T, V, G, F>, V::Error>
     where
         V: Decode + Sync + Send,
         G: Send + 'static,
@@ -111,7 +111,12 @@ where
         // filling first item
         let _ = iterator.next().await;
 
-        Ok(iterator)
+        unsafe {
+            let raw: *mut IndexBatchStream<K, T, V, G, F> =
+                Box::into_raw(Pin::into_inner_unchecked(iterator));
+
+            Ok(*Box::from_raw(raw))
+        }
     }
 }
 

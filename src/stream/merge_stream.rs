@@ -11,7 +11,7 @@ use futures::Stream;
 
 use crate::{serdes::Decode, stream::EStreamImpl, utils::CmpKeyItem};
 
-pub struct MergeIterator<'stream, K, T, V, G, F>
+pub struct MergeStream<'stream, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,
@@ -25,7 +25,7 @@ where
     item_buf: Option<(Arc<K>, Option<G>)>,
 }
 
-impl<'stream, K, T, V, G, F> MergeIterator<'stream, K, T, V, G, F>
+impl<'stream, K, T, V, G, F> MergeStream<'stream, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,
@@ -46,7 +46,7 @@ where
                 heap.push(Reverse((CmpKeyItem { key, _value: value }, i)));
             }
         }
-        let mut iterator = Box::pin(MergeIterator {
+        let mut iterator = Box::pin(MergeStream {
             iters,
             heap,
             item_buf: None,
@@ -54,7 +54,7 @@ where
         let _ = iterator.next().await;
 
         unsafe {
-            let raw: *mut MergeIterator<K, T, V, G, F> =
+            let raw: *mut MergeStream<K, T, V, G, F> =
                 Box::into_raw(Pin::into_inner_unchecked(iterator));
 
             Ok(*Box::from_raw(raw))
@@ -62,7 +62,7 @@ where
     }
 }
 
-impl<'stream, K, T, V, G, F> Stream for MergeIterator<'stream, K, T, V, G, F>
+impl<'stream, K, T, V, G, F> Stream for MergeStream<'stream, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy + Default,
@@ -110,7 +110,7 @@ mod tests {
     use executor::futures::StreamExt;
     use futures::executor::block_on;
 
-    use crate::stream::{buf_stream::BufStream, merge_stream::MergeIterator, EStreamImpl};
+    use crate::stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl};
 
     #[test]
     fn iter() {
@@ -130,7 +130,7 @@ mod tests {
             ]);
 
             let mut iterator = unsafe {
-                MergeIterator::<String, u64, String, String, fn(&String) -> String>::new(vec![
+                MergeStream::<String, u64, String, String, fn(&String) -> String>::new(vec![
                     EStreamImpl::Buf(iter_3),
                     EStreamImpl::Buf(iter_2),
                     EStreamImpl::Buf(iter_1),

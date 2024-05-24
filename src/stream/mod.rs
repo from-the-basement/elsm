@@ -24,7 +24,7 @@ where
 {
     Buf(BufStream<'a, K, G, V::Error>),
     IndexBatch(IndexBatchStream<'a, K, T, V, G, F>),
-    MemTable(MemTableStream<'a, K, V, T, G, F>),
+    MemTable(MemTableStream<'a, K, T, V, G, F>),
     TransactionInner(TransactionStream<'a, K, V, G, F, V::Error>),
 }
 

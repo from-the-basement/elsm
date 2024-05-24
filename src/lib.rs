@@ -43,7 +43,7 @@ use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 use crate::{
     index_batch::IndexBatch,
     serdes::Decode,
-    stream::{buf_stream::BufStream, merge_stream::MergeIterator, EStreamImpl},
+    stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
     wal::WalRecover,
 };
 
@@ -254,7 +254,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &O::Timestamp,
         f: F,
-    ) -> Result<MergeIterator<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
+    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -262,7 +262,7 @@ where
     {
         let iters = self.inner_range(lower, upper, ts, f).await?;
 
-        unsafe { MergeIterator::new(iters) }.await
+        unsafe { MergeStream::new(iters) }.await
     }
 
     pub(crate) async fn inner_range<'s, G, F>(

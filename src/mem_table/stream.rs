@@ -12,7 +12,7 @@ use crate::{
     serdes::Decode,
 };
 
-pub(crate) struct MemTableStream<'a, K, V, T, G, F>
+pub(crate) struct MemTableStream<'a, K, T, V, G, F>
 where
     K: Ord,
     T: Ord,
@@ -25,7 +25,7 @@ where
     f: F,
 }
 
-impl<'a, K, V, T, G, F> Stream for MemTableStream<'a, K, V, T, G, F>
+impl<'a, K, V, T, G, F> Stream for MemTableStream<'a, K, T, V, G, F>
 where
     K: Ord,
     T: Ord + Copy,
@@ -61,10 +61,7 @@ where
     T: Ord + Copy + Default,
     V: Decode,
 {
-    pub(crate) async fn iter<G, F>(
-        &self,
-        f: F,
-    ) -> Result<Pin<Box<MemTableStream<K, V, T, G, F>>>, V::Error>
+    pub(crate) async fn iter<G, F>(&self, f: F) -> Result<MemTableStream<K, T, V, G, F>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
@@ -82,7 +79,12 @@ where
         // filling first item
         let _ = iterator.next().await;
 
-        Ok(iterator)
+        unsafe {
+            let raw: *mut MemTableStream<K, T, V, G, F> =
+                Box::into_raw(Pin::into_inner_unchecked(iterator));
+
+            Ok(*Box::from_raw(raw))
+        }
     }
 
     pub(crate) async fn range<G, F>(
@@ -91,7 +93,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<Pin<Box<MemTableStream<K, V, T, G, F>>>, V::Error>
+    ) -> Result<MemTableStream<K, T, V, G, F>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
@@ -122,7 +124,12 @@ where
         // filling first item
         let _ = iterator.next().await;
 
-        Ok(iterator)
+        unsafe {
+            let raw: *mut MemTableStream<K, T, V, G, F> =
+                Box::into_raw(Pin::into_inner_unchecked(iterator));
+
+            Ok(*Box::from_raw(raw))
+        }
     }
 }
 

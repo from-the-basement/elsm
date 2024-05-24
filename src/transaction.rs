@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::{
     oracle::WriteConflict,
     serdes::Decode,
-    stream::{merge_stream::MergeIterator, EStreamImpl},
+    stream::{merge_stream::MergeStream, EStreamImpl},
     GetWrite,
 };
 
@@ -94,7 +94,7 @@ where
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         f: F,
-    ) -> Result<MergeIterator<K, DB::Timestamp, V, G, F>, V::Error>
+    ) -> Result<MergeStream<K, DB::Timestamp, V, G, F>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Send + Sync + 'static + Copy,
@@ -116,7 +116,7 @@ where
         };
         iters.insert(0, EStreamImpl::TransactionInner(iter));
 
-        unsafe { MergeIterator::new(iters).await }
+        unsafe { MergeStream::new(iters).await }
     }
 }
 
