@@ -6,7 +6,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use arrow::array::iterator;
 use executor::futures::StreamExt;
 use futures::Stream;
 
