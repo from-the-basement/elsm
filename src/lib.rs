@@ -545,16 +545,6 @@ where
     }
 }
 
-pub trait EIterator<K, E>
-where
-    K: Ord,
-    E: From<io::Error> + std::error::Error + Send + Sync + 'static,
-{
-    type Item;
-
-    fn try_next(&mut self) -> impl Future<Output = Result<Option<Self::Item>, E>>;
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
