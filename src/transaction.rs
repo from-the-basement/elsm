@@ -1,17 +1,29 @@
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{btree_map, btree_map::Entry, BTreeMap},
     hash::Hash,
+    io,
+    marker::PhantomData,
+    ops::Bound,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
 
+use executor::futures::Stream;
 use thiserror::Error;
 
-use crate::{oracle::WriteConflict, GetWrite};
+use crate::{
+    oracle::WriteConflict,
+    serdes::Decode,
+    stream::{merge_stream::MergeStream, EStreamImpl},
+    GetWrite,
+};
 
 #[derive(Debug)]
 pub struct Transaction<K, V, DB>
 where
     K: Ord,
+    V: Decode,
     DB: GetWrite<K, V>,
 {
     pub(crate) read_at: DB::Timestamp,
@@ -21,7 +33,8 @@ where
 
 impl<K, V, DB> Transaction<K, V, DB>
 where
-    K: Hash + Ord,
+    K: Hash + Ord + Send + Sync,
+    V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
     DB::Timestamp: Send + Sync,
 {
@@ -63,24 +76,77 @@ where
     }
 
     pub async fn commit(self) -> Result<(), CommitError<K>> {
-        self.share.read_commit(self.read_at.clone());
+        self.share.read_commit(self.read_at);
         if self.local.is_empty() {
             return Ok(());
         }
         let write_at = self.share.start_write();
-        self.share.write_commit(
-            self.read_at.clone(),
-            write_at.clone(),
-            self.local.keys().cloned().collect(),
-        )?;
         self.share
-            .write_batch(
-                self.local
-                    .into_iter()
-                    .map(|(k, v)| (k, write_at.clone(), v)),
-            )
+            .write_commit(self.read_at, write_at, self.local.keys().cloned().collect())?;
+        self.share
+            .write_batch(self.local.into_iter().map(|(k, v)| (k, write_at, v)))
             .await?;
         Ok(())
+    }
+
+    pub async fn range<G, F>(
+        &self,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
+        f: F,
+    ) -> Result<MergeStream<K, DB::Timestamp, V, G, F>, V::Error>
+    where
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Send + Sync + 'static + Copy,
+    {
+        let mut iters = self
+            .share
+            .inner_range(lower, upper, &self.read_at, f)
+            .await?;
+        let range = self
+            .local
+            .range::<Arc<K>, (Bound<&Arc<K>>, Bound<&Arc<K>>)>((
+                lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
+                upper.map(Bound::Included).unwrap_or(Bound::Unbounded),
+            ));
+        let iter = TransactionStream {
+            range,
+            f,
+            _p: Default::default(),
+        };
+        iters.insert(0, EStreamImpl::TransactionInner(iter));
+
+        unsafe { MergeStream::new(iters).await }
+    }
+}
+
+pub(crate) struct TransactionStream<'a, K, V, G, F, E>
+where
+    G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
+{
+    range: btree_map::Range<'a, Arc<K>, Option<V>>,
+    f: F,
+    _p: PhantomData<E>,
+}
+
+impl<'a, K, V, E, G, F> Stream for TransactionStream<'a, K, V, G, F, E>
+where
+    K: Ord,
+    G: Send + Sync + 'static,
+    F: Fn(&V) -> G + Sync + 'static,
+    E: From<io::Error> + std::error::Error + Send + Sync + 'static,
+{
+    type Item = Result<(Arc<K>, Option<G>), E>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        Poll::Ready(
+            this.range
+                .next()
+                .map(|(key, value)| (key.clone(), value.as_ref().map(|v| (this.f)(v))))
+                .map(Ok),
+        )
     }
 }
 

@@ -1,10 +1,12 @@
 mod consistent_hash;
-mod index_batch;
+pub(crate) mod index_batch;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
 pub mod serdes;
+pub mod stream;
 pub mod transaction;
+pub(crate) mod utils;
 pub mod wal;
 
 use std::{
@@ -13,7 +15,7 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    mem,
+    io, mem,
     ops::DerefMut,
     pin::pin,
     sync::Arc,
@@ -38,7 +40,12 @@ use serdes::Encode;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
-use crate::{index_batch::IndexBatch, serdes::Decode, wal::WalRecover};
+use crate::{
+    index_batch::IndexBatch,
+    serdes::Decode,
+    stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
+    wal::WalRecover,
+};
 
 lazy_static! {
     pub static ref ELSM_SCHEMA: SchemaRef = {
@@ -85,11 +92,12 @@ where
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Decode + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite + AsyncRead,
+    io::Error: From<<V as Decode>::Error>,
 {
     pub async fn new(
         oracle: O,
@@ -134,11 +142,12 @@ where
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
+    io::Error: From<<V as Decode>::Error>,
 {
     pub fn new_txn(self: &Arc<Self>) -> Transaction<K, V, Self> {
         Transaction::new(self.clone())
@@ -220,31 +229,93 @@ where
             )
         };
 
-        let mut result = self
+        if let Some(value) = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
-                local.read().await.mutable.get(key, ts).map(f)
+                local.read().await.mutable.get(key, ts).map(|v| v.map(f))
             })
-            .await;
-        if result.is_none() {
-            let guard = self.immutable.read().await;
+            .await
+        {
+            return value;
+        }
+        let guard = self.immutable.read().await;
 
-            for index_batch in guard.iter().rev() {
-                if let Some(bytes) = index_batch.find(key, ts) {
-                    if bytes.is_empty() {
-                        return None;
-                    }
-                    let mut cursor = Cursor::new(bytes);
-
-                    if let Ok(value) = V::decode(&mut cursor).await {
-                        result = Some(f(&value));
-                        break;
-                    }
-                }
+        for index_batch in guard.iter().rev() {
+            if let Ok(Some(value)) = index_batch.find(key, ts).await {
+                return value.map(|v| f(&v));
             }
         }
+        None
+    }
 
-        result
+    async fn range<G, F>(
+        &self,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
+        ts: &O::Timestamp,
+        f: F,
+    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
+    where
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+        O::Timestamp: Sync,
+    {
+        let iters = self.inner_range(lower, upper, ts, f).await?;
+
+        unsafe { MergeStream::new(iters) }.await
+    }
+
+    pub(crate) async fn inner_range<'s, G, F>(
+        &'s self,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
+        ts: &<O as Oracle<K>>::Timestamp,
+        f: F,
+    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
+    where
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+    {
+        let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
+            let lower = lower.cloned();
+            let upper = upper.cloned();
+            let ts = *ts;
+
+            self.mutable_shards.with(i, move |local| async move {
+                let guard = local.read().await;
+                let mut items = Vec::new();
+
+                let mut iter = pin!(
+                    guard
+                        .mutable
+                        .range(lower.as_ref(), upper.as_ref(), &ts, f)
+                        .await?,
+                );
+
+                while let Some(item) = iter.next().await {
+                    let (k, v) = item?;
+
+                    items.push((k.clone(), v));
+                }
+                Ok(EStreamImpl::Buf(BufStream::new(items)))
+            })
+        }))
+        .await?;
+        let guard = self.immutable.read().await;
+
+        for batch in guard.iter() {
+            let mut items = Vec::new();
+
+            let mut stream = pin!(batch.range(lower, upper, ts, f).await?);
+
+            while let Some(item) = stream.next().await {
+                let (k, v) = item?;
+
+                items.push((k.clone(), v));
+            }
+            iters.push(EStreamImpl::Buf(BufStream::new(items)));
+        }
+        Ok(iters)
     }
 
     async fn write_batch(
@@ -372,9 +443,10 @@ where
     }
 }
 
-pub trait GetWrite<K, V>: Oracle<K>
+pub(crate) trait GetWrite<K, V>: Oracle<K>
 where
     K: Ord,
+    V: Decode,
 {
     fn get<G, F>(
         &self,
@@ -399,16 +471,33 @@ where
         &self,
         kvs: impl ExactSizeIterator<Item = (Arc<K>, Self::Timestamp, Option<V>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
+
+    fn inner_range<'a, G, F>(
+        &'a self,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
+        ts: &Self::Timestamp,
+        f: F,
+    ) -> impl Future<
+        Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, <V as Decode>::Error>,
+    >
+    where
+        K: 'a,
+        Self::Timestamp: 'a,
+        V: 'a,
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy;
 }
 
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
     K: Encode + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
+    io::Error: From<<V as Decode>::Error>,
 {
     async fn write(
         &self,
@@ -437,20 +526,35 @@ where
         Db::write_batch(self, kvs).await?;
         Ok(())
     }
+
+    async fn inner_range<'a, G, F>(
+        &'a self,
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
+        ts: &<O as Oracle<K>>::Timestamp,
+        f: F,
+    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
+    where
+        K: 'a,
+        Self::Timestamp: 'a,
+        V: 'a,
+        G: Send + Sync + 'static,
+        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+    {
+        Db::inner_range(self, lower, upper, ts, f).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use executor::{futures::io::Cursor, ExecutorBuilder};
+    use executor::{futures::StreamExt, ExecutorBuilder};
     use tempfile::TempDir;
 
     use crate::{
-        mem_table::MemTable,
         oracle::LocalOracle,
         record::RecordType,
-        serdes::Encode,
         transaction::CommitError,
         wal::provider::{fs::Fs, in_mem::InMemProvider},
         Db, DbOption,
@@ -501,6 +605,85 @@ mod tests {
             assert_eq!(
                 txn.get(&Arc::from("key1".to_string()), |v| *v).await,
                 Some(0)
+            );
+        });
+    }
+
+    #[test]
+    fn range() {
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption {
+                        max_wal_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+
+            let mut txn = db.new_txn();
+            txn.set("key0".to_string(), 0);
+            txn.set("key1".to_string(), 1);
+            txn.set("key2".to_string(), 2);
+            txn.set("key3".to_string(), 3);
+            txn.commit().await.unwrap();
+
+            let mut iter = db
+                .range(
+                    Some(&Arc::new("key1".to_string())),
+                    Some(&Arc::new("key2".to_string())),
+                    &1,
+                    |v| *v,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                iter.next().await.unwrap().unwrap(),
+                (Arc::new("key1".to_string()), Some(1))
+            );
+            assert_eq!(
+                iter.next().await.unwrap().unwrap(),
+                (Arc::new("key2".to_string()), Some(2))
+            );
+
+            let mut txn_1 = db.new_txn();
+            txn_1.set("key5".to_string(), 5);
+            txn_1.set("key4".to_string(), 4);
+
+            let mut txn_2 = db.new_txn();
+            txn_2.set("key5".to_string(), 4);
+            txn_2.set("key4".to_string(), 5);
+            txn_2.commit().await.unwrap();
+
+            let mut iter = txn_1
+                .range(
+                    Some(&Arc::new("key1".to_string())),
+                    Some(&Arc::new("key4".to_string())),
+                    |v| *v,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                iter.next().await.unwrap().unwrap(),
+                (Arc::new("key1".to_string()), Some(1))
+            );
+            assert_eq!(
+                iter.next().await.unwrap().unwrap(),
+                (Arc::new("key2".to_string()), Some(2))
+            );
+            assert_eq!(
+                iter.next().await.unwrap().unwrap(),
+                (Arc::new("key3".to_string()), Some(3))
+            );
+            assert_eq!(
+                iter.next().await.unwrap().unwrap(),
+                (Arc::new("key4".to_string()), Some(4))
             );
         });
     }
@@ -593,42 +776,6 @@ mod tests {
             assert_eq!(db.get(&key_1, &1, |v| v.clone()).await, None);
             assert_eq!(db.get(&key_2, &0, |v| v.clone()).await, None);
             assert_eq!(db.get(&key_2, &1, |v| v.clone()).await, Some(value_2));
-        });
-    }
-
-    #[test]
-    fn freeze() {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
-        ExecutorBuilder::new().build().unwrap().block_on(async {
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
-            let key_3 = Arc::new("key_3".to_owned());
-            let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
-
-            let mut mem_table = MemTable::default();
-
-            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 1, None);
-            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
-            mem_table.insert(key_3.clone(), 0, None);
-
-            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
-                .await
-                .unwrap();
-
-            let mut buf = Cursor::new(Vec::new());
-            value_1.encode(&mut buf).await.unwrap();
-            assert_eq!(batch.find(&key_1, &0), Some(buf.get_ref().as_slice()));
-            assert_eq!(batch.find(&key_1, &1), Some(vec![].as_slice()));
-            clear(&mut buf);
-            value_2.encode(&mut buf).await.unwrap();
-            assert_eq!(batch.find(&key_2, &0), Some(buf.get_ref().as_slice()));
-            assert_eq!(batch.find(&key_3, &0), Some(vec![].as_slice()));
         });
     }
 
