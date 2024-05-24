@@ -9,9 +9,11 @@ use std::{
 
 use arrow::array::RecordBatch;
 use executor::futures::{Stream, StreamExt};
+use pin_project::pin_project;
 
 use crate::{index_batch::IndexBatch, mem_table::InternalKey, serdes::Decode};
 
+#[pin_project]
 #[derive(Debug)]
 pub(crate) struct IndexBatchStream<'a, K, T, V, G, F>
 where
@@ -40,9 +42,9 @@ where
     type Item = Result<(Arc<K>, Option<G>), V::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         for (InternalKey { key, ts }, offset) in this.inner.by_ref() {
-            if ts <= &this.ts
+            if ts <= this.ts
                 && matches!(
                     this.item_buf.as_ref().map(|(k, _)| k != key),
                     Some(true) | None
@@ -109,7 +111,7 @@ where
         };
 
         {
-            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            let mut iterator = pin!(&mut iterator);
             // filling first item
             let _ = iterator.next().await;
         }

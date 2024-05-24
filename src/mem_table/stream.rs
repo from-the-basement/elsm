@@ -1,17 +1,19 @@
 use std::{
     collections::{btree_map, Bound},
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
 };
 
 use executor::futures::{util::StreamExt, Stream};
+use pin_project::pin_project;
 
 use crate::{
     mem_table::{InternalKey, MemTable},
     serdes::Decode,
 };
 
+#[pin_project]
 pub(crate) struct MemTableStream<'a, K, T, V, G, F>
 where
     K: Ord,
@@ -36,9 +38,9 @@ where
     type Item = Result<(Arc<K>, Option<G>), V::Error>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         for (InternalKey { key, ts }, value) in this.inner.by_ref() {
-            if ts <= &this.ts
+            if ts <= this.ts
                 && matches!(
                     this.item_buf.as_ref().map(|(k, _)| k != key),
                     Some(true) | None
@@ -77,7 +79,7 @@ where
             f,
         };
         {
-            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            let mut iterator = pin!(&mut iterator);
             // filling first item
             let _ = iterator.next().await;
         }
@@ -121,7 +123,7 @@ where
         };
 
         {
-            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            let mut iterator = pin!(&mut iterator);
             // filling first item
             let _ = iterator.next().await;
         }

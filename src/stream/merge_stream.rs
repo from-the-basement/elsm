@@ -1,16 +1,18 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
 };
 
 use executor::futures::StreamExt;
 use futures::Stream;
+use pin_project::pin_project;
 
 use crate::{serdes::Decode, stream::EStreamImpl, utils::CmpKeyItem};
 
+#[pin_project]
 pub struct MergeStream<'stream, K, T, V, G, F>
 where
     K: Ord,
@@ -33,14 +35,13 @@ where
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    pub(crate) async unsafe fn new(
+    pub(crate) async fn new(
         mut iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
     ) -> Result<Self, V::Error> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
-            // WARNING: Pin security cannot be guaranteed here
-            if let Some(result) = unsafe { Pin::new_unchecked(iter) }.next().await {
+            if let Some(result) = Pin::new(iter).next().await {
                 let (key, value) = result?;
 
                 heap.push(Reverse((CmpKeyItem { key, _value: value }, i)));
@@ -53,7 +54,7 @@ where
         };
 
         {
-            let mut iterator = unsafe { Pin::new_unchecked(&mut iterator) };
+            let mut iterator = pin!(&mut iterator);
             let _ = iterator.next().await;
         }
 
@@ -72,7 +73,7 @@ where
     type Item = Result<(Arc<K>, Option<G>), V::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         while let Some(Reverse((
             CmpKeyItem {
                 key: item_key,
@@ -81,7 +82,7 @@ where
             idx,
         ))) = this.heap.pop()
         {
-            match unsafe { Pin::new_unchecked(&mut this.iters[idx]) }.poll_next(cx) {
+            match Pin::new(&mut this.iters[idx]).poll_next(cx) {
                 Poll::Ready(Some(item)) => {
                     let (key, value) = item?;
                     this.heap
@@ -128,15 +129,14 @@ mod tests {
                 (Arc::new("key_6".to_owned()), None),
             ]);
 
-            let mut iterator = unsafe {
+            let mut iterator =
                 MergeStream::<String, u64, String, String, fn(&String) -> String>::new(vec![
                     EStreamImpl::Buf(iter_3),
                     EStreamImpl::Buf(iter_2),
                     EStreamImpl::Buf(iter_1),
                 ])
                 .await
-                .unwrap()
-            };
+                .unwrap();
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
