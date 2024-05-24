@@ -262,7 +262,7 @@ where
     {
         let iters = self.inner_range(lower, upper, ts, f).await?;
 
-        unsafe { MergeStream::new(iters) }.await
+        MergeStream::new(iters).await
     }
 
     pub(crate) async fn inner_range<'s, G, F>(

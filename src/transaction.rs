@@ -10,6 +10,7 @@ use std::{
 };
 
 use executor::futures::Stream;
+use pin_project::pin_project;
 use thiserror::Error;
 
 use crate::{
@@ -116,15 +117,17 @@ where
         };
         iters.insert(0, EStreamImpl::TransactionInner(iter));
 
-        unsafe { MergeStream::new(iters).await }
+        MergeStream::new(iters).await
     }
 }
 
+#[pin_project]
 pub(crate) struct TransactionStream<'a, K, V, G, F, E>
 where
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
+    #[pin]
     range: btree_map::Range<'a, Arc<K>, Option<V>>,
     f: F,
     _p: PhantomData<E>,
@@ -140,7 +143,7 @@ where
     type Item = Result<(Arc<K>, Option<G>), E>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let mut this = self.project();
         Poll::Ready(
             this.range
                 .next()
