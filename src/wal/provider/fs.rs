@@ -7,9 +7,12 @@ use std::{
 
 use async_stream::stream;
 use executor::futures::Stream;
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 use super::WalProvider;
+
+static WAL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d+\.wal$").unwrap());
 
 pub struct Fs {
     path: PathBuf,
@@ -38,14 +41,13 @@ impl WalProvider for Fs {
 
     fn list(&self) -> impl Stream<Item = io::Result<Self::File>> {
         stream! {
-            let re = Regex::new(r"^\d+\.wal$").unwrap();
 
             for entry in fs::read_dir(&self.path)? {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(filename) = path.file_name().and_then(|s| s.to_str()) {
-                        if re.is_match(filename) {
+                        if WAL_REGEX.is_match(filename) {
                             yield Ok(OpenOptions::new()
                                 .create(true)
                                 .write(true)
