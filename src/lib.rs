@@ -69,7 +69,7 @@ lazy_static! {
 }
 
 pub type Offset = i64;
-pub type Immutable<K, T> = Arc<RwLock<(VecDeque<IndexBatch<K, T>>, Sender<CompactTask>)>>;
+pub type Immutable<K, T> = Arc<RwLock<VecDeque<IndexBatch<K, T>>>>;
 
 #[derive(Debug)]
 pub enum CompactTask {
@@ -106,6 +106,7 @@ where
     pub(crate) immutable: Immutable<K, O::Timestamp>,
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
+    pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
@@ -131,24 +132,23 @@ where
         });
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
-        let (task_tx, mut task_rx) = channel(1);
-        let immutable = Arc::new(RwLock::new((VecDeque::new(), task_tx)));
+        let immutable = Arc::new(RwLock::new(VecDeque::new()));
         let option = Arc::new(option);
 
+        let (task_tx, mut task_rx) = channel(1);
         let mut compactor = Compactor::<K, O>::new(immutable.clone(), option.clone());
 
         spawn(async move {
             loop {
-                match task_rx.try_next() {
-                    Ok(Some(task)) => match task {
+                match task_rx.next().await {
+                    None => break,
+                    Some(task) => match task {
                         CompactTask::Flush(option_tx) => {
                             if let Err(err) = compactor.check_then_compaction(option_tx).await {
                                 println!("[Compaction Error]: {}", err)
                             }
                         }
                     },
-                    Ok(None) => break,
-                    Err(_) => (),
                 }
             }
         })
@@ -161,6 +161,7 @@ where
             mutable_shards,
             immutable,
             wal,
+            compaction_tx: Mutex::new(task_tx),
         };
         let mut file_stream = pin!(wal_manager.wal_provider.list());
 
@@ -244,13 +245,17 @@ where
                 }
             })
             .await?;
+
+        let mut is_exceeded = false;
         if let Some(mem_table) = freeze {
             let mut guard = self.immutable.write().await;
 
-            guard.0.push_back(Self::freeze(mem_table).await?);
-
-            if guard.0.len() > self.option.immutable_chunk_num {
-                let _ = guard.1.try_send(CompactTask::Flush(None));
+            guard.push_back(Self::freeze(mem_table).await?);
+            is_exceeded = guard.len() > self.option.immutable_chunk_num;
+        }
+        if is_exceeded {
+            if let Some(mut guard) = self.compaction_tx.try_lock() {
+                let _ = guard.try_send(CompactTask::Flush(None));
             }
         }
         Ok(())
@@ -285,7 +290,7 @@ where
         }
         let guard = self.immutable.read().await;
 
-        for index_batch in guard.0.iter().rev() {
+        for index_batch in guard.iter().rev() {
             if let Ok(Some(value)) = index_batch.find(key, ts).await {
                 return value.map(|v| f(&v));
             }
@@ -348,7 +353,7 @@ where
         .await?;
         let guard = self.immutable.read().await;
 
-        for batch in guard.0.iter() {
+        for batch in guard.iter() {
             let mut items = Vec::new();
 
             let mut stream = pin!(batch.range(lower, upper, ts, f).await?);
@@ -617,7 +622,7 @@ mod tests {
                     DbOption {
                         path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -669,7 +674,7 @@ mod tests {
                     DbOption {
                         path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -751,7 +756,7 @@ mod tests {
                     DbOption {
                         path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -809,7 +814,7 @@ mod tests {
                         // TIPS: kv size in test case is 17
                         path: temp_dir.path().to_path_buf(),
                         max_wal_size: 20,
-                        immutable_chunk_num: 1,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -848,7 +853,7 @@ mod tests {
                     DbOption {
                         path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -869,7 +874,7 @@ mod tests {
                     DbOption {
                         path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await

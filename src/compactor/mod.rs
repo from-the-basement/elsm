@@ -35,10 +35,9 @@ where
         option_tx: Option<oneshot::Sender<()>>,
     ) -> Result<(), CompactionError> {
         let mut guard = self.immutable.write().await;
-        let tables = &mut guard.0;
 
-        if tables.len() > self.option.immutable_chunk_num {
-            let excess = tables.split_off(self.option.immutable_chunk_num);
+        if guard.len() > self.option.immutable_chunk_num {
+            let excess = guard.split_off(self.option.immutable_chunk_num);
             let gen = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
