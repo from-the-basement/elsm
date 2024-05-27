@@ -1,3 +1,4 @@
+pub(crate) mod compactor;
 mod consistent_hash;
 pub(crate) mod index_batch;
 pub(crate) mod mem_table;
@@ -17,6 +18,7 @@ use std::{
     hash::Hash,
     io, mem,
     ops::DerefMut,
+    path::PathBuf,
     pin::pin,
     sync::Arc,
 };
@@ -30,8 +32,17 @@ use consistent_hash::jump_consistent_hash;
 use executor::{
     futures::{AsyncRead, StreamExt},
     shard::Shard,
+    spawn,
 };
-use futures::{executor::block_on, io::Cursor, AsyncWrite};
+use futures::{
+    channel::{
+        mpsc::{channel, Sender},
+        oneshot,
+    },
+    executor::block_on,
+    io::Cursor,
+    AsyncWrite,
+};
 use lazy_static::lazy_static;
 use mem_table::MemTable;
 use oracle::Oracle;
@@ -41,6 +52,7 @@ use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 use crate::{
+    compactor::Compactor,
     index_batch::IndexBatch,
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
@@ -57,9 +69,16 @@ lazy_static! {
 }
 
 pub type Offset = i64;
+pub type Immutable<K, T> = Arc<RwLock<(VecDeque<IndexBatch<K, T>>, Sender<CompactTask>)>>;
+
+#[derive(Debug)]
+pub enum CompactTask {
+    Flush(Option<oneshot::Sender<()>>),
+}
 
 #[derive(Debug)]
 pub struct DbOption {
+    pub path: PathBuf,
     pub max_wal_size: usize,
     pub immutable_chunk_num: usize,
 }
@@ -80,11 +99,11 @@ where
     O: Oracle<K>,
     WP: WalProvider,
 {
-    option: DbOption,
+    option: Arc<DbOption>,
     pub(crate) oracle: O,
     wal_manager: Arc<WalManager<WP>>,
     pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp>>>,
-    pub(crate) immutable: RwLock<VecDeque<IndexBatch<K, O::Timestamp>>>,
+    pub(crate) immutable: Immutable<K, O::Timestamp>,
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
 }
@@ -93,7 +112,7 @@ impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Decode + Ord + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
-    O: Oracle<K>,
+    O: Oracle<K> + 'static,
     O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite + AsyncRead,
@@ -112,12 +131,35 @@ where
         });
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
+        let (task_tx, mut task_rx) = channel(1);
+        let immutable = Arc::new(RwLock::new((VecDeque::new(), task_tx)));
+        let option = Arc::new(option);
+
+        let mut compactor = Compactor::<K, O>::new(immutable.clone(), option.clone());
+
+        spawn(async move {
+            loop {
+                match task_rx.try_next() {
+                    Ok(Some(task)) => match task {
+                        CompactTask::Flush(option_tx) => {
+                            if let Err(err) = compactor.check_then_compaction(option_tx).await {
+                                println!("[Compaction Error]: {}", err)
+                            }
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(_) => (),
+                }
+            }
+        })
+        .detach();
+
         let mut db = Db {
             option,
             oracle,
             wal_manager: wal_manager.clone(),
             mutable_shards,
-            immutable: RwLock::new(VecDeque::new()),
+            immutable,
             wal,
         };
         let mut file_stream = pin!(wal_manager.wal_provider.list());
@@ -203,10 +245,13 @@ where
             })
             .await?;
         if let Some(mem_table) = freeze {
-            self.immutable
-                .write()
-                .await
-                .push_back(Self::freeze(mem_table).await?);
+            let mut guard = self.immutable.write().await;
+
+            guard.0.push_back(Self::freeze(mem_table).await?);
+
+            if guard.0.len() > self.option.immutable_chunk_num {
+                let _ = guard.1.try_send(CompactTask::Flush(None));
+            }
         }
         Ok(())
     }
@@ -240,7 +285,7 @@ where
         }
         let guard = self.immutable.read().await;
 
-        for index_batch in guard.iter().rev() {
+        for index_batch in guard.0.iter().rev() {
             if let Ok(Some(value)) = index_batch.find(key, ts).await {
                 return value.map(|v| f(&v));
             }
@@ -303,7 +348,7 @@ where
         .await?;
         let guard = self.immutable.read().await;
 
-        for batch in guard.iter() {
+        for batch in guard.0.iter() {
             let mut items = Vec::new();
 
             let mut stream = pin!(batch.range(lower, upper, ts, f).await?);
@@ -562,12 +607,15 @@ mod tests {
 
     #[test]
     fn read_committed() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
                     DbOption {
+                        path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
                         immutable_chunk_num: 1,
                     },
@@ -611,12 +659,15 @@ mod tests {
 
     #[test]
     fn range() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
                     DbOption {
+                        path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
                         immutable_chunk_num: 1,
                     },
@@ -690,12 +741,15 @@ mod tests {
 
     #[test]
     fn write_conflicts() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
                     DbOption {
+                        path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
                         immutable_chunk_num: 1,
                     },
@@ -739,6 +793,8 @@ mod tests {
 
     #[test]
     fn read_from_immut_table() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let key_1 = Arc::new("key_1".to_owned());
             let key_2 = Arc::new("key_2".to_owned());
@@ -751,6 +807,7 @@ mod tests {
                     InMemProvider::default(),
                     DbOption {
                         // TIPS: kv size in test case is 17
+                        path: temp_dir.path().to_path_buf(),
                         max_wal_size: 20,
                         immutable_chunk_num: 1,
                     },
@@ -789,6 +846,7 @@ mod tests {
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
                     DbOption {
+                        path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
                         immutable_chunk_num: 1,
                     },
@@ -809,6 +867,7 @@ mod tests {
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
                     DbOption {
+                        path: temp_dir.path().to_path_buf(),
                         max_wal_size: 64 * 1024 * 1024,
                         immutable_chunk_num: 1,
                     },
