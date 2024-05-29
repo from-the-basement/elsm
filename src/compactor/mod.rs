@@ -1,33 +1,40 @@
-use std::{
-    collections::VecDeque,
-    error::Error,
-    fs::File,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::VecDeque, error::Error, fmt::Debug, fs::File, sync::Arc};
 
-use arrow::{array::RecordBatchWriter, ipc::writer::StreamWriter};
 use futures::channel::oneshot;
+use parquet::arrow::ArrowWriter;
+use snowflake::ProcessUniqueId;
 use thiserror::Error;
 
-use crate::{index_batch::IndexBatch, oracle::Oracle, DbOption, Immutable, ELSM_SCHEMA};
+use crate::{
+    index_batch::IndexBatch, oracle::Oracle, scope::Scope, serdes::Encode, version::SyncVersion,
+    DbOption, Immutable, ELSM_SCHEMA,
+};
 
 pub(crate) struct Compactor<K, O>
 where
-    K: Ord,
+    K: Ord + Encode + Debug,
     O: Oracle<K>,
 {
     pub(crate) option: Arc<DbOption>,
     pub(crate) immutable: Immutable<K, O::Timestamp>,
+    pub(crate) version: SyncVersion<K>,
 }
 
 impl<K, O> Compactor<K, O>
 where
-    K: Ord,
+    K: Ord + Encode + Debug,
     O: Oracle<K>,
 {
-    pub(crate) fn new(immutable: Immutable<K, O::Timestamp>, option: Arc<DbOption>) -> Self {
-        Compactor { option, immutable }
+    pub(crate) fn new(
+        immutable: Immutable<K, O::Timestamp>,
+        option: Arc<DbOption>,
+        version: SyncVersion<K>,
+    ) -> Self {
+        Compactor {
+            option,
+            immutable,
+            version,
+        }
     }
 
     pub(crate) async fn check_then_compaction(
@@ -38,12 +45,10 @@ where
 
         if guard.len() > self.option.immutable_chunk_num {
             let excess = guard.split_off(self.option.immutable_chunk_num);
-            let gen = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
 
-            Self::minor_compaction(gen as i64, &self.option, excess).await?;
+            if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
+                self.version.write().await.level_slice.push(scope);
+            }
         }
         if let Some(tx) = option_tx {
             let _ = tx.send(());
@@ -52,24 +57,43 @@ where
     }
 
     pub(crate) async fn minor_compaction(
-        gen: i64,
         option: &DbOption,
         batches: VecDeque<IndexBatch<K, O::Timestamp>>,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<Option<Scope<K>>, CompactionError> {
         if !batches.is_empty() {
-            let mut writer = StreamWriter::try_new(
-                File::create(option.path.join(format!("{}.parquet", gen)))
-                    .map_err(CompactionError::Io)?,
-                &ELSM_SCHEMA,
+            let mut min = None;
+            let mut max = None;
+
+            let gen = ProcessUniqueId::new();
+
+            let mut writer = ArrowWriter::try_new(
+                File::create(option.table_path(&gen)).map_err(CompactionError::Io)?,
+                ELSM_SCHEMA.clone(),
+                None,
             )
-            .map_err(CompactionError::Arrow)?;
+            .map_err(CompactionError::Parquet)?;
 
             for batch in batches {
-                writer.write(&batch.batch).map_err(CompactionError::Arrow)?;
+                if let Some((batch_min, batch_max)) = batch.scope() {
+                    if matches!(min.as_ref().map(|min| min > batch_min), Some(true) | None) {
+                        min = Some(batch_min.clone())
+                    }
+                    if matches!(max.as_ref().map(|max| max < batch_max), Some(true) | None) {
+                        max = Some(batch_max.clone())
+                    }
+                }
+                writer
+                    .write(&batch.batch)
+                    .map_err(CompactionError::Parquet)?;
             }
-            writer.close().map_err(CompactionError::Arrow)?;
+            writer.close().map_err(CompactionError::Parquet)?;
+            return Ok(Some(Scope {
+                min: min.unwrap(),
+                max: max.unwrap(),
+                gen,
+            }));
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -78,7 +102,7 @@ pub enum CompactionError {
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
     #[error("compaction arrow error: {0}")]
-    Arrow(#[source] arrow::error::ArrowError),
+    Parquet(#[source] parquet::errors::ParquetError),
     #[error("compaction internal error: {0}")]
     Internal(#[source] Box<dyn Error + Send + Sync + 'static>),
 }

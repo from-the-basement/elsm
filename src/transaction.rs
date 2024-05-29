@@ -1,5 +1,6 @@
 use std::{
     collections::{btree_map, btree_map::Entry, BTreeMap},
+    fmt::Debug,
     hash::Hash,
     io,
     marker::PhantomData,
@@ -34,7 +35,7 @@ where
 
 impl<K, V, DB> Transaction<K, V, DB>
 where
-    K: Hash + Ord + Send + Sync,
+    K: Hash + Ord + Debug + Send + Sync,
     V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
     DB::Timestamp: Send + Sync,

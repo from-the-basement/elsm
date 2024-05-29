@@ -27,18 +27,16 @@ use crate::{
 pub(crate) struct WalManager<WP> {
     pub(crate) wal_provider: WP,
     file_id: AtomicU32,
-    file_max_size: usize,
 }
 
 impl<WP> WalManager<WP>
 where
     WP: WalProvider,
 {
-    pub(crate) fn new(wal_provider: WP, file_max_size: usize) -> Self {
+    pub(crate) fn new(wal_provider: WP) -> Self {
         Self {
             wal_provider,
             file_id: AtomicU32::new(0),
-            file_max_size,
         }
     }
 
@@ -53,7 +51,7 @@ where
         &self,
         file: WP::File,
     ) -> io::Result<WalFile<WP::File, K, V, T>> {
-        Ok(WalFile::new(file, self.file_max_size))
+        Ok(WalFile::new(file))
     }
 }
 
@@ -82,17 +80,13 @@ pub trait WalRecover<K, V, T> {
 #[derive(Debug)]
 pub(crate) struct WalFile<F, K, V, T> {
     file: F,
-    max_size: usize,
-    writed_size: usize,
     _marker: PhantomData<(K, V, T)>,
 }
 
 impl<F, K, V, T> WalFile<F, K, V, T> {
-    pub(crate) fn new(file: F, max_size: usize) -> Self {
+    pub(crate) fn new(file: F) -> Self {
         Self {
             file,
-            max_size,
-            writed_size: 0,
             _marker: PhantomData,
         }
     }
@@ -109,15 +103,9 @@ where
         &mut self,
         record: Record<&K, &V, &T>,
     ) -> Result<(), WriteError<<Record<&K, &V, &T> as Encode>::Error>> {
-        let write_size = record.size();
-        if self.writed_size + write_size > self.max_size {
-            return Err(WriteError::MaxSizeExceeded);
-        }
-
         let mut writer = HashWriter::new(&mut self.file);
         record.encode(&mut writer).await?;
         writer.eol().await.map_err(WriteError::Io)?;
-        self.writed_size += write_size;
         Ok(())
     }
 
@@ -203,7 +191,7 @@ mod tests {
         let mut file = Vec::new();
         block_on(async {
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
+                let mut wal = WalFile::new(Cursor::new(&mut file));
                 wal.write(Record::new(
                     RecordType::Full,
                     &"key".to_string(),
@@ -215,7 +203,7 @@ mod tests {
                 wal.flush().await.unwrap();
             }
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
+                let mut wal = WalFile::new(Cursor::new(&mut file));
 
                 {
                     let mut stream = pin!(wal.recover());
@@ -237,7 +225,7 @@ mod tests {
             }
 
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file), usize::MAX);
+                let mut wal = WalFile::new(Cursor::new(&mut file));
 
                 {
                     let mut stream = pin!(wal.recover());

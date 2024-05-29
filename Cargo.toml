@@ -16,9 +16,11 @@ fxhash = "0.2"
 # replace them with std::sync::lazy, once stabilized
 lazy_static = "1"
 once_cell = "1"
+parquet = { version = "51", features = ["async"] }
 pin-project = "1"
 pin-project-lite = "0.2"
 regex = "1"
+snowflake = "1"
 thiserror = "1"
 unsend = "0.2"
 

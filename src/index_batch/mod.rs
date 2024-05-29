@@ -24,7 +24,7 @@ where
 
 impl<K, T> IndexBatch<K, T>
 where
-    K: Ord,
+    K: Ord + Debug,
     T: Ord + Copy + Default,
 {
     pub(crate) async fn find<V>(&self, key: &Arc<K>, ts: &T) -> Result<Option<Option<V>>, V::Error>
@@ -41,27 +41,34 @@ where
             .next()
         {
             if item_key == key {
-                return Ok(Some(
-                    IndexBatch::<K, T>::decode_value::<V>(&self.batch, *offset).await?,
-                ));
+                return Ok(Some(decode_value::<V>(&self.batch, *offset).await?));
             }
         }
         Ok(None)
     }
 
-    async fn decode_value<V>(batch: &RecordBatch, offset: u32) -> Result<Option<V>, V::Error>
-    where
-        V: Decode + Sync + Send,
-    {
-        let bytes = batch.column(1).as_binary::<Offset>().value(offset as usize);
-
-        if bytes.is_empty() {
-            return Ok(None);
+    pub(crate) fn scope(&self) -> Option<(&Arc<K>, &Arc<K>)> {
+        if let (Some((min, _)), Some((max, _))) =
+            (self.index.first_key_value(), self.index.last_key_value())
+        {
+            return Some((&min.key, &max.key));
         }
-        let mut cursor = Cursor::new(bytes);
-
-        Ok(Some(V::decode(&mut cursor).await?))
+        None
     }
+}
+
+pub(crate) async fn decode_value<V>(batch: &RecordBatch, offset: u32) -> Result<Option<V>, V::Error>
+where
+    V: Decode + Sync + Send,
+{
+    let bytes = batch.column(1).as_binary::<Offset>().value(offset as usize);
+
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut cursor = Cursor::new(bytes);
+
+    Ok(Some(V::decode(&mut cursor).await?))
 }
 
 #[cfg(test)]

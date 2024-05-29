@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
+    fmt::Debug,
     pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
@@ -29,7 +30,7 @@ where
 
 impl<'stream, K, T, V, G, F> MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Debug,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
@@ -64,7 +65,7 @@ where
 
 impl<'stream, K, T, V, G, F> Stream for MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Debug,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,

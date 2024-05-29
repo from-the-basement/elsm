@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -32,7 +33,7 @@ where
 
 impl<'a, K, T, V, G, F> Stream for EStreamImpl<'a, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Debug,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
