@@ -10,7 +10,7 @@ use crate::{
     oracle::Oracle,
     scope::Scope,
     serdes::{Decode, Encode},
-    version::{apply_edits, edit::VersionEdit, SyncVersion},
+    version::{apply_edits, edit::VersionEdit, SyncVersion, VersionError},
     DbOption, Immutable, ELSM_SCHEMA,
 };
 
@@ -44,7 +44,7 @@ where
     pub(crate) async fn check_then_compaction(
         &mut self,
         option_tx: Option<oneshot::Sender<()>>,
-    ) -> Result<(), CompactionError<<K as Encode>::Error>> {
+    ) -> Result<(), CompactionError<K>> {
         let mut guard = self.immutable.write().await;
 
         if guard.len() > self.option.immutable_chunk_num {
@@ -53,7 +53,9 @@ where
             if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
                 let mut guard = self.version.write().await;
 
-                apply_edits(&mut guard, vec![VersionEdit::Add { scope }], false).await?;
+                apply_edits(&mut guard, vec![VersionEdit::Add { scope }], false)
+                    .await
+                    .map_err(CompactionError::Version)?;
             }
         }
         if let Some(tx) = option_tx {
@@ -65,7 +67,7 @@ where
     pub(crate) async fn minor_compaction(
         option: &DbOption,
         batches: VecDeque<IndexBatch<K, O::Timestamp>>,
-    ) -> Result<Option<Scope<K>>, CompactionError<<K as Encode>::Error>> {
+    ) -> Result<Option<Scope<K>>, CompactionError<K>> {
         if !batches.is_empty() {
             let mut min = None;
             let mut max = None;
@@ -105,13 +107,18 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum CompactionError<E: std::error::Error + Send + Sync> {
+pub enum CompactionError<K>
+where
+    K: Encode + Decode,
+{
     #[error("compaction encode error: {0}")]
-    Encode(#[from] E),
+    Encode(#[source] <K as Encode>::Error),
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
-    #[error("compaction arrow error: {0}")]
+    #[error("compaction parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
     #[error("compaction internal error: {0}")]
     Internal(#[source] Box<dyn Error + Send + Sync + 'static>),
+    #[error("compaction version error: {0}")]
+    Version(#[source] VersionError<K>),
 }
