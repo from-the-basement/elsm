@@ -24,7 +24,7 @@ where
 
 impl<K, T> IndexBatch<K, T>
 where
-    K: Ord + Debug,
+    K: Ord,
     T: Ord + Copy + Default,
 {
     pub(crate) async fn find<V>(&self, key: &Arc<K>, ts: &T) -> Result<Option<Option<V>>, V::Error>

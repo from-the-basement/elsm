@@ -22,6 +22,7 @@ pin-project-lite = "0.2"
 regex = "1"
 snowflake = "1"
 thiserror = "1"
+tracing = "0.1"
 unsend = "0.2"
 
 [dev-dependencies]

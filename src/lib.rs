@@ -51,6 +51,7 @@ use oracle::Oracle;
 use record::{Record, RecordType};
 use serdes::Encode;
 use snowflake::ProcessUniqueId;
+use tracing::error;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
@@ -154,7 +155,7 @@ where
                     Some(task) => match task {
                         CompactTask::Flush(option_tx) => {
                             if let Err(err) = compactor.check_then_compaction(option_tx).await {
-                                println!("[Compaction Error]: {}", err)
+                                error!("[Compaction Error]: {}", err)
                             }
                         }
                     },
