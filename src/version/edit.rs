@@ -1,23 +1,19 @@
-use std::io;
-use std::mem::size_of;
-use executor::fs::File;
-use executor::futures::{AsyncRead, AsyncWrite};
-use executor::futures::util::{AsyncReadExt, AsyncWriteExt};
-use parquet::data_type::AsBytes;
-use snowflake::ProcessUniqueId;
 use crate::scope::Scope;
 use crate::serdes::{Decode, Encode};
+use executor::fs::File;
+use executor::futures::util::{AsyncReadExt, AsyncWriteExt};
+use executor::futures::{AsyncRead, AsyncWrite};
+use parquet::data_type::AsBytes;
+use snowflake::ProcessUniqueId;
+use std::io;
+use std::mem::size_of;
 
 pub(crate) enum VersionEdit<K>
 where
     K: Encode + Decode + Ord,
 {
-    Add {
-        scope: Scope<K>
-    },
-    Remove {
-        gen: ProcessUniqueId
-    }
+    Add { scope: Scope<K> },
+    Remove { gen: ProcessUniqueId },
 }
 
 impl<K> VersionEdit<K>
@@ -43,31 +39,40 @@ where
 {
     type Error = <K as Encode>::Error;
 
-    async fn encode<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<(), Self::Error> {
-        writer.write_all(match self {
-            VersionEdit::Add { .. } => 0u8,
-            VersionEdit::Remove { .. } => 1u8,
-        }.as_bytes()).await?;
+    async fn encode<W: AsyncWrite + Unpin + Send + Sync>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), Self::Error> {
+        writer
+            .write_all(
+                match self {
+                    VersionEdit::Add { .. } => 0u8,
+                    VersionEdit::Remove { .. } => 1u8,
+                }
+                .as_bytes(),
+            )
+            .await?;
 
         match self {
             VersionEdit::Add { scope } => {
                 writer.write_all(&0u8.to_le_bytes()).await?;
                 scope.encode(writer).await?;
-            },
+            }
             VersionEdit::Remove { gen } => {
                 writer.write_all(&1u8.to_le_bytes()).await?;
                 writer.write_all(&bincode::serialize(gen).unwrap()).await?;
-            },
+            }
         }
 
         Ok(())
     }
 
     fn size(&self) -> usize {
-        size_of::<u8>() + match self {
-            VersionEdit::Add{ scope } => scope.size(),
-            VersionEdit::Remove{ .. } => 16
-        }
+        size_of::<u8>()
+            + match self {
+                VersionEdit::Add { scope } => scope.size(),
+                VersionEdit::Remove { .. } => 16,
+            }
     }
 }
 
@@ -95,11 +100,9 @@ where
                     reader.read_exact(&mut slice).await?;
                     bincode::deserialize(&slice).unwrap()
                 };
-                VersionEdit::Remove {
-                    gen,
-                }
-            },
-            _ => todo!()
+                VersionEdit::Remove { gen }
+            }
+            _ => todo!(),
         })
     }
 }

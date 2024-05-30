@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use executor::futures::{AsyncRead, AsyncWrite};
 use executor::futures::util::{AsyncReadExt, AsyncWriteExt};
+use executor::futures::{AsyncRead, AsyncWrite};
+use std::sync::Arc;
 
 use snowflake::ProcessUniqueId;
 
@@ -38,11 +38,16 @@ where
 {
     type Error = <K as Encode>::Error;
 
-    async fn encode<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<(), Self::Error> {
+    async fn encode<W: AsyncWrite + Unpin + Send + Sync>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), Self::Error> {
         self.min.encode(writer).await?;
         self.max.encode(writer).await?;
 
-        writer.write_all(&bincode::serialize(&self.gen).unwrap()).await?;
+        writer
+            .write_all(&bincode::serialize(&self.gen).unwrap())
+            .await?;
         Ok(())
     }
 
@@ -68,10 +73,6 @@ where
             bincode::deserialize(&slice).unwrap()
         };
 
-        Ok(Scope {
-            min,
-            max,
-            gen,
-        })
+        Ok(Scope { min, max, gen })
     }
 }

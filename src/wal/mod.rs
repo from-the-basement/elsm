@@ -94,7 +94,7 @@ impl<F, K, V, T> WalFile<F, K, V, T> {
 
 impl<F, K, V, T> WalWrite<K, V, T> for WalFile<F, K, V, T>
 where
-    F: AsyncWrite + Unpin,
+    F: AsyncWrite + Unpin + Send + Sync,
     K: Encode,
     V: Encode,
     T: Encode,

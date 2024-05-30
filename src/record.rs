@@ -38,7 +38,7 @@ where
 
     async fn encode<W>(&self, writer: &mut W) -> Result<(), Self::Error>
     where
-        W: AsyncWrite + Unpin,
+        W: AsyncWrite + Unpin + Send + Sync,
     {
         writer.write_all(&[self.record_type as u8]).await?;
         self.key.encode(writer).await.map_err(EncodeError::Key)?;
