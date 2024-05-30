@@ -1,12 +1,15 @@
+mod compactor;
 mod consistent_hash;
 pub(crate) mod index_batch;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
+pub(crate) mod scope;
 pub mod serdes;
 pub mod stream;
 pub mod transaction;
 pub(crate) mod utils;
+mod version;
 pub mod wal;
 
 use std::{
@@ -17,6 +20,7 @@ use std::{
     hash::Hash,
     io, mem,
     ops::DerefMut,
+    path::PathBuf,
     pin::pin,
     sync::Arc,
 };
@@ -30,20 +34,33 @@ use consistent_hash::jump_consistent_hash;
 use executor::{
     futures::{AsyncRead, StreamExt},
     shard::Shard,
+    spawn,
 };
-use futures::{executor::block_on, io::Cursor, AsyncWrite};
+use futures::{
+    channel::{
+        mpsc::{channel, Sender},
+        oneshot,
+    },
+    executor::block_on,
+    io::Cursor,
+    AsyncWrite,
+};
 use lazy_static::lazy_static;
 use mem_table::MemTable;
 use oracle::Oracle;
 use record::{Record, RecordType};
 use serdes::Encode;
+use snowflake::ProcessUniqueId;
+use tracing::error;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 use crate::{
-    index_batch::IndexBatch,
+    compactor::Compactor,
+    index_batch::{decode_value, IndexBatch},
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
+    version::{SyncVersion, Version},
     wal::WalRecover,
 };
 
@@ -57,10 +74,17 @@ lazy_static! {
 }
 
 pub type Offset = i64;
+pub type Immutable<K, T> = Arc<RwLock<VecDeque<IndexBatch<K, T>>>>;
+
+#[derive(Debug)]
+pub enum CompactTask {
+    Flush(Option<oneshot::Sender<()>>),
+}
 
 #[derive(Debug)]
 pub struct DbOption {
-    pub max_wal_size: usize,
+    pub path: PathBuf,
+    pub max_mem_table_size: usize,
     pub immutable_chunk_num: usize,
 }
 
@@ -76,24 +100,26 @@ where
 #[derive(Debug)]
 pub struct Db<K, V, O, WP>
 where
-    K: Ord,
+    K: Ord + Encode,
     O: Oracle<K>,
     WP: WalProvider,
 {
-    option: DbOption,
+    option: Arc<DbOption>,
     pub(crate) oracle: O,
     wal_manager: Arc<WalManager<WP>>,
     pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp>>>,
-    pub(crate) immutable: RwLock<VecDeque<IndexBatch<K, O::Timestamp>>>,
+    pub(crate) immutable: Immutable<K, O::Timestamp>,
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
+    pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
+    pub(crate) version: SyncVersion<K>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
-    K: Encode + Decode + Ord + Hash + Send + Sync + 'static,
+    K: Encode + Decode + Debug + Ord + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
-    O: Oracle<K>,
+    O: Oracle<K> + 'static,
     O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite + AsyncRead,
@@ -104,7 +130,7 @@ where
         wal_provider: WP,
         option: DbOption,
     ) -> Result<Self, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
-        let wal_manager = Arc::new(WalManager::new(wal_provider, option.max_wal_size));
+        let wal_manager = Arc::new(WalManager::new(wal_provider));
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
                 mutable: MemTable::default(),
@@ -112,13 +138,41 @@ where
         });
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
+        let immutable = Arc::new(RwLock::new(VecDeque::new()));
+        let version = Arc::new(RwLock::new(Version {
+            level_slice: vec![],
+        }));
+        let option = Arc::new(option);
+
+        let (task_tx, mut task_rx) = channel(1);
+        let mut compactor =
+            Compactor::<K, O>::new(immutable.clone(), option.clone(), version.clone());
+
+        spawn(async move {
+            loop {
+                match task_rx.next().await {
+                    None => break,
+                    Some(task) => match task {
+                        CompactTask::Flush(option_tx) => {
+                            if let Err(err) = compactor.check_then_compaction(option_tx).await {
+                                error!("[Compaction Error]: {}", err)
+                            }
+                        }
+                    },
+                }
+            }
+        })
+        .detach();
+
         let mut db = Db {
             option,
             oracle,
             wal_manager: wal_manager.clone(),
             mutable_shards,
-            immutable: RwLock::new(VecDeque::new()),
+            immutable,
             wal,
+            compaction_tx: Mutex::new(task_tx),
+            version,
         };
         let mut file_stream = pin!(wal_manager.wal_provider.list());
 
@@ -141,7 +195,7 @@ where
 
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
-    K: Encode + Ord + Hash + Send + Sync + 'static,
+    K: Encode + Ord + Debug + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
@@ -164,49 +218,53 @@ where
             jump_consistent_hash(fxhash::hash64(&key), executor::worker_num()) as usize;
         let wal_manager = self.wal_manager.clone();
         let wal = self.wal.clone();
+        let max_mem_table_size = self.option.max_mem_table_size;
+
         let freeze = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
                 let mut local = local.write().await;
-                let result = wal
-                    .lock()
+                wal.lock()
                     .await
                     .write(Record::new(record_type, &key, &ts, value.as_ref()))
-                    .await;
-                match result {
-                    Ok(_) => {
-                        local.mutable.insert(key, ts, value);
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        if let WriteError::MaxSizeExceeded = e {
-                            let mut wal_file = wal_manager
-                                .create_wal_file()
-                                .await
-                                .map_err(WriteError::Io)?;
-                            {
-                                let mut guard = wal.lock().await;
-                                mem::swap(guard.deref_mut(), &mut wal_file);
-                            }
-                            wal_file.close().await.map_err(WriteError::Io)?;
-                            let mut mem_table = MemTable::default();
-                            mem_table.insert(key, ts, value);
+                    .await?;
 
-                            mem::swap(&mut local.mutable, &mut mem_table);
-
-                            Ok(Some(mem_table))
-                        } else {
-                            Err(e)
-                        }
+                local.mutable.insert(key, ts, value);
+                if local.mutable.is_excess(max_mem_table_size) {
+                    let mut wal_file = wal_manager
+                        .create_wal_file()
+                        .await
+                        .map_err(WriteError::Io)?;
+                    {
+                        let mut guard = wal.lock().await;
+                        mem::swap(guard.deref_mut(), &mut wal_file);
                     }
+                    wal_file.close().await.map_err(WriteError::Io)?;
+                    let mut mem_table = MemTable::default();
+
+                    mem::swap(&mut local.mutable, &mut mem_table);
+
+                    return Ok::<
+                        Option<MemTable<K, V, <O as Oracle<K>>::Timestamp>>,
+                        WriteError<<Record<&K, &V, &<O as Oracle<K>>::Timestamp> as Encode>::Error>,
+                    >(Some(mem_table));
                 }
+                Ok(None)
             })
             .await?;
+
         if let Some(mem_table) = freeze {
-            self.immutable
-                .write()
-                .await
-                .push_back(Self::freeze(mem_table).await?);
+            if mem_table.is_empty() {
+                return Ok(());
+            }
+            let mut guard = self.immutable.write().await;
+
+            guard.push_back(Self::freeze(mem_table).await?);
+            if guard.len() > self.option.immutable_chunk_num {
+                if let Some(mut guard) = self.compaction_tx.try_lock() {
+                    let _ = guard.try_send(CompactTask::Flush(None));
+                }
+            }
         }
         Ok(())
     }
@@ -239,12 +297,21 @@ where
             return value;
         }
         let guard = self.immutable.read().await;
-
         for index_batch in guard.iter().rev() {
             if let Ok(Some(value)) = index_batch.find(key, ts).await {
                 return value.map(|v| f(&v));
             }
         }
+        drop(guard);
+
+        let guard = self.version.read().await;
+        if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
+            if let Ok(value) = decode_value(&record_batch, 0).await {
+                return value.map(|v| f(&v));
+            }
+        }
+        drop(guard);
+
         None
     }
 
@@ -305,7 +372,6 @@ where
 
         for batch in guard.iter() {
             let mut items = Vec::new();
-
             let mut stream = pin!(batch.range(lower, upper, ts, f).await?);
 
             while let Some(item) = stream.next().await {
@@ -415,7 +481,7 @@ where
 
 impl<K, V, O, WP> Oracle<K> for Db<K, V, O, WP>
 where
-    K: Ord,
+    K: Ord + Encode,
     O: Oracle<K>,
     WP: WalProvider,
 {
@@ -491,7 +557,7 @@ where
 
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
-    K: Encode + Ord + Hash + Send + Sync + 'static,
+    K: Encode + Ord + Debug + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
@@ -545,6 +611,12 @@ where
     }
 }
 
+impl DbOption {
+    pub(crate) fn table_path(&self, gen: &ProcessUniqueId) -> PathBuf {
+        self.path.join(format!("{}.parquet", gen))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -562,14 +634,17 @@ mod tests {
 
     #[test]
     fn read_committed() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
                     DbOption {
-                        max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -611,14 +686,17 @@ mod tests {
 
     #[test]
     fn range() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
                     DbOption {
-                        max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -690,14 +768,17 @@ mod tests {
 
     #[test]
     fn write_conflicts() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
                     DbOption {
-                        max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -739,11 +820,10 @@ mod tests {
 
     #[test]
     fn read_from_immut_table() {
+        let temp_dir = TempDir::new().unwrap();
+
         ExecutorBuilder::new().build().unwrap().block_on(async {
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
             let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
 
             let db = Arc::new(
                 Db::new(
@@ -751,7 +831,8 @@ mod tests {
                     InMemProvider::default(),
                     DbOption {
                         // TIPS: kv size in test case is 17
-                        max_wal_size: 20,
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 25,
                         immutable_chunk_num: 1,
                     },
                 )
@@ -759,23 +840,302 @@ mod tests {
                 .unwrap(),
             );
 
-            db.write(RecordType::Full, key_1.clone(), 0, Some(value_1.clone()))
-                .await
-                .unwrap();
-            db.write(RecordType::Full, key_1.clone(), 1, None)
-                .await
-                .unwrap();
-            db.write(RecordType::Full, key_2.clone(), 0, None)
-                .await
-                .unwrap();
-            db.write(RecordType::Full, key_2.clone(), 1, Some(value_2.clone()))
-                .await
-                .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key1".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key2".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key3".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key4".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key5".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key6".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key7".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key8".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key9".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key10".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key20".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key30".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key40".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key50".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key60".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key70".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key80".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key90".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key100".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key200".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key300".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key400".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key500".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key600".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key700".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key800".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key900".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key1000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key2000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key3000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key4000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key5000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key6000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key7000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key8000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
+            db.write(
+                RecordType::Full,
+                Arc::new("key9000".to_owned()),
+                0,
+                Some(value_1.clone()),
+            )
+            .await
+            .unwrap();
 
-            assert_eq!(db.get(&key_1, &0, |v| v.clone()).await, Some(value_1));
-            assert_eq!(db.get(&key_1, &1, |v| v.clone()).await, None);
-            assert_eq!(db.get(&key_2, &0, |v| v.clone()).await, None);
-            assert_eq!(db.get(&key_2, &1, |v| v.clone()).await, Some(value_2));
+            println!("{:?}", db.version);
+
+            assert_eq!(
+                db.get(&Arc::new("key2000".to_owned()), &0, |v| v.clone())
+                    .await,
+                Some(value_1)
+            );
         });
     }
 
@@ -789,8 +1149,9 @@ mod tests {
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
                     DbOption {
-                        max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await
@@ -809,8 +1170,9 @@ mod tests {
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
                     DbOption {
-                        max_wal_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 1,
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 64 * 1024 * 1024,
+                        immutable_chunk_num: 5,
                     },
                 )
                 .await

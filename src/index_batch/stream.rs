@@ -1,5 +1,6 @@
 use std::{
     collections::{btree_map::Range, Bound},
+    fmt::Debug,
     future::Future,
     marker::PhantomData,
     pin::{pin, Pin},
@@ -11,7 +12,11 @@ use arrow::array::RecordBatch;
 use executor::futures::{Stream, StreamExt};
 use pin_project::pin_project;
 
-use crate::{index_batch::IndexBatch, mem_table::InternalKey, serdes::Decode};
+use crate::{
+    index_batch::{decode_value, IndexBatch},
+    mem_table::InternalKey,
+    serdes::Decode,
+};
 
 #[pin_project]
 #[derive(Debug)]
@@ -33,7 +38,7 @@ where
 
 impl<'a, K, T, V, G, F> Stream for IndexBatchStream<'a, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Debug,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + 'static,
@@ -50,7 +55,7 @@ where
                     Some(true) | None
                 )
             {
-                let mut future = pin!(IndexBatch::<K, T>::decode_value::<V>(this.batch, *offset));
+                let mut future = pin!(decode_value::<V>(this.batch, *offset));
 
                 return match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(option)) => Poll::Ready(
@@ -69,7 +74,7 @@ where
 
 impl<K, T> IndexBatch<K, T>
 where
-    K: Ord,
+    K: Ord + Debug,
     T: Ord + Copy + Default,
 {
     pub(crate) async fn range<V, G, F>(
