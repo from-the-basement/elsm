@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn read_from_immut_table() {
+    fn read_from_disk() {
         let temp_dir = TempDir::new().unwrap();
 
         ExecutorBuilder::new().build().unwrap().block_on(async {
@@ -1131,6 +1131,28 @@ mod tests {
 
             assert_eq!(
                 db.get(&Arc::new("key2000".to_owned()), &0, |v| v.clone())
+                    .await,
+                Some(value_1.clone())
+            );
+            drop(db);
+
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption {
+                        // TIPS: kv size in test case is 17
+                        path: temp_dir.path().to_path_buf(),
+                        max_mem_table_size: 25,
+                        immutable_chunk_num: 1,
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+
+            assert_eq!(
+                db.get(&Arc::new("key2000".to_owned()), &0, |v: &String| v.clone())
                     .await,
                 Some(value_1)
             );

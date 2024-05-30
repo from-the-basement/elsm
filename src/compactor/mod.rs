@@ -6,12 +6,13 @@ use snowflake::ProcessUniqueId;
 use thiserror::Error;
 
 use crate::{
-    index_batch::IndexBatch, oracle::Oracle, scope::Scope, serdes::Encode, version::SyncVersion,
+    index_batch::IndexBatch,
+    oracle::Oracle,
+    scope::Scope,
+    serdes::{Decode, Encode},
+    version::{apply_edits, edit::VersionEdit, SyncVersion},
     DbOption, Immutable, ELSM_SCHEMA,
 };
-use crate::serdes::Decode;
-use crate::version::apply_edits;
-use crate::version::edit::VersionEdit;
 
 pub(crate) struct Compactor<K, O>
 where
@@ -52,7 +53,7 @@ where
             if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
                 let mut guard = self.version.write().await;
 
-                apply_edits(&mut guard, vec![VersionEdit::Add { scope }], &self.option).await?;
+                apply_edits(&mut guard, vec![VersionEdit::Add { scope }], false).await?;
             }
         }
         if let Some(tx) = option_tx {

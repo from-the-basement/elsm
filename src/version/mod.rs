@@ -1,23 +1,29 @@
 pub(crate) mod edit;
 
-use std::{fs::File, sync::Arc};
+use std::{
+    fs::{File, OpenOptions},
+    io::SeekFrom,
+    sync::Arc,
+};
 
 use arrow::{
     array::{GenericBinaryArray, RecordBatch, Scalar},
     compute::kernels::cmp::eq,
 };
 use async_lock::RwLock;
-use executor::fs;
-use executor::futures::AsyncWriteExt;
+use executor::{fs, futures::AsyncSeekExt};
 use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
     ProjectionMask,
 };
 use snowflake::ProcessUniqueId;
 
-use crate::{scope::Scope, serdes::Encode, DbOption, Offset};
-use crate::serdes::Decode;
-use crate::version::edit::VersionEdit;
+use crate::{
+    scope::Scope,
+    serdes::{Decode, Encode},
+    version::edit::VersionEdit,
+    DbOption, Offset,
+};
 
 pub(crate) type SyncVersion<K> = Arc<RwLock<Version<K>>>;
 
@@ -27,7 +33,7 @@ where
 {
     // FIXME: only level 0
     pub(crate) level_slice: Vec<Scope<K>>,
-    pub(crate) log: fs::File
+    pub(crate) log: fs::File,
 }
 
 impl<K> Version<K>
@@ -35,16 +41,22 @@ where
     K: Encode + Decode + Ord,
 {
     pub(crate) async fn new(option: &DbOption) -> Result<Self, <K as Decode>::Error> {
-        let mut log = fs::File::from(File::open(option.version_path()).unwrap());
-        let mut level_slice = vec![];
-
+        let mut log = fs::File::from(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(option.version_path())
+                .unwrap(),
+        );
         let edits = VersionEdit::recover(&mut log).await;
 
+        log.seek(SeekFrom::End(0)).await?;
         let mut version = Version {
-            level_slice,
+            level_slice: vec![],
             log,
         };
-        apply_edits(&mut version, edits, option).await.unwrap();
+        apply_edits(&mut version, edits, true).await.unwrap();
 
         Ok(version)
     }
@@ -101,11 +113,17 @@ where
     }
 }
 
-pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(version: &mut Version<K>, version_edits: Vec<VersionEdit<K>>, option: &DbOption) -> Result<(), <K as Encode>::Error> {
+pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(
+    version: &mut Version<K>,
+    version_edits: Vec<VersionEdit<K>>,
+    is_recover: bool,
+) -> Result<(), <K as Encode>::Error> {
     for version_edit in version_edits {
+        if !is_recover {
+            version_edit.encode(&mut version.log).await?;
+        }
         match version_edit {
             VersionEdit::Add { scope } => {
-                scope.encode(&mut version.log).await?;
                 version.level_slice.push(scope);
             }
             VersionEdit::Remove { .. } => {
@@ -114,4 +132,48 @@ pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(version: &mut Version<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::{executor::block_on, io::Cursor};
+
+    use crate::{scope::Scope, serdes::Encode, version::edit::VersionEdit};
+
+    #[test]
+    fn encode_and_decode() {
+        block_on(async {
+            let edits = vec![
+                VersionEdit::Add {
+                    scope: Scope {
+                        min: Arc::new("Min".to_string()),
+                        max: Arc::new("Max".to_string()),
+                        gen: Default::default(),
+                    },
+                },
+                VersionEdit::Remove {
+                    gen: Default::default(),
+                },
+            ];
+
+            let bytes = {
+                let mut cursor = Cursor::new(vec![]);
+
+                for edit in edits.clone() {
+                    edit.encode(&mut cursor).await.unwrap();
+                }
+                cursor.into_inner()
+            };
+
+            let decode_edits = {
+                let mut cursor = Cursor::new(bytes);
+
+                VersionEdit::<String>::recover(&mut cursor).await
+            };
+
+            assert_eq!(edits, decode_edits);
+        })
+    }
 }

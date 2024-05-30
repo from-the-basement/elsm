@@ -1,7 +1,9 @@
-use executor::futures::util::{AsyncReadExt, AsyncWriteExt};
-use executor::futures::{AsyncRead, AsyncWrite};
 use std::sync::Arc;
 
+use executor::futures::{
+    util::{AsyncReadExt, AsyncWriteExt},
+    AsyncRead, AsyncWrite,
+};
 use snowflake::ProcessUniqueId;
 
 use crate::serdes::{Decode, Encode};
@@ -53,7 +55,7 @@ where
 
     fn size(&self) -> usize {
         // ProcessUniqueId: usize + u64
-        self.min.size() + self.max.size() + 12
+        self.min.size() + self.max.size() + 16
     }
 }
 
@@ -68,7 +70,7 @@ where
         let max = Arc::new(K::decode(reader).await?);
 
         let gen = {
-            let mut slice = [0; 12];
+            let mut slice = [0; 16];
             reader.read_exact(&mut slice).await?;
             bincode::deserialize(&slice).unwrap()
         };

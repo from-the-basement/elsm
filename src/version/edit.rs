@@ -1,13 +1,17 @@
-use crate::scope::Scope;
-use crate::serdes::{Decode, Encode};
-use executor::fs::File;
-use executor::futures::util::{AsyncReadExt, AsyncWriteExt};
-use executor::futures::{AsyncRead, AsyncWrite};
-use parquet::data_type::AsBytes;
-use snowflake::ProcessUniqueId;
-use std::io;
 use std::mem::size_of;
 
+use executor::futures::{
+    util::{AsyncReadExt, AsyncWriteExt},
+    AsyncRead, AsyncWrite,
+};
+use snowflake::ProcessUniqueId;
+
+use crate::{
+    scope::Scope,
+    serdes::{Decode, Encode},
+};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum VersionEdit<K>
 where
     K: Encode + Decode + Ord,
@@ -20,14 +24,11 @@ impl<K> VersionEdit<K>
 where
     K: Encode + Decode + Ord,
 {
-    pub(crate) async fn recover(log: &mut File) -> Vec<VersionEdit<K>> {
+    pub(crate) async fn recover<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<VersionEdit<K>> {
         let mut edits = Vec::new();
 
-        loop {
-            match VersionEdit::decode(log).await {
-                Ok(edit) => edits.push(edit),
-                Err(_) => break,
-            }
+        while let Ok(edit) = VersionEdit::decode(reader).await {
+            edits.push(edit)
         }
         edits
     }
@@ -43,16 +44,6 @@ where
         &self,
         writer: &mut W,
     ) -> Result<(), Self::Error> {
-        writer
-            .write_all(
-                match self {
-                    VersionEdit::Add { .. } => 0u8,
-                    VersionEdit::Remove { .. } => 1u8,
-                }
-                .as_bytes(),
-            )
-            .await?;
-
         match self {
             VersionEdit::Add { scope } => {
                 writer.write_all(&0u8.to_le_bytes()).await?;
@@ -91,12 +82,11 @@ where
 
         Ok(match edit_type {
             0 => VersionEdit::Add {
-                // FIXME: unwrap
-                scope: Scope::decode(reader).await.unwrap(),
+                scope: Scope::<K>::decode(reader).await?,
             },
             1 => {
                 let gen = {
-                    let mut slice = [0; 12];
+                    let mut slice = [0; 16];
                     reader.read_exact(&mut slice).await?;
                     bincode::deserialize(&slice).unwrap()
                 };
