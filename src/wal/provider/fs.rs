@@ -41,7 +41,6 @@ impl WalProvider for Fs {
 
     fn list(&self) -> impl Stream<Item = io::Result<Self::File>> {
         stream! {
-
             for entry in fs::read_dir(&self.path)? {
                 let entry = entry?;
                 let path = entry.path();

@@ -97,10 +97,9 @@ where
     mutable: MemTable<K, V, T>,
 }
 
-#[derive(Debug)]
 pub struct Db<K, V, O, WP>
 where
-    K: Ord + Encode,
+    K: Ord + Encode + Decode,
     O: Oracle<K>,
     WP: WalProvider,
 {
@@ -139,9 +138,7 @@ where
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
         let immutable = Arc::new(RwLock::new(VecDeque::new()));
-        let version = Arc::new(RwLock::new(Version {
-            level_slice: vec![],
-        }));
+        let version = Arc::new(RwLock::new(Version::new(&option).await.unwrap()));
         let option = Arc::new(option);
 
         let (task_tx, mut task_rx) = channel(1);
@@ -195,7 +192,7 @@ where
 
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
-    K: Encode + Ord + Debug + Hash + Send + Sync + 'static,
+    K: Encode + Decode + Ord + Debug + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
@@ -481,7 +478,7 @@ where
 
 impl<K, V, O, WP> Oracle<K> for Db<K, V, O, WP>
 where
-    K: Ord + Encode,
+    K: Ord + Encode + Decode,
     O: Oracle<K>,
     WP: WalProvider,
 {
@@ -557,7 +554,7 @@ where
 
 impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
 where
-    K: Encode + Ord + Debug + Hash + Send + Sync + 'static,
+    K: Encode + Decode + Ord + Debug + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
     O::Timestamp: Encode + Copy + Send + Sync + 'static,
@@ -614,6 +611,9 @@ where
 impl DbOption {
     pub(crate) fn table_path(&self, gen: &ProcessUniqueId) -> PathBuf {
         self.path.join(format!("{}.parquet", gen))
+    }
+    pub(crate) fn version_path(&self) -> PathBuf {
+        self.path.join("version.log")
     }
 }
 
@@ -1128,8 +1128,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-            println!("{:?}", db.version);
 
             assert_eq!(
                 db.get(&Arc::new("key2000".to_owned()), &0, |v| v.clone())
