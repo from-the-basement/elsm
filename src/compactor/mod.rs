@@ -6,13 +6,17 @@ use snowflake::ProcessUniqueId;
 use thiserror::Error;
 
 use crate::{
-    index_batch::IndexBatch, oracle::Oracle, scope::Scope, serdes::Encode, version::SyncVersion,
+    index_batch::IndexBatch,
+    oracle::Oracle,
+    scope::Scope,
+    serdes::{Decode, Encode},
+    version::{apply_edits, edit::VersionEdit, SyncVersion, VersionError},
     DbOption, Immutable, ELSM_SCHEMA,
 };
 
 pub(crate) struct Compactor<K, O>
 where
-    K: Ord + Encode + Debug,
+    K: Ord + Encode + Decode + Debug,
     O: Oracle<K>,
 {
     pub(crate) option: Arc<DbOption>,
@@ -22,7 +26,7 @@ where
 
 impl<K, O> Compactor<K, O>
 where
-    K: Ord + Encode + Debug,
+    K: Ord + Encode + Decode + Debug,
     O: Oracle<K>,
 {
     pub(crate) fn new(
@@ -40,14 +44,18 @@ where
     pub(crate) async fn check_then_compaction(
         &mut self,
         option_tx: Option<oneshot::Sender<()>>,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<(), CompactionError<K>> {
         let mut guard = self.immutable.write().await;
 
         if guard.len() > self.option.immutable_chunk_num {
             let excess = guard.split_off(self.option.immutable_chunk_num);
 
             if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
-                self.version.write().await.level_slice.push(scope);
+                let mut guard = self.version.write().await;
+
+                apply_edits(&mut guard, vec![VersionEdit::Add { scope }], false)
+                    .await
+                    .map_err(CompactionError::Version)?;
             }
         }
         if let Some(tx) = option_tx {
@@ -59,13 +67,14 @@ where
     pub(crate) async fn minor_compaction(
         option: &DbOption,
         batches: VecDeque<IndexBatch<K, O::Timestamp>>,
-    ) -> Result<Option<Scope<K>>, CompactionError> {
+    ) -> Result<Option<Scope<K>>, CompactionError<K>> {
         if !batches.is_empty() {
             let mut min = None;
             let mut max = None;
 
             let gen = ProcessUniqueId::new();
 
+            // FIXME: Async Writer
             let mut writer = ArrowWriter::try_new(
                 File::create(option.table_path(&gen)).map_err(CompactionError::Io)?,
                 ELSM_SCHEMA.clone(),
@@ -98,11 +107,18 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum CompactionError {
+pub enum CompactionError<K>
+where
+    K: Encode + Decode,
+{
+    #[error("compaction encode error: {0}")]
+    Encode(#[source] <K as Encode>::Error),
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
-    #[error("compaction arrow error: {0}")]
+    #[error("compaction parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
     #[error("compaction internal error: {0}")]
     Internal(#[source] Box<dyn Error + Send + Sync + 'static>),
+    #[error("compaction version error: {0}")]
+    Version(#[source] VersionError<K>),
 }

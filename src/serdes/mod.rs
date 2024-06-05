@@ -7,22 +7,22 @@ use std::{future::Future, io};
 
 use futures::{AsyncRead, AsyncWrite};
 
-pub trait Encode {
+pub trait Encode: Send + Sync {
     type Error: From<io::Error> + std::error::Error + Send + Sync + 'static;
 
-    fn encode<W>(&self, writer: &mut W) -> impl Future<Output = Result<(), Self::Error>>
+    fn encode<W>(&self, writer: &mut W) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
-        W: AsyncWrite + Unpin;
+        W: AsyncWrite + Unpin + Send + Sync;
 
     fn size(&self) -> usize;
 }
 
-impl<T: Encode> Encode for &T {
+impl<T: Encode + Sync> Encode for &T {
     type Error = T::Error;
 
     async fn encode<W>(&self, writer: &mut W) -> Result<(), Self::Error>
     where
-        W: AsyncWrite + Unpin,
+        W: AsyncWrite + Unpin + Send + Sync,
     {
         Encode::encode(*self, writer).await
     }

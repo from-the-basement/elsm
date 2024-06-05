@@ -20,13 +20,13 @@ where
 
 impl<T> Encode for Arc<T>
 where
-    T: Encode,
+    T: Encode + Send + Sync,
 {
     type Error = T::Error;
 
     async fn encode<W>(&self, writer: &mut W) -> Result<(), Self::Error>
     where
-        W: AsyncWrite + Unpin,
+        W: AsyncWrite + Unpin + Send + Sync,
     {
         self.as_ref().encode(writer).await
     }

@@ -7,7 +7,10 @@ use super::{Decode, Encode};
 impl Encode for String {
     type Error = io::Error;
 
-    async fn encode<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<(), Self::Error> {
+    async fn encode<W: AsyncWrite + Unpin + Send>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), Self::Error> {
         writer.write_all(&(self.len() as u16).to_le_bytes()).await?;
         writer.write_all(self.as_bytes()).await
     }

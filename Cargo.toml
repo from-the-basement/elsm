@@ -8,6 +8,7 @@ arrow = "51"
 async-channel = "2"
 async-lock = "3"
 async-stream = "0.3"
+bincode = "1"
 crc32fast = "1"
 crossbeam-queue = "0.3"
 executor = { git = "https://github.com/ethe/executor.git", branch = "main" }
@@ -20,7 +21,7 @@ parquet = { version = "51", features = ["async"] }
 pin-project = "1"
 pin-project-lite = "0.2"
 regex = "1"
-snowflake = "1"
+snowflake = { version = "1", features = ["serde_support"] }
 thiserror = "1"
 tracing = "0.1"
 unsend = "0.2"
