@@ -61,7 +61,6 @@ impl<'a, K, V, E> Stream for BufStream<'a, K, V, E>
 where
     K: Ord + 'a,
     V: 'a,
-    E: std::error::Error + Send + Sync + 'static,
 {
     type Item = Result<(Arc<K>, Option<V>), E>;
 

@@ -9,7 +9,11 @@ use std::{
 use executor::futures::{Stream, StreamExt};
 use pin_project::pin_project;
 
-use crate::{serdes::Decode, stream::EInnerStreamImpl, utils::CmpKeyItem};
+use crate::{
+    serdes::Decode,
+    stream::{EInnerStreamImpl, StreamError},
+    utils::CmpKeyItem,
+};
 
 #[pin_project]
 pub struct MergeInnerStream<'stream, K, V>
@@ -30,7 +34,7 @@ where
 {
     pub(crate) async fn new(
         mut iters: Vec<EInnerStreamImpl<'stream, K, V>>,
-    ) -> Result<Self, V::Error> {
+    ) -> Result<Self, StreamError<K, V>> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
@@ -60,7 +64,7 @@ where
     K: Ord + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<V>), V::Error>;
+    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();

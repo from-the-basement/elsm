@@ -59,7 +59,7 @@ use crate::{
     compactor::Compactor,
     index_batch::{decode_value, IndexBatch},
     serdes::Decode,
-    stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
+    stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
     version::{SyncVersion, Version},
     wal::WalRecover,
 };
@@ -321,7 +321,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &O::Timestamp,
         f: F,
-    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
+    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -338,7 +338,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
+    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -511,7 +511,7 @@ where
 
 pub(crate) trait GetWrite<K, V>: Oracle<K>
 where
-    K: Ord,
+    K: Ord + Decode,
     V: Decode,
 {
     fn get<G, F>(
@@ -544,9 +544,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &Self::Timestamp,
         f: F,
-    ) -> impl Future<
-        Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, <V as Decode>::Error>,
-    >
+    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, StreamError<K, V>>>
     where
         K: 'a,
         Self::Timestamp: 'a,
@@ -599,7 +597,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
+    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, StreamError<K, V>>
     where
         K: 'a,
         Self::Timestamp: 'a,

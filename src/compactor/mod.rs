@@ -15,7 +15,10 @@ use crate::{
     oracle::Oracle,
     scope::Scope,
     serdes::{Decode, Encode},
-    stream::{merge_inner_stream::MergeInnerStream, table_stream::TableStream, EInnerStreamImpl},
+    stream::{
+        merge_inner_stream::MergeInnerStream, table_stream::TableStream, EInnerStreamImpl,
+        StreamError,
+    },
     version::{apply_edits, edit::VersionEdit, SyncVersion, Version, VersionError, MAX_LEVEL},
     DbOption, Immutable, Offset, ELSM_SCHEMA,
 };
@@ -190,7 +193,7 @@ where
             }
             let stream = MergeInnerStream::<K, V>::new(streams)
                 .await
-                .map_err(CompactionError::ValueDecode)?;
+                .map_err(CompactionError::Stream)?;
 
             let mut buf = Cursor::new(vec![0; 128]);
             let mut stream = pin!(stream);
@@ -201,7 +204,7 @@ where
             let mut max = None;
 
             while let Some(result) = stream.next().await {
-                let (key, value) = result.map_err(CompactionError::ValueDecode)?;
+                let (key, value) = result.map_err(CompactionError::Stream)?;
                 if min.is_none() {
                     min = Some(key.clone())
                 }
@@ -319,8 +322,6 @@ where
     KeyEncode(#[source] <K as Encode>::Error),
     #[error("compaction value encode error: {0}")]
     ValueEncode(#[source] <V as Encode>::Error),
-    #[error("compaction value decode error: {0}")]
-    ValueDecode(#[source] <V as Decode>::Error),
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
     #[error("compaction arrow error: {0}")]
@@ -329,4 +330,6 @@ where
     Parquet(#[source] parquet::errors::ParquetError),
     #[error("compaction version error: {0}")]
     Version(#[source] VersionError<K>),
+    #[error("compaction stream error: {0}")]
+    Stream(#[source] StreamError<K, V>),
 }

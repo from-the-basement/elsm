@@ -2,7 +2,6 @@ use std::{
     collections::{btree_map, btree_map::Entry, BTreeMap},
     fmt::Debug,
     hash::Hash,
-    io,
     marker::PhantomData,
     ops::Bound,
     pin::Pin,
@@ -17,14 +16,14 @@ use thiserror::Error;
 use crate::{
     oracle::WriteConflict,
     serdes::Decode,
-    stream::{merge_stream::MergeStream, EStreamImpl},
+    stream::{merge_stream::MergeStream, EStreamImpl, StreamError},
     GetWrite,
 };
 
 #[derive(Debug)]
 pub struct Transaction<K, V, DB>
 where
-    K: Ord,
+    K: Ord + Decode,
     V: Decode,
     DB: GetWrite<K, V>,
 {
@@ -35,7 +34,7 @@ where
 
 impl<K, V, DB> Transaction<K, V, DB>
 where
-    K: Hash + Ord + Debug + Send + Sync,
+    K: Hash + Ord + Debug + Decode + Send + Sync,
     V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
     DB::Timestamp: Send + Sync,
@@ -96,7 +95,7 @@ where
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         f: F,
-    ) -> Result<MergeStream<K, DB::Timestamp, V, G, F>, V::Error>
+    ) -> Result<MergeStream<K, DB::Timestamp, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Send + Sync + 'static + Copy,
@@ -139,7 +138,6 @@ where
     K: Ord,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
-    E: From<io::Error> + std::error::Error + Send + Sync + 'static,
 {
     type Item = Result<(Arc<K>, Option<G>), E>;
 

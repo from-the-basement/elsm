@@ -7,6 +7,7 @@ use std::{
 
 use executor::futures::Stream;
 use pin_project::pin_project;
+use thiserror::Error;
 
 use crate::{
     index_batch::stream::IndexBatchStream,
@@ -25,16 +26,16 @@ pub(crate) mod table_stream;
 #[pin_project(project = EStreamImplProj)]
 pub(crate) enum EStreamImpl<'a, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Decode,
     T: Ord + Copy + Default,
     V: Decode,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    Buf(#[pin] BufStream<'a, K, G, V::Error>),
+    Buf(#[pin] BufStream<'a, K, G, StreamError<K, V>>),
     IndexBatch(#[pin] IndexBatchStream<'a, K, T, V, G, F>),
     MemTable(#[pin] MemTableStream<'a, K, T, V, G, F>),
-    TransactionInner(#[pin] TransactionStream<'a, K, V, G, F, V::Error>),
+    TransactionInner(#[pin] TransactionStream<'a, K, V, G, F, StreamError<K, V>>),
 }
 
 #[pin_project(project = EInnerStreamImplProj)]
@@ -48,13 +49,13 @@ where
 
 impl<'a, K, T, V, G, F> Stream for EStreamImpl<'a, K, T, V, G, F>
 where
-    K: Ord + Debug,
+    K: Ord + Debug + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<G>), V::Error>;
+    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.project() {
@@ -71,11 +72,25 @@ where
     K: Ord + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<V>), V::Error>;
+    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.project() {
             EInnerStreamImplProj::Table(stream) => stream.poll_next(cx),
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum StreamError<K, V>
+where
+    K: Decode,
+    V: Decode,
+{
+    #[error("compaction key decode error: {0}")]
+    KeyDecode(#[source] <K as Decode>::Error),
+    #[error("compaction value decode error: {0}")]
+    ValueDecode(#[source] <V as Decode>::Error),
+    #[error("compaction io error: {0}")]
+    Io(#[source] std::io::Error),
 }

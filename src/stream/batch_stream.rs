@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use executor::futures::{FutureExt, Stream};
 use pin_project::pin_project;
 
-use crate::{index_batch::decode_value, serdes::Decode};
+use crate::{index_batch::decode_value, serdes::Decode, stream::StreamError};
 
 #[pin_project]
 pub(crate) struct BatchStream<K, V>
@@ -35,13 +35,15 @@ where
         }
     }
 
-    async fn decode_item(&mut self) -> Result<(Arc<K>, Option<V>), V::Error> {
+    async fn decode_item(&mut self) -> Result<(Arc<K>, Option<V>), StreamError<K, V>> {
         // FIXME: handle error
         let key = decode_value::<K>(&self.inner, 0, self.pos)
             .await
-            .unwrap()
+            .map_err(StreamError::KeyDecode)?
             .unwrap();
-        let value = decode_value::<V>(&self.inner, 1, self.pos).await?;
+        let value = decode_value::<V>(&self.inner, 1, self.pos)
+            .await
+            .map_err(StreamError::ValueDecode)?;
 
         self.pos += 1;
         Ok((Arc::new(key), value))
@@ -53,7 +55,7 @@ where
     K: Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<V>), V::Error>;
+    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.pos < self.inner.num_rows() {

@@ -24,7 +24,7 @@ use snowflake::ProcessUniqueId;
 
 use crate::{
     serdes::{Decode, Encode},
-    stream::batch_stream::BatchStream,
+    stream::{batch_stream::BatchStream, StreamError},
     DbOption, Offset,
 };
 
@@ -112,7 +112,7 @@ where
     K: Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<V>), V::Error>;
+    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.stream).poll_next(cx) {
@@ -132,32 +132,3 @@ where
         }
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use std::path::PathBuf;
-//     use executor::ExecutorBuilder;
-//     use executor::futures::StreamExt;
-//     use snowflake::ProcessUniqueId;
-//     use crate::DbOption;
-//     use crate::stream::table_stream::TableStream;
-//
-//     #[test]
-//     fn iter() {
-//         ExecutorBuilder::new().build().unwrap().block_on(async {
-//             let option = DbOption {
-//                 // TIPS: kv size in test case is 17
-//                 path: PathBuf::from("E:/test"),
-//                 max_mem_table_size: 25,
-//                 immutable_chunk_num: 1,
-//                 major_threshold_with_sst_size: 10,
-//                 level_sst_magnification: 10,
-//                 sst_file_size: 2 * 1024 * 1024,
-//             };
-//             let mut stream = TableStream::<String, String>::new(&option, &ProcessUniqueId::new(),
-// None, None).await;             while let Some(result) = stream.next().await {
-//                 println!("{}", result.unwrap().0)
-//             }
-//         })
-//     }
-// }

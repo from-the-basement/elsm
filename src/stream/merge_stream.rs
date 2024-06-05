@@ -11,12 +11,16 @@ use executor::futures::StreamExt;
 use futures::Stream;
 use pin_project::pin_project;
 
-use crate::{serdes::Decode, stream::EStreamImpl, utils::CmpKeyItem};
+use crate::{
+    serdes::Decode,
+    stream::{EStreamImpl, StreamError},
+    utils::CmpKeyItem,
+};
 
 #[pin_project]
 pub struct MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
@@ -30,7 +34,7 @@ where
 
 impl<'stream, K, T, V, G, F> MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord + Debug,
+    K: Ord + Debug + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
@@ -38,7 +42,7 @@ where
 {
     pub(crate) async fn new(
         mut iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
-    ) -> Result<Self, V::Error> {
+    ) -> Result<Self, StreamError<K, V>> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
@@ -65,13 +69,13 @@ where
 
 impl<'stream, K, T, V, G, F> Stream for MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord + Debug,
+    K: Ord + Debug + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<G>), V::Error>;
+    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
