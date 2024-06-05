@@ -9,12 +9,18 @@ use executor::futures::Stream;
 use pin_project::pin_project;
 
 use crate::{
-    index_batch::stream::IndexBatchStream, mem_table::stream::MemTableStream, serdes::Decode,
-    stream::buf_stream::BufStream, transaction::TransactionStream,
+    index_batch::stream::IndexBatchStream,
+    mem_table::stream::MemTableStream,
+    serdes::Decode,
+    stream::{buf_stream::BufStream, table_stream::TableStream},
+    transaction::TransactionStream,
 };
 
+pub(crate) mod batch_stream;
 pub(crate) mod buf_stream;
+pub(crate) mod merge_inner_stream;
 pub(crate) mod merge_stream;
+pub(crate) mod table_stream;
 
 #[pin_project(project = EStreamImplProj)]
 pub(crate) enum EStreamImpl<'a, K, T, V, G, F>
@@ -29,6 +35,15 @@ where
     IndexBatch(#[pin] IndexBatchStream<'a, K, T, V, G, F>),
     MemTable(#[pin] MemTableStream<'a, K, T, V, G, F>),
     TransactionInner(#[pin] TransactionStream<'a, K, V, G, F, V::Error>),
+}
+
+#[pin_project(project = EInnerStreamImplProj)]
+pub(crate) enum EInnerStreamImpl<'a, K, V>
+where
+    K: Decode + Send + Sync + 'static,
+    V: Decode + Send + Sync + 'static,
+{
+    Table(#[pin] TableStream<'a, K, V>),
 }
 
 impl<'a, K, T, V, G, F> Stream for EStreamImpl<'a, K, T, V, G, F>
@@ -47,6 +62,20 @@ where
             EStreamImplProj::IndexBatch(stream) => stream.poll_next(cx),
             EStreamImplProj::MemTable(stream) => stream.poll_next(cx),
             EStreamImplProj::TransactionInner(stream) => stream.poll_next(cx),
+        }
+    }
+}
+
+impl<'a, K, V> Stream for EInnerStreamImpl<'a, K, V>
+where
+    K: Ord + Decode + Send + Sync + 'static,
+    V: Decode + Send + Sync + 'static,
+{
+    type Item = Result<(Arc<K>, Option<V>), V::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.project() {
+            EInnerStreamImplProj::Table(stream) => stream.poll_next(cx),
         }
     }
 }

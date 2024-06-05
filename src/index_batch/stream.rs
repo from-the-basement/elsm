@@ -55,7 +55,7 @@ where
                     Some(true) | None
                 )
             {
-                let mut future = pin!(decode_value::<V>(this.batch, *offset));
+                let mut future = pin!(decode_value::<V>(this.batch, 1, *offset as usize));
 
                 return match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(option)) => Poll::Ready(

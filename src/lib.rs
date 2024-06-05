@@ -86,6 +86,9 @@ pub struct DbOption {
     pub path: PathBuf,
     pub max_mem_table_size: usize,
     pub immutable_chunk_num: usize,
+    pub major_threshold_with_sst_size: usize,
+    pub level_sst_magnification: usize,
+    pub sst_file_size: usize,
 }
 
 #[derive(Debug)]
@@ -143,7 +146,7 @@ where
 
         let (task_tx, mut task_rx) = channel(1);
         let mut compactor =
-            Compactor::<K, O>::new(immutable.clone(), option.clone(), version.clone());
+            Compactor::<K, O, V>::new(immutable.clone(), option.clone(), version.clone());
 
         spawn(async move {
             loop {
@@ -303,7 +306,7 @@ where
 
         let guard = self.version.read().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
-            if let Ok(value) = decode_value(&record_batch, 0).await {
+            if let Ok(value) = decode_value(&record_batch, 1, 0).await {
                 return value.map(|v| f(&v));
             }
         }
@@ -609,11 +612,30 @@ where
 }
 
 impl DbOption {
+    pub(crate) fn new(path: impl Into<PathBuf> + Send) -> Self {
+        DbOption {
+            path: path.into(),
+            max_mem_table_size: 8 * 1024 * 1024,
+            immutable_chunk_num: 5,
+            major_threshold_with_sst_size: 10,
+            level_sst_magnification: 10,
+            sst_file_size: 64 * 1024 * 1024,
+        }
+    }
+
     pub(crate) fn table_path(&self, gen: &ProcessUniqueId) -> PathBuf {
         self.path.join(format!("{}.parquet", gen))
     }
     pub(crate) fn version_path(&self) -> PathBuf {
         self.path.join("version.log")
+    }
+
+    pub(crate) fn is_threshold_exceeded_major<K>(&self, version: &Version<K>, level: usize) -> bool
+    where
+        K: Ord + Encode + Decode + Debug,
+    {
+        version.tables_len(level)
+            >= (self.major_threshold_with_sst_size * self.level_sst_magnification.pow(level as u32))
     }
 }
 
@@ -641,11 +663,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -693,11 +711,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -775,11 +789,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -834,6 +844,9 @@ mod tests {
                         path: temp_dir.path().to_path_buf(),
                         max_mem_table_size: 25,
                         immutable_chunk_num: 1,
+                        major_threshold_with_sst_size: 5,
+                        level_sst_magnification: 10,
+                        sst_file_size: 2 * 1024 * 1024,
                     },
                 )
                 .await
@@ -1130,10 +1143,11 @@ mod tests {
             .unwrap();
 
             assert_eq!(
-                db.get(&Arc::new("key2000".to_owned()), &0, |v| v.clone())
+                db.get(&Arc::new("key20".to_owned()), &0, |v: &String| v.clone())
                     .await,
                 Some(value_1.clone())
             );
+
             drop(db);
 
             let db = Arc::new(
@@ -1145,6 +1159,9 @@ mod tests {
                         path: temp_dir.path().to_path_buf(),
                         max_mem_table_size: 25,
                         immutable_chunk_num: 1,
+                        major_threshold_with_sst_size: 5,
+                        level_sst_magnification: 10,
+                        sst_file_size: 2 * 1024 * 1024,
                     },
                 )
                 .await
@@ -1152,7 +1169,7 @@ mod tests {
             );
 
             assert_eq!(
-                db.get(&Arc::new("key2000".to_owned()), &0, |v: &String| v.clone())
+                db.get(&Arc::new("key20".to_owned()), &0, |v: &String| v.clone())
                     .await,
                 Some(value_1)
             );
@@ -1168,11 +1185,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -1189,11 +1202,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),

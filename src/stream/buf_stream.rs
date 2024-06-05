@@ -96,7 +96,6 @@ mod tests {
     use crate::stream::buf_stream::BufStream;
 
     #[test]
-
     fn iter() {
         block_on(async {
             let key_1 = Arc::new("key_1".to_owned());

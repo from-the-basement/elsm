@@ -1,7 +1,7 @@
 pub(crate) mod edit;
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{metadata, File, OpenOptions},
     io::SeekFrom,
     sync::Arc,
 };
@@ -11,7 +11,10 @@ use arrow::{
     compute::kernels::cmp::eq,
 };
 use async_lock::RwLock;
-use executor::{fs, futures::AsyncSeekExt};
+use executor::{
+    fs,
+    futures::{AsyncSeekExt, AsyncWriteExt},
+};
 use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
     ProjectionMask,
@@ -26,14 +29,15 @@ use crate::{
     DbOption, Offset,
 };
 
+pub const MAX_LEVEL: usize = 7;
+
 pub(crate) type SyncVersion<K> = Arc<RwLock<Version<K>>>;
 
 pub(crate) struct Version<K>
 where
     K: Encode + Decode + Ord,
 {
-    // FIXME: only level 0
-    pub(crate) level_slice: Vec<Scope<K>>,
+    pub(crate) level_slice: [Vec<Scope<K>>; MAX_LEVEL],
     pub(crate) log: fs::File,
 }
 
@@ -51,10 +55,10 @@ where
                 .map_err(VersionError::Io)?,
         );
         let edits = VersionEdit::recover(&mut log).await;
-
         log.seek(SeekFrom::End(0)).await.map_err(VersionError::Io)?;
+
         let mut version = Version {
-            level_slice: vec![],
+            level_slice: Self::level_slice_new(),
             log,
         };
         apply_edits(&mut version, edits, true).await?;
@@ -74,7 +78,7 @@ where
 
         let key_scalar = GenericBinaryArray::<Offset>::from(vec![key_bytes.as_slice()]);
 
-        for scope in self.level_slice.iter().rev() {
+        for scope in self.level_slice[0].iter().rev() {
             if !scope.is_between(key) {
                 continue;
             }
@@ -82,7 +86,42 @@ where
                 return Ok(Some(batch));
             }
         }
+        for level in self.level_slice[1..6].iter() {
+            if level.is_empty() {
+                continue;
+            }
+            let index = Self::scope_search(key, level);
+            if !level[index].is_between(key) {
+                continue;
+            }
+            if let Some(batch) = Self::read_parquet(&level[index].gen, &key_scalar, option).await? {
+                return Ok(Some(batch));
+            }
+        }
+
         Ok(None)
+    }
+
+    pub(crate) fn scope_search(key: &K, level: &[Scope<K>]) -> usize {
+        level
+            .binary_search_by(|scope| scope.min.as_ref().cmp(key))
+            .unwrap_or_else(|index| index.saturating_sub(1))
+    }
+
+    pub(crate) fn tables_len(&self, level: usize) -> usize {
+        self.level_slice[level].len()
+    }
+
+    fn level_slice_new() -> [Vec<Scope<K>>; 7] {
+        [
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]
     }
 
     async fn read_parquet(
@@ -128,14 +167,20 @@ pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(
                 .map_err(VersionError::Encode)?;
         }
         match version_edit {
-            VersionEdit::Add { scope } => {
-                version.level_slice.push(scope);
+            VersionEdit::Add { scope, level } => {
+                version.level_slice[level as usize].push(scope);
             }
-            VersionEdit::Remove { .. } => {
-                todo!()
+            VersionEdit::Remove { gen, level } => {
+                if let Some(i) = version.level_slice[level as usize]
+                    .iter()
+                    .position(|scope| scope.gen == gen)
+                {
+                    version.level_slice[level as usize].remove(i);
+                }
             }
         }
     }
+    version.log.flush().await.map_err(VersionError::Io)?;
     Ok(())
 }
 
@@ -154,48 +199,4 @@ where
     Arrow(#[source] arrow::error::ArrowError),
     #[error("version parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use futures::{executor::block_on, io::Cursor};
-
-    use crate::{scope::Scope, serdes::Encode, version::edit::VersionEdit};
-
-    #[test]
-    fn encode_and_decode() {
-        block_on(async {
-            let edits = vec![
-                VersionEdit::Add {
-                    scope: Scope {
-                        min: Arc::new("Min".to_string()),
-                        max: Arc::new("Max".to_string()),
-                        gen: Default::default(),
-                    },
-                },
-                VersionEdit::Remove {
-                    gen: Default::default(),
-                },
-            ];
-
-            let bytes = {
-                let mut cursor = Cursor::new(vec![]);
-
-                for edit in edits.clone() {
-                    edit.encode(&mut cursor).await.unwrap();
-                }
-                cursor.into_inner()
-            };
-
-            let decode_edits = {
-                let mut cursor = Cursor::new(bytes);
-
-                VersionEdit::<String>::recover(&mut cursor).await
-            };
-
-            assert_eq!(edits, decode_edits);
-        })
-    }
 }

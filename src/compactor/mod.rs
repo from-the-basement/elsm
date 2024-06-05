@@ -1,5 +1,10 @@
-use std::{collections::VecDeque, error::Error, fmt::Debug, fs::File, sync::Arc};
+use std::{
+    collections::VecDeque, error::Error, fmt::Debug, fs::File, marker::PhantomData, pin::pin,
+    sync::Arc,
+};
 
+use arrow::array::{GenericBinaryBuilder, RecordBatch};
+use executor::futures::{util::io::Cursor, StreamExt};
 use futures::channel::oneshot;
 use parquet::arrow::ArrowWriter;
 use snowflake::ProcessUniqueId;
@@ -10,23 +15,27 @@ use crate::{
     oracle::Oracle,
     scope::Scope,
     serdes::{Decode, Encode},
-    version::{apply_edits, edit::VersionEdit, SyncVersion, VersionError},
-    DbOption, Immutable, ELSM_SCHEMA,
+    stream::{merge_inner_stream::MergeInnerStream, table_stream::TableStream, EInnerStreamImpl},
+    version::{apply_edits, edit::VersionEdit, SyncVersion, Version, VersionError, MAX_LEVEL},
+    DbOption, Immutable, Offset, ELSM_SCHEMA,
 };
 
-pub(crate) struct Compactor<K, O>
+pub(crate) struct Compactor<K, O, V>
 where
-    K: Ord + Encode + Decode + Debug,
+    K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
 {
     pub(crate) option: Arc<DbOption>,
     pub(crate) immutable: Immutable<K, O::Timestamp>,
     pub(crate) version: SyncVersion<K>,
+    _p: PhantomData<V>,
 }
 
-impl<K, O> Compactor<K, O>
+impl<K, O, V> Compactor<K, O, V>
 where
-    K: Ord + Encode + Decode + Debug,
+    K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
+    V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
 {
     pub(crate) fn new(
@@ -34,10 +43,11 @@ where
         option: Arc<DbOption>,
         version: SyncVersion<K>,
     ) -> Self {
-        Compactor {
+        Compactor::<K, O, V> {
             option,
             immutable,
             version,
+            _p: Default::default(),
         }
     }
 
@@ -53,7 +63,22 @@ where
             if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
                 let mut guard = self.version.write().await;
 
-                apply_edits(&mut guard, vec![VersionEdit::Add { scope }], false)
+                let mut version_edits = vec![];
+
+                if self.option.is_threshold_exceeded_major(&guard, 0) {
+                    Self::major_compaction(
+                        &guard,
+                        &self.option,
+                        &scope.min,
+                        &scope.max,
+                        &mut version_edits,
+                    )
+                    .await
+                    .unwrap();
+                }
+                version_edits.insert(0, VersionEdit::Add { level: 0, scope });
+
+                apply_edits(&mut guard, version_edits, false)
                     .await
                     .map_err(CompactionError::Version)?;
             }
@@ -103,6 +128,171 @@ where
             }));
         }
         Ok(None)
+    }
+
+    pub(crate) async fn major_compaction(
+        version: &Version<K>,
+        option: &DbOption,
+        mut min: &Arc<K>,
+        mut max: &Arc<K>,
+        version_edits: &mut Vec<VersionEdit<K>>,
+    ) -> Result<(), CompactionError<K>> {
+        fn clear(buf: &mut Cursor<Vec<u8>>) {
+            buf.get_mut().clear();
+            buf.set_position(0);
+        }
+
+        let mut level = 0;
+
+        while level < MAX_LEVEL - 2 {
+            if !option.is_threshold_exceeded_major(version, level) {
+                break;
+            }
+
+            let mut meet_scopes_l = Vec::new();
+            {
+                let index = Version::<K>::scope_search(min, &version.level_slice[level]);
+
+                for scope in version.level_slice[level][index..].iter() {
+                    if scope.is_between(min) || scope.is_between(max) {
+                        meet_scopes_l.push(scope);
+                    }
+                }
+                if meet_scopes_l.is_empty() {
+                    return Ok(());
+                }
+            }
+            let mut meet_scopes_ll = Vec::new();
+            {
+                if !version.level_slice[level + 1].is_empty() {
+                    let min_key = &meet_scopes_l.first().unwrap().min;
+                    let max_key = &meet_scopes_l.last().unwrap().max;
+                    min = min_key;
+                    max = max_key;
+
+                    let min_index =
+                        Version::<K>::scope_search(min_key, &version.level_slice[level]);
+                    let max_index =
+                        Version::<K>::scope_search(max_key, &version.level_slice[level]);
+
+                    for scope in version.level_slice[level + 1][min_index..max_index].iter() {
+                        if scope.is_between(min) || scope.is_between(max) {
+                            meet_scopes_ll.push(scope);
+                        }
+                    }
+                }
+            }
+            let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
+
+            for scope in meet_scopes_l.iter().chain(meet_scopes_ll.iter()) {
+                streams.push(EInnerStreamImpl::Table(
+                    TableStream::new(option, &scope.gen, None, None).await,
+                ));
+            }
+            let stream = MergeInnerStream::<K, V>::new(streams).await.unwrap();
+
+            let mut buf = Cursor::new(vec![0; 128]);
+            let mut stream = pin!(stream);
+            let mut key_builder = GenericBinaryBuilder::<Offset>::new();
+            let mut value_builder = GenericBinaryBuilder::<Offset>::new();
+            let mut written_size = 0;
+            let mut min = None;
+            let mut max = None;
+
+            while let Some(result) = stream.next().await {
+                let (key, value) = result.unwrap();
+                if min.is_none() {
+                    min = Some(key.clone())
+                }
+                max = Some(key.clone());
+
+                written_size += key.size();
+                clear(&mut buf);
+                key.encode(&mut buf).await.unwrap();
+                key_builder.append_value(buf.get_ref());
+
+                if let Some(value) = value {
+                    clear(&mut buf);
+                    value.encode(&mut buf).await.unwrap();
+                    value_builder.append_value(buf.get_ref());
+                    written_size += value.size();
+                } else {
+                    value_builder.append_null();
+                }
+
+                if written_size >= option.sst_file_size {
+                    let gen = ProcessUniqueId::new();
+                    let batch = RecordBatch::try_new(
+                        ELSM_SCHEMA.clone(),
+                        vec![
+                            Arc::new(key_builder.finish()),
+                            Arc::new(value_builder.finish()),
+                        ],
+                    )
+                    .unwrap();
+                    let mut writer = ArrowWriter::try_new(
+                        File::create(option.table_path(&gen)).unwrap(),
+                        ELSM_SCHEMA.clone(),
+                        None,
+                    )
+                    .unwrap();
+                    writer.write(&batch).unwrap();
+                    writer.close().unwrap();
+                    version_edits.push(VersionEdit::Add {
+                        level: (level + 1) as u8,
+                        scope: Scope {
+                            min: min.take().unwrap(),
+                            max: max.take().unwrap(),
+                            gen,
+                        },
+                    });
+                    written_size = 0;
+                }
+            }
+            if written_size > 0 {
+                // FIXME: Copy Code ↑
+                let gen = ProcessUniqueId::new();
+                let batch = RecordBatch::try_new(
+                    ELSM_SCHEMA.clone(),
+                    vec![
+                        Arc::new(key_builder.finish()),
+                        Arc::new(value_builder.finish()),
+                    ],
+                )
+                .unwrap();
+                let mut writer = ArrowWriter::try_new(
+                    File::create(option.table_path(&gen)).unwrap(),
+                    ELSM_SCHEMA.clone(),
+                    None,
+                )
+                .unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                version_edits.push(VersionEdit::Add {
+                    level: (level + 1) as u8,
+                    scope: Scope {
+                        min: min.take().unwrap(),
+                        max: max.take().unwrap(),
+                        gen,
+                    },
+                });
+            }
+            for scope in meet_scopes_l {
+                version_edits.push(VersionEdit::Remove {
+                    level: level as u8,
+                    gen: scope.gen,
+                })
+            }
+            for scope in meet_scopes_ll {
+                version_edits.push(VersionEdit::Remove {
+                    level: (level + 1) as u8,
+                    gen: scope.gen,
+                })
+            }
+            level += 1;
+        }
+
+        Ok(())
     }
 }
 

@@ -41,7 +41,9 @@ where
             .next()
         {
             if item_key == key {
-                return Ok(Some(decode_value::<V>(&self.batch, *offset).await?));
+                return Ok(Some(
+                    decode_value::<V>(&self.batch, 1, *offset as usize).await?,
+                ));
             }
         }
         Ok(None)
@@ -57,11 +59,15 @@ where
     }
 }
 
-pub(crate) async fn decode_value<V>(batch: &RecordBatch, offset: u32) -> Result<Option<V>, V::Error>
+pub(crate) async fn decode_value<V>(
+    batch: &RecordBatch,
+    column: usize,
+    offset: usize,
+) -> Result<Option<V>, V::Error>
 where
     V: Decode + Sync + Send,
 {
-    let bytes = batch.column(1).as_binary::<Offset>().value(offset as usize);
+    let bytes = batch.column(column).as_binary::<Offset>().value(offset);
 
     if bytes.is_empty() {
         return Ok(None);
