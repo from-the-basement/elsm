@@ -120,7 +120,7 @@ where
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Decode + Debug + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + Sync + 'static,
+    V: Encode + Decode + Debug + Send + Sync + 'static,
     O: Oracle<K> + 'static,
     O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,

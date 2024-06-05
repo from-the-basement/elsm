@@ -1,7 +1,7 @@
 pub(crate) mod edit;
 
 use std::{
-    fs::{metadata, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::SeekFrom,
     sync::Arc,
 };
@@ -187,12 +187,10 @@ pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(
 #[derive(Debug, Error)]
 pub enum VersionError<K>
 where
-    K: Encode + Decode,
+    K: Encode,
 {
     #[error("version encode error: {0}")]
     Encode(#[source] <K as Encode>::Error),
-    #[error("version decode error: {0}")]
-    Decode(#[source] <K as Decode>::Error),
     #[error("version io error: {0}")]
     Io(#[source] std::io::Error),
     #[error("version arrow error: {0}")]

@@ -1,9 +1,9 @@
-use std::{
-    collections::VecDeque, error::Error, fmt::Debug, fs::File, marker::PhantomData, pin::pin,
-    sync::Arc,
-};
+use std::{collections::VecDeque, fmt::Debug, fs::File, marker::PhantomData, pin::pin, sync::Arc};
 
-use arrow::array::{GenericBinaryBuilder, RecordBatch};
+use arrow::{
+    array::{GenericBinaryBuilder, GenericByteBuilder, RecordBatch},
+    datatypes::GenericBinaryType,
+};
 use executor::futures::{util::io::Cursor, StreamExt};
 use futures::channel::oneshot;
 use parquet::arrow::ArrowWriter;
@@ -23,7 +23,7 @@ use crate::{
 pub(crate) struct Compactor<K, O, V>
 where
     K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
-    V: Encode + Decode + Send + Sync + 'static,
+    V: Debug + Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
 {
     pub(crate) option: Arc<DbOption>,
@@ -35,7 +35,7 @@ where
 impl<K, O, V> Compactor<K, O, V>
 where
     K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
-    V: Encode + Decode + Send + Sync + 'static,
+    V: Debug + Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
 {
     pub(crate) fn new(
@@ -54,7 +54,7 @@ where
     pub(crate) async fn check_then_compaction(
         &mut self,
         option_tx: Option<oneshot::Sender<()>>,
-    ) -> Result<(), CompactionError<K>> {
+    ) -> Result<(), CompactionError<K, V>> {
         let mut guard = self.immutable.write().await;
 
         if guard.len() > self.option.immutable_chunk_num {
@@ -73,8 +73,7 @@ where
                         &scope.max,
                         &mut version_edits,
                     )
-                    .await
-                    .unwrap();
+                    .await?;
                 }
                 version_edits.insert(0, VersionEdit::Add { level: 0, scope });
 
@@ -92,7 +91,7 @@ where
     pub(crate) async fn minor_compaction(
         option: &DbOption,
         batches: VecDeque<IndexBatch<K, O::Timestamp>>,
-    ) -> Result<Option<Scope<K>>, CompactionError<K>> {
+    ) -> Result<Option<Scope<K>>, CompactionError<K, V>> {
         if !batches.is_empty() {
             let mut min = None;
             let mut max = None;
@@ -136,7 +135,7 @@ where
         mut min: &Arc<K>,
         mut max: &Arc<K>,
         version_edits: &mut Vec<VersionEdit<K>>,
-    ) -> Result<(), CompactionError<K>> {
+    ) -> Result<(), CompactionError<K, V>> {
         fn clear(buf: &mut Cursor<Vec<u8>>) {
             buf.get_mut().clear();
             buf.set_position(0);
@@ -189,7 +188,9 @@ where
                     TableStream::new(option, &scope.gen, None, None).await,
                 ));
             }
-            let stream = MergeInnerStream::<K, V>::new(streams).await.unwrap();
+            let stream = MergeInnerStream::<K, V>::new(streams)
+                .await
+                .map_err(CompactionError::ValueDecode)?;
 
             let mut buf = Cursor::new(vec![0; 128]);
             let mut stream = pin!(stream);
@@ -200,7 +201,7 @@ where
             let mut max = None;
 
             while let Some(result) = stream.next().await {
-                let (key, value) = result.unwrap();
+                let (key, value) = result.map_err(CompactionError::ValueDecode)?;
                 if min.is_none() {
                     min = Some(key.clone())
                 }
@@ -208,12 +209,17 @@ where
 
                 written_size += key.size();
                 clear(&mut buf);
-                key.encode(&mut buf).await.unwrap();
+                key.encode(&mut buf)
+                    .await
+                    .map_err(CompactionError::KeyEncode)?;
                 key_builder.append_value(buf.get_ref());
 
                 if let Some(value) = value {
                     clear(&mut buf);
-                    value.encode(&mut buf).await.unwrap();
+                    value
+                        .encode(&mut buf)
+                        .await
+                        .map_err(CompactionError::ValueEncode)?;
                     value_builder.append_value(buf.get_ref());
                     written_size += value.size();
                 } else {
@@ -221,61 +227,28 @@ where
                 }
 
                 if written_size >= option.sst_file_size {
-                    let gen = ProcessUniqueId::new();
-                    let batch = RecordBatch::try_new(
-                        ELSM_SCHEMA.clone(),
-                        vec![
-                            Arc::new(key_builder.finish()),
-                            Arc::new(value_builder.finish()),
-                        ],
-                    )
-                    .unwrap();
-                    let mut writer = ArrowWriter::try_new(
-                        File::create(option.table_path(&gen)).unwrap(),
-                        ELSM_SCHEMA.clone(),
-                        None,
-                    )
-                    .unwrap();
-                    writer.write(&batch).unwrap();
-                    writer.close().unwrap();
-                    version_edits.push(VersionEdit::Add {
-                        level: (level + 1) as u8,
-                        scope: Scope {
-                            min: min.take().unwrap(),
-                            max: max.take().unwrap(),
-                            gen,
-                        },
-                    });
+                    Self::build_table(
+                        option,
+                        version_edits,
+                        level,
+                        &mut key_builder,
+                        &mut value_builder,
+                        &mut min,
+                        &mut max,
+                    )?;
                     written_size = 0;
                 }
             }
             if written_size > 0 {
-                // FIXME: Copy Code ↑
-                let gen = ProcessUniqueId::new();
-                let batch = RecordBatch::try_new(
-                    ELSM_SCHEMA.clone(),
-                    vec![
-                        Arc::new(key_builder.finish()),
-                        Arc::new(value_builder.finish()),
-                    ],
-                )
-                .unwrap();
-                let mut writer = ArrowWriter::try_new(
-                    File::create(option.table_path(&gen)).unwrap(),
-                    ELSM_SCHEMA.clone(),
-                    None,
-                )
-                .unwrap();
-                writer.write(&batch).unwrap();
-                writer.close().unwrap();
-                version_edits.push(VersionEdit::Add {
-                    level: (level + 1) as u8,
-                    scope: Scope {
-                        min: min.take().unwrap(),
-                        max: max.take().unwrap(),
-                        gen,
-                    },
-                });
+                Self::build_table(
+                    option,
+                    version_edits,
+                    level,
+                    &mut key_builder,
+                    &mut value_builder,
+                    &mut min,
+                    &mut max,
+                )?;
             }
             for scope in meet_scopes_l {
                 version_edits.push(VersionEdit::Remove {
@@ -294,21 +267,66 @@ where
 
         Ok(())
     }
+
+    fn build_table(
+        option: &DbOption,
+        version_edits: &mut Vec<VersionEdit<K>>,
+        level: usize,
+        key_builder: &mut GenericByteBuilder<GenericBinaryType<Offset>>,
+        value_builder: &mut GenericByteBuilder<GenericBinaryType<Offset>>,
+        min: &mut Option<Arc<K>>,
+        max: &mut Option<Arc<K>>,
+    ) -> Result<(), CompactionError<K, V>> {
+        assert!(min.is_some());
+        assert!(max.is_some());
+
+        let gen = ProcessUniqueId::new();
+        let batch = RecordBatch::try_new(
+            ELSM_SCHEMA.clone(),
+            vec![
+                Arc::new(key_builder.finish()),
+                Arc::new(value_builder.finish()),
+            ],
+        )
+        .map_err(CompactionError::Arrow)?;
+        let mut writer = ArrowWriter::try_new(
+            File::create(option.table_path(&gen)).map_err(CompactionError::Io)?,
+            ELSM_SCHEMA.clone(),
+            None,
+        )
+        .map_err(CompactionError::Parquet)?;
+        writer.write(&batch).map_err(CompactionError::Parquet)?;
+        writer.close().map_err(CompactionError::Parquet)?;
+        version_edits.push(VersionEdit::Add {
+            level: (level + 1) as u8,
+            scope: Scope {
+                min: min.take().unwrap(),
+                max: max.take().unwrap(),
+                gen,
+            },
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
-pub enum CompactionError<K>
+pub enum CompactionError<K, V>
 where
     K: Encode + Decode,
+    V: Encode + Decode,
 {
-    #[error("compaction encode error: {0}")]
-    Encode(#[source] <K as Encode>::Error),
+    #[error("compaction key encode error: {0}")]
+    KeyEncode(#[source] <K as Encode>::Error),
+    #[error("compaction value encode error: {0}")]
+    ValueEncode(#[source] <V as Encode>::Error),
+    #[error("compaction value decode error: {0}")]
+    ValueDecode(#[source] <V as Decode>::Error),
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
+    #[error("compaction arrow error: {0}")]
+    Arrow(#[source] arrow::error::ArrowError),
     #[error("compaction parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
-    #[error("compaction internal error: {0}")]
-    Internal(#[source] Box<dyn Error + Send + Sync + 'static>),
     #[error("compaction version error: {0}")]
     Version(#[source] VersionError<K>),
 }
