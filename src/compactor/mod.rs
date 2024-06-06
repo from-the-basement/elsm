@@ -229,7 +229,7 @@ where
                     value_builder.append_null();
                 }
 
-                if written_size >= option.sst_file_size {
+                if written_size >= option.max_sst_file_size {
                     Self::build_table(
                         option,
                         version_edits,

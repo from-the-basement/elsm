@@ -88,7 +88,7 @@ pub struct DbOption {
     pub immutable_chunk_num: usize,
     pub major_threshold_with_sst_size: usize,
     pub level_sst_magnification: usize,
-    pub sst_file_size: usize,
+    pub max_sst_file_size: usize,
 }
 
 #[derive(Debug)]
@@ -617,7 +617,7 @@ impl DbOption {
             immutable_chunk_num: 5,
             major_threshold_with_sst_size: 10,
             level_sst_magnification: 10,
-            sst_file_size: 64 * 1024 * 1024,
+            max_sst_file_size: 64 * 1024 * 1024,
         }
     }
 
@@ -844,7 +844,7 @@ mod tests {
                         immutable_chunk_num: 1,
                         major_threshold_with_sst_size: 5,
                         level_sst_magnification: 10,
-                        sst_file_size: 2 * 1024 * 1024,
+                        max_sst_file_size: 2 * 1024 * 1024,
                     },
                 )
                 .await
@@ -1159,7 +1159,7 @@ mod tests {
                         immutable_chunk_num: 1,
                         major_threshold_with_sst_size: 5,
                         level_sst_magnification: 10,
-                        sst_file_size: 2 * 1024 * 1024,
+                        max_sst_file_size: 2 * 1024 * 1024,
                     },
                 )
                 .await
