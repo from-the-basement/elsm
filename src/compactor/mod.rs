@@ -19,7 +19,7 @@ use crate::{
         merge_inner_stream::MergeInnerStream, table_stream::TableStream, EInnerStreamImpl,
         StreamError,
     },
-    version::{apply_edits, edit::VersionEdit, SyncVersion, Version, VersionError, MAX_LEVEL},
+    version::{edit::VersionEdit, set::VersionSet, Version, VersionError, MAX_LEVEL},
     DbOption, Immutable, Offset, ELSM_SCHEMA,
 };
 
@@ -31,7 +31,7 @@ where
 {
     pub(crate) option: Arc<DbOption>,
     pub(crate) immutable: Immutable<K, O::Timestamp>,
-    pub(crate) version: SyncVersion<K>,
+    pub(crate) version_set: VersionSet<K>,
     _p: PhantomData<V>,
 }
 
@@ -44,12 +44,12 @@ where
     pub(crate) fn new(
         immutable: Immutable<K, O::Timestamp>,
         option: Arc<DbOption>,
-        version: SyncVersion<K>,
+        version_set: VersionSet<K>,
     ) -> Self {
         Compactor::<K, O, V> {
             option,
             immutable,
-            version,
+            version_set,
             _p: Default::default(),
         }
     }
@@ -64,13 +64,12 @@ where
             let excess = guard.split_off(self.option.immutable_chunk_num);
 
             if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
-                let mut guard = self.version.write().await;
-
+                let version_ref = self.version_set.current().await;
                 let mut version_edits = vec![];
 
-                if self.option.is_threshold_exceeded_major(&guard, 0) {
+                if self.option.is_threshold_exceeded_major(&version_ref, 0) {
                     Self::major_compaction(
-                        &guard,
+                        &version_ref,
                         &self.option,
                         &scope.min,
                         &scope.max,
@@ -80,7 +79,8 @@ where
                 }
                 version_edits.insert(0, VersionEdit::Add { level: 0, scope });
 
-                apply_edits(&mut guard, version_edits, false)
+                self.version_set
+                    .apply_edits(version_edits, false)
                     .await
                     .map_err(CompactionError::Version)?;
             }

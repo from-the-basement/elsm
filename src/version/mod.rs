@@ -1,19 +1,11 @@
 pub(crate) mod edit;
+pub(crate) mod set;
 
-use std::{
-    fs::{File, OpenOptions},
-    io::SeekFrom,
-    sync::Arc,
-};
+use std::{fs::File, sync::Arc};
 
 use arrow::{
     array::{GenericBinaryArray, RecordBatch, Scalar},
     compute::kernels::cmp::eq,
-};
-use async_lock::RwLock;
-use executor::{
-    fs,
-    futures::{AsyncSeekExt, AsyncWriteExt},
 };
 use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
@@ -25,47 +17,45 @@ use thiserror::Error;
 use crate::{
     scope::Scope,
     serdes::{Decode, Encode},
-    version::edit::VersionEdit,
     DbOption, Offset,
 };
 
 pub const MAX_LEVEL: usize = 7;
 
-pub(crate) type SyncVersion<K> = Arc<RwLock<Version<K>>>;
+pub(crate) type VersionRef<K> = Arc<Version<K>>;
 
 pub(crate) struct Version<K>
 where
     K: Encode + Decode + Ord,
 {
+    pub(crate) num: usize,
     pub(crate) level_slice: [Vec<Scope<K>>; MAX_LEVEL],
-    pub(crate) log: fs::File,
+}
+
+impl<K> Clone for Version<K>
+where
+    K: Encode + Decode + Ord,
+{
+    fn clone(&self) -> Self {
+        let mut level_slice = Version::level_slice_new();
+
+        for (level, scopes) in self.level_slice.iter().enumerate() {
+            for scope in scopes {
+                level_slice[level].push(scope.clone());
+            }
+        }
+
+        Self {
+            num: self.num,
+            level_slice,
+        }
+    }
 }
 
 impl<K> Version<K>
 where
     K: Encode + Decode + Ord,
 {
-    pub(crate) async fn new(option: &DbOption) -> Result<Self, VersionError<K>> {
-        let mut log = fs::File::from(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .open(option.version_path())
-                .map_err(VersionError::Io)?,
-        );
-        let edits = VersionEdit::recover(&mut log).await;
-        log.seek(SeekFrom::End(0)).await.map_err(VersionError::Io)?;
-
-        let mut version = Version {
-            level_slice: Self::level_slice_new(),
-            log,
-        };
-        apply_edits(&mut version, edits, true).await?;
-
-        Ok(version)
-    }
-
     pub(crate) async fn query(
         &self,
         key: &K,
@@ -112,7 +102,7 @@ where
         self.level_slice[level].len()
     }
 
-    fn level_slice_new() -> [Vec<Scope<K>>; 7] {
+    pub(crate) fn level_slice_new() -> [Vec<Scope<K>>; 7] {
         [
             Vec::new(),
             Vec::new(),
@@ -152,36 +142,6 @@ where
         }
         Ok(None)
     }
-}
-
-pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(
-    version: &mut Version<K>,
-    version_edits: Vec<VersionEdit<K>>,
-    is_recover: bool,
-) -> Result<(), VersionError<K>> {
-    for version_edit in version_edits {
-        if !is_recover {
-            version_edit
-                .encode(&mut version.log)
-                .await
-                .map_err(VersionError::Encode)?;
-        }
-        match version_edit {
-            VersionEdit::Add { scope, level } => {
-                version.level_slice[level as usize].push(scope);
-            }
-            VersionEdit::Remove { gen, level } => {
-                if let Some(i) = version.level_slice[level as usize]
-                    .iter()
-                    .position(|scope| scope.gen == gen)
-                {
-                    version.level_slice[level as usize].remove(i);
-                }
-            }
-        }
-    }
-    version.log.flush().await.map_err(VersionError::Io)?;
-    Ok(())
 }
 
 #[derive(Debug, Error)]

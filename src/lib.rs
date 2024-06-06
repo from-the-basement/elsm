@@ -60,7 +60,7 @@ use crate::{
     index_batch::{decode_value, IndexBatch},
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
-    version::{SyncVersion, Version},
+    version::{set::VersionSet, Version},
     wal::WalRecover,
 };
 
@@ -114,7 +114,7 @@ where
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
     pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
-    pub(crate) version: SyncVersion<K>,
+    pub(crate) version_set: VersionSet<K>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
@@ -141,12 +141,12 @@ where
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
         let immutable = Arc::new(RwLock::new(VecDeque::new()));
-        let version = Arc::new(RwLock::new(Version::new(&option).await.unwrap()));
+        let version_set = VersionSet::<K>::new(&option).await.unwrap();
         let option = Arc::new(option);
 
         let (task_tx, mut task_rx) = channel(1);
         let mut compactor =
-            Compactor::<K, O, V>::new(immutable.clone(), option.clone(), version.clone());
+            Compactor::<K, O, V>::new(immutable.clone(), option.clone(), version_set.clone());
 
         spawn(async move {
             loop {
@@ -172,7 +172,7 @@ where
             immutable,
             wal,
             compaction_tx: Mutex::new(task_tx),
-            version,
+            version_set,
         };
         let mut file_stream = pin!(wal_manager.wal_provider.list());
 
@@ -304,7 +304,7 @@ where
         }
         drop(guard);
 
-        let guard = self.version.read().await;
+        let guard = self.version_set.current().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
             if let Ok(value) = decode_value(&record_batch, 1, 0).await {
                 return value.map(|v| f(&v));

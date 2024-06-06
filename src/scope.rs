@@ -8,7 +8,7 @@ use snowflake::ProcessUniqueId;
 
 use crate::serdes::{Decode, Encode};
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Scope<K>
 where
     K: Encode + Decode + Ord,
@@ -16,6 +16,19 @@ where
     pub(crate) min: Arc<K>,
     pub(crate) max: Arc<K>,
     pub(crate) gen: ProcessUniqueId,
+}
+
+impl<K> Clone for Scope<K>
+where
+    K: Encode + Decode + Ord,
+{
+    fn clone(&self) -> Self {
+        Scope {
+            min: self.min.clone(),
+            max: self.max.clone(),
+            gen: self.gen,
+        }
+    }
 }
 
 impl<K> Scope<K>
