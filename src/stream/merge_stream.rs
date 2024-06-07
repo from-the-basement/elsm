@@ -12,7 +12,7 @@ use futures::Stream;
 use pin_project::pin_project;
 
 use crate::{
-    serdes::Decode,
+    serdes::{Decode, Encode},
     stream::{EStreamImpl, StreamError},
     utils::CmpKeyItem,
 };
@@ -20,7 +20,7 @@ use crate::{
 #[pin_project]
 pub struct MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord + Decode,
+    K: Ord + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
@@ -34,7 +34,7 @@ where
 
 impl<'stream, K, T, V, G, F> MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord + Debug + Decode,
+    K: Ord + Debug + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
@@ -69,7 +69,7 @@ where
 
 impl<'stream, K, T, V, G, F> Stream for MergeStream<'stream, K, T, V, G, F>
 where
-    K: Ord + Debug + Decode,
+    K: Ord + Debug + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,

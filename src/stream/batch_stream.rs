@@ -9,12 +9,16 @@ use arrow::record_batch::RecordBatch;
 use executor::futures::{FutureExt, Stream};
 use pin_project::pin_project;
 
-use crate::{index_batch::decode_value, serdes::Decode, stream::StreamError};
+use crate::{
+    index_batch::decode_value,
+    serdes::{Decode, Encode},
+    stream::StreamError,
+};
 
 #[pin_project]
 pub(crate) struct BatchStream<K, V>
 where
-    K: Decode + Send + Sync + 'static,
+    K: Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     pos: usize,
@@ -24,7 +28,7 @@ where
 
 impl<K, V> BatchStream<K, V>
 where
-    K: Decode + Send + Sync + 'static,
+    K: Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     pub(crate) fn new(batch: RecordBatch) -> Self {
@@ -52,7 +56,7 @@ where
 
 impl<K, V> Stream for BatchStream<K, V>
 where
-    K: Decode + Send + Sync + 'static,
+    K: Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;

@@ -15,7 +15,7 @@ use pin_project::pin_project;
 use crate::{
     index_batch::{decode_value, IndexBatch},
     mem_table::InternalKey,
-    serdes::Decode,
+    serdes::{Decode, Encode},
     stream::StreamError,
 };
 
@@ -39,7 +39,7 @@ where
 
 impl<'a, K, T, V, G, F> Stream for IndexBatchStream<'a, K, T, V, G, F>
 where
-    K: Ord + Debug + Decode,
+    K: Ord + Debug + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + 'static,
@@ -75,7 +75,7 @@ where
 
 impl<K, T> IndexBatch<K, T>
 where
-    K: Ord + Debug + Decode,
+    K: Ord + Debug + Encode + Decode,
     T: Ord + Copy + Default,
 {
     pub(crate) async fn range<V, G, F>(

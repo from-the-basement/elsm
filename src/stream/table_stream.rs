@@ -31,7 +31,7 @@ use crate::{
 #[pin_project]
 pub(crate) struct TableStream<'stream, K, V>
 where
-    K: Decode + Send + Sync + 'static,
+    K: Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     inner: ParquetRecordBatchReader,
@@ -47,19 +47,18 @@ where
     pub(crate) async fn new(
         option: &DbOption,
         gen: &ProcessUniqueId,
-        lower: Option<K>,
-        upper: Option<K>,
-    ) -> Self {
-        // FIXME: unwrap
-        let file = File::open(option.table_path(gen)).unwrap();
+        lower: Option<&Arc<K>>,
+        upper: Option<&Arc<K>>,
+    ) -> Result<Self, StreamError<K, V>> {
+        let file = File::open(option.table_path(gen)).map_err(StreamError::Io)?;
 
         let lower = if let Some(l) = lower {
-            Some(Self::to_scalar(l).await)
+            Some(Self::to_scalar(l).await?)
         } else {
             None
         };
         let upper = if let Some(u) = upper {
-            Some(Self::to_scalar(u).await)
+            Some(Self::to_scalar(u).await?)
         } else {
             None
         };
@@ -88,28 +87,33 @@ where
         let row_filter = RowFilter::new(predicates);
         builder = builder.with_row_filter(row_filter);
 
-        // FIXME: unwrap
-        let mut reader = builder.build().unwrap();
-        let batch = reader.next().unwrap().unwrap();
+        let mut reader = builder.build().map_err(StreamError::Parquet)?;
+        let batch = reader.next().unwrap().map_err(StreamError::Arrow)?;
 
-        TableStream {
+        Ok(TableStream {
             inner: reader,
             stream: BatchStream::new(batch),
             _p: Default::default(),
-        }
+        })
     }
 
-    async fn to_scalar(key: K) -> GenericByteArray<GenericBinaryType<Offset>> {
+    async fn to_scalar(
+        key: &K,
+    ) -> Result<GenericByteArray<GenericBinaryType<Offset>>, StreamError<K, V>> {
         let mut key_bytes = Vec::new();
-        key.encode(&mut key_bytes).await.unwrap();
+        key.encode(&mut key_bytes)
+            .await
+            .map_err(StreamError::KeyEncode)?;
 
-        GenericBinaryArray::<Offset>::from(vec![key_bytes.as_slice()])
+        Ok(GenericBinaryArray::<Offset>::from(vec![
+            key_bytes.as_slice()
+        ]))
     }
 }
 
 impl<K, V> Stream for TableStream<'_, K, V>
 where
-    K: Decode + Send + Sync + 'static,
+    K: Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;

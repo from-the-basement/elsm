@@ -10,7 +10,7 @@ use pin_project::pin_project;
 
 use crate::{
     mem_table::{InternalKey, MemTable},
-    serdes::Decode,
+    serdes::{Decode, Encode},
     stream::StreamError,
 };
 
@@ -30,7 +30,7 @@ where
 
 impl<'a, K, V, T, G, F> Stream for MemTableStream<'a, K, T, V, G, F>
 where
-    K: Ord + Decode,
+    K: Ord + Encode + Decode,
     T: Ord + Copy,
     V: Decode,
     G: Send + Sync + 'static,
@@ -60,7 +60,7 @@ where
 
 impl<K, V, T> MemTable<K, V, T>
 where
-    K: Ord + Decode,
+    K: Ord + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode,
 {

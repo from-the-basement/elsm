@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     oracle::WriteConflict,
-    serdes::Decode,
+    serdes::{Decode, Encode},
     stream::{merge_stream::MergeStream, EStreamImpl, StreamError},
     GetWrite,
 };
@@ -23,7 +23,7 @@ use crate::{
 #[derive(Debug)]
 pub struct Transaction<K, V, DB>
 where
-    K: Ord + Decode,
+    K: Ord + Encode + Decode,
     V: Decode,
     DB: GetWrite<K, V>,
 {
@@ -34,7 +34,7 @@ where
 
 impl<K, V, DB> Transaction<K, V, DB>
 where
-    K: Hash + Ord + Debug + Decode + Send + Sync,
+    K: Hash + Ord + Debug + Encode + Decode + Send + Sync,
     V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
     DB::Timestamp: Send + Sync,

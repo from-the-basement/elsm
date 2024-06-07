@@ -16,8 +16,8 @@ use crate::{
     scope::Scope,
     serdes::{Decode, Encode},
     stream::{
-        merge_inner_stream::MergeInnerStream, table_stream::TableStream, EInnerStreamImpl,
-        StreamError,
+        level_stream::LevelStream, merge_inner_stream::MergeInnerStream, table_stream::TableStream,
+        EInnerStreamImpl, StreamError,
     },
     version::{edit::VersionEdit, set::VersionSet, Version, VersionError, MAX_LEVEL},
     DbOption, Immutable, Offset, ELSM_SCHEMA,
@@ -186,11 +186,36 @@ where
             }
             let mut streams = Vec::with_capacity(meet_scopes_l.len() + meet_scopes_ll.len());
 
-            for scope in meet_scopes_l.iter().chain(meet_scopes_ll.iter()) {
-                streams.push(EInnerStreamImpl::Table(
-                    TableStream::new(option, &scope.gen, None, None).await,
+            // This Level
+            if level == 0 {
+                for scope in meet_scopes_l.iter() {
+                    streams.push(EInnerStreamImpl::Table(
+                        TableStream::new(option, &scope.gen, None, None)
+                            .await
+                            .map_err(CompactionError::Stream)?,
+                    ));
+                }
+            } else {
+                let gens = meet_scopes_l
+                    .iter()
+                    .map(|scope| scope.gen)
+                    .collect::<Vec<_>>();
+                streams.push(EInnerStreamImpl::Level(
+                    LevelStream::new(option, gens, Some(min), Some(max))
+                        .await
+                        .map_err(CompactionError::Stream)?,
                 ));
             }
+            // Next Level
+            let gens = meet_scopes_ll
+                .iter()
+                .map(|scope| scope.gen)
+                .collect::<Vec<_>>();
+            streams.push(EInnerStreamImpl::Level(
+                LevelStream::new(option, gens, None, None)
+                    .await
+                    .map_err(CompactionError::Stream)?,
+            ));
             let stream = MergeInnerStream::<K, V>::new(streams)
                 .await
                 .map_err(CompactionError::Stream)?;

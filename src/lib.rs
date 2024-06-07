@@ -511,7 +511,7 @@ where
 
 pub(crate) trait GetWrite<K, V>: Oracle<K>
 where
-    K: Ord + Decode,
+    K: Ord + Encode + Decode,
     V: Decode,
 {
     fn get<G, F>(

@@ -10,7 +10,7 @@ use executor::futures::{Stream, StreamExt};
 use pin_project::pin_project;
 
 use crate::{
-    serdes::Decode,
+    serdes::{Decode, Encode},
     stream::{EInnerStreamImpl, StreamError},
     utils::CmpKeyItem,
 };
@@ -18,7 +18,7 @@ use crate::{
 #[pin_project]
 pub struct MergeInnerStream<'stream, K, V>
 where
-    K: Ord + Decode + Send + Sync + 'static,
+    K: Ord + Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     #[allow(clippy::type_complexity)]
@@ -29,7 +29,7 @@ where
 
 impl<'stream, K, V> MergeInnerStream<'stream, K, V>
 where
-    K: Ord + Decode + Send + Sync + 'static,
+    K: Ord + Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     pub(crate) async fn new(
@@ -61,7 +61,7 @@ where
 
 impl<'stream, K, V> Stream for MergeInnerStream<'stream, K, V>
 where
-    K: Ord + Decode + Send + Sync + 'static,
+    K: Ord + Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
     type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
