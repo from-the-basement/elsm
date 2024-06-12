@@ -11,13 +11,14 @@ use arrow::{
     compute::kernels::cmp::{gt_eq, lt_eq},
     datatypes::GenericBinaryType,
 };
-use executor::futures::Stream;
+use executor::{
+    fs,
+    futures::{Stream, StreamExt},
+};
 use parquet::arrow::{
-    arrow_reader::{
-        ArrowPredicate, ArrowPredicateFn, ParquetRecordBatchReader,
-        ParquetRecordBatchReaderBuilder, RowFilter,
-    },
-    ProjectionMask,
+    arrow_reader::{ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, RowFilter},
+    async_reader::ParquetRecordBatchStream,
+    ParquetRecordBatchStreamBuilder, ProjectionMask,
 };
 use pin_project::pin_project;
 use snowflake::ProcessUniqueId;
@@ -34,8 +35,8 @@ where
     K: Encode + Decode + Send + Sync + 'static,
     V: Decode + Send + Sync + 'static,
 {
-    inner: ParquetRecordBatchReader,
-    stream: BatchStream<K, V>,
+    inner: ParquetRecordBatchStream<fs::File>,
+    stream: Option<BatchStream<K, V>>,
     _p: PhantomData<&'stream ()>,
 }
 
@@ -50,8 +51,6 @@ where
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
     ) -> Result<Self, StreamError<K, V>> {
-        let file = File::open(option.table_path(gen)).map_err(StreamError::Io)?;
-
         let lower = if let Some(l) = lower {
             Some(Self::to_scalar(l).await?)
         } else {
@@ -63,10 +62,11 @@ where
             None
         };
 
-        // FIXME: Async Reader
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .with_batch_size(8192);
+        let mut file = fs::File::from(File::open(option.table_path(gen)).map_err(StreamError::Io)?);
+        let meta = ArrowReaderMetadata::load_async(&mut file, Default::default())
+            .await
+            .map_err(StreamError::Parquet)?;
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(file, meta);
         let file_metadata = builder.metadata().file_metadata();
 
         let mut predicates = Vec::with_capacity(2);
@@ -88,11 +88,15 @@ where
         builder = builder.with_row_filter(row_filter);
 
         let mut reader = builder.build().map_err(StreamError::Parquet)?;
-        let batch = reader.next().unwrap().map_err(StreamError::Arrow)?;
+
+        let mut stream = None;
+        if let Some(result) = reader.next().await {
+            stream = Some(BatchStream::new(result.map_err(StreamError::Parquet)?));
+        }
 
         Ok(TableStream {
             inner: reader,
-            stream: BatchStream::new(batch),
+            stream,
             _p: Default::default(),
         })
     }
@@ -119,19 +123,19 @@ where
     type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.stream).poll_next(cx) {
-            Poll::Ready(None) => {
-                match self.inner.next() {
-                    None => Poll::Ready(None),
-                    Some(result) => {
-                        // FIXME: unwrap
-                        let batch = result.unwrap();
-
-                        self.stream = BatchStream::new(batch);
-                        self.poll_next(cx)
-                    }
+        if self.stream.is_none() {
+            return Poll::Ready(None);
+        }
+        match Pin::new(self.stream.as_mut().unwrap()).poll_next(cx) {
+            Poll::Ready(None) => match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    self.stream = Some(BatchStream::new(batch));
+                    self.poll_next(cx)
                 }
-            }
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(StreamError::Parquet(err)))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
             poll => poll,
         }
     }

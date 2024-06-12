@@ -7,9 +7,10 @@ use arrow::{
     array::{GenericBinaryArray, RecordBatch, Scalar},
     compute::kernels::cmp::eq,
 };
+use executor::{fs, futures::StreamExt};
 use parquet::arrow::{
-    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
-    ProjectionMask,
+    arrow_reader::{ArrowPredicateFn, ArrowReaderMetadata, RowFilter},
+    ParquetRecordBatchStreamBuilder, ProjectionMask,
 };
 use snowflake::ProcessUniqueId;
 use thiserror::Error;
@@ -119,12 +120,12 @@ where
         key_scalar: &GenericBinaryArray<Offset>,
         option: &DbOption,
     ) -> Result<Option<RecordBatch>, VersionError<K>> {
-        let file = File::open(option.table_path(scope_gen)).map_err(VersionError::Io)?;
-
-        // FIXME: Async Reader
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(VersionError::<K>::Parquet)?
-            .with_batch_size(8192);
+        let mut file =
+            fs::File::from(File::open(option.table_path(scope_gen)).map_err(VersionError::Io)?);
+        let meta = ArrowReaderMetadata::load_async(&mut file, Default::default())
+            .await
+            .map_err(VersionError::Parquet)?;
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(file, meta);
         let file_metadata = builder.metadata().file_metadata();
 
         let scalar = key_scalar.clone();
@@ -137,8 +138,8 @@ where
 
         let mut stream = builder.build().map_err(VersionError::Parquet)?;
 
-        if let Some(result) = stream.next() {
-            return Ok(Some(result.map_err(VersionError::Arrow)?));
+        if let Some(result) = stream.next().await {
+            return Ok(Some(result.map_err(VersionError::Parquet)?));
         }
         Ok(None)
     }

@@ -4,9 +4,12 @@ use arrow::{
     array::{GenericBinaryBuilder, GenericByteBuilder, RecordBatch},
     datatypes::GenericBinaryType,
 };
-use executor::futures::{util::io::Cursor, StreamExt};
+use executor::{
+    fs,
+    futures::{util::io::Cursor, StreamExt},
+};
 use futures::channel::oneshot;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, AsyncArrowWriter};
 use snowflake::ProcessUniqueId;
 use thiserror::Error;
 
@@ -101,9 +104,8 @@ where
 
             let gen = ProcessUniqueId::new();
 
-            // FIXME: Async Writer
-            let mut writer = ArrowWriter::try_new(
-                File::create(option.table_path(&gen)).map_err(CompactionError::Io)?,
+            let mut writer = AsyncArrowWriter::try_new(
+                fs::File::from(File::create(option.table_path(&gen)).map_err(CompactionError::Io)?),
                 ELSM_SCHEMA.clone(),
                 None,
             )
@@ -120,12 +122,13 @@ where
                 }
                 writer
                     .write(&batch.batch)
+                    .await
                     .map_err(CompactionError::Parquet)?;
             }
-            writer.close().map_err(CompactionError::Parquet)?;
+            writer.close().await.map_err(CompactionError::Parquet)?;
             return Ok(Some(Scope {
-                min: min.unwrap(),
-                max: max.unwrap(),
+                min: min.ok_or(CompactionError::EmptyLevel)?,
+                max: max.ok_or(CompactionError::EmptyLevel)?,
                 gen,
             }));
         }
@@ -167,8 +170,11 @@ where
             let mut meet_scopes_ll = Vec::new();
             {
                 if !version.level_slice[level + 1].is_empty() {
-                    let min_key = &meet_scopes_l.first().unwrap().min;
-                    let max_key = &meet_scopes_l.last().unwrap().max;
+                    let min_key = &meet_scopes_l
+                        .first()
+                        .ok_or(CompactionError::EmptyLevel)?
+                        .min;
+                    let max_key = &meet_scopes_l.last().ok_or(CompactionError::EmptyLevel)?.max;
                     min = min_key;
                     max = max_key;
 
@@ -328,8 +334,8 @@ where
         version_edits.push(VersionEdit::Add {
             level: (level + 1) as u8,
             scope: Scope {
-                min: min.take().unwrap(),
-                max: max.take().unwrap(),
+                min: min.take().ok_or(CompactionError::EmptyLevel)?,
+                max: max.take().ok_or(CompactionError::EmptyLevel)?,
                 gen,
             },
         });
@@ -357,4 +363,6 @@ where
     Version(#[source] VersionError<K>),
     #[error("compaction stream error: {0}")]
     Stream(#[source] StreamError<K, V>),
+    #[error("the level being compacted does not have a table")]
+    EmptyLevel,
 }

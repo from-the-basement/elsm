@@ -40,7 +40,6 @@ where
     }
 
     async fn decode_item(&mut self) -> Result<(Arc<K>, Option<V>), StreamError<K, V>> {
-        // FIXME: handle error
         let key = decode_value::<K>(&self.inner, 0, self.pos)
             .await
             .map_err(StreamError::KeyDecode)?
