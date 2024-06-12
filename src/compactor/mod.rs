@@ -71,6 +71,7 @@ where
             if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
                 let version_ref = self.version_set.current().await;
                 let mut version_edits = vec![];
+                let mut delete_gens = vec![];
 
                 if self.option.is_threshold_exceeded_major(&version_ref, 0) {
                     Self::major_compaction(
@@ -79,13 +80,14 @@ where
                         &scope.min,
                         &scope.max,
                         &mut version_edits,
+                        &mut delete_gens,
                     )
                     .await?;
                 }
                 version_edits.insert(0, VersionEdit::Add { level: 0, scope });
 
                 self.version_set
-                    .apply_edits(version_edits, false)
+                    .apply_edits(version_edits, Some(delete_gens), false)
                     .await
                     .map_err(CompactionError::Version)?;
             }
@@ -143,6 +145,7 @@ where
         mut min: &Arc<K>,
         mut max: &Arc<K>,
         version_edits: &mut Vec<VersionEdit<K>>,
+        delete_gens: &mut Vec<ProcessUniqueId>,
     ) -> Result<(), CompactionError<K, V>> {
         fn clear(buf: &mut Cursor<Vec<u8>>) {
             buf.get_mut().clear();
@@ -294,13 +297,15 @@ where
                 version_edits.push(VersionEdit::Remove {
                     level: level as u8,
                     gen: scope.gen,
-                })
+                });
+                delete_gens.push(scope.gen);
             }
             for scope in meet_scopes_ll {
                 version_edits.push(VersionEdit::Remove {
                     level: (level + 1) as u8,
                     gen: scope.gen,
-                })
+                });
+                delete_gens.push(scope.gen);
             }
             level += 1;
         }

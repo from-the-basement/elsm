@@ -60,7 +60,7 @@ use crate::{
     index_batch::{decode_value, IndexBatch},
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
-    version::{set::VersionSet, Version},
+    version::{cleaner::Cleaner, set::VersionSet, Version},
     wal::WalRecover,
 };
 
@@ -89,6 +89,7 @@ pub struct DbOption {
     pub major_threshold_with_sst_size: usize,
     pub level_sst_magnification: usize,
     pub max_sst_file_size: usize,
+    pub clean_channel_buffer: usize,
 }
 
 #[derive(Debug)]
@@ -141,13 +142,23 @@ where
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
         let immutable = Arc::new(RwLock::new(VecDeque::new()));
-        let version_set = VersionSet::<K>::new(&option).await.unwrap();
         let option = Arc::new(option);
 
         let (task_tx, mut task_rx) = channel(1);
+        let (mut cleaner, clean_sender) = Cleaner::new(option.clone());
+
+        let version_set = VersionSet::<K>::new(&option, clean_sender.clone())
+            .await
+            .unwrap();
         let mut compactor =
             Compactor::<K, O, V>::new(immutable.clone(), option.clone(), version_set.clone());
 
+        spawn(async move {
+            if let Err(err) = cleaner.listen().await {
+                error!("[Cleaner Error]: {}", err)
+            }
+        })
+        .detach();
         spawn(async move {
             loop {
                 match task_rx.next().await {
@@ -618,6 +629,7 @@ impl DbOption {
             major_threshold_with_sst_size: 10,
             level_sst_magnification: 10,
             max_sst_file_size: 64 * 1024 * 1024,
+            clean_channel_buffer: 10,
         }
     }
 
@@ -845,6 +857,7 @@ mod tests {
                         major_threshold_with_sst_size: 5,
                         level_sst_magnification: 10,
                         max_sst_file_size: 2 * 1024 * 1024,
+                        clean_channel_buffer: 10,
                     },
                 )
                 .await
@@ -1160,6 +1173,7 @@ mod tests {
                         major_threshold_with_sst_size: 5,
                         level_sst_magnification: 10,
                         max_sst_file_size: 2 * 1024 * 1024,
+                        clean_channel_buffer: 10,
                     },
                 )
                 .await

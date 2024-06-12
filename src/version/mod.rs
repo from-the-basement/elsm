@@ -1,3 +1,4 @@
+pub(crate) mod cleaner;
 pub(crate) mod edit;
 pub(crate) mod set;
 
@@ -7,17 +8,26 @@ use arrow::{
     array::{GenericBinaryArray, RecordBatch, Scalar},
     compute::kernels::cmp::eq,
 };
-use executor::{fs, futures::StreamExt};
+use executor::{
+    fs,
+    futures::{util::SinkExt, StreamExt},
+};
+use futures::{
+    channel::mpsc::{SendError, Sender},
+    executor::block_on,
+};
 use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ArrowReaderMetadata, RowFilter},
     ParquetRecordBatchStreamBuilder, ProjectionMask,
 };
 use snowflake::ProcessUniqueId;
 use thiserror::Error;
+use tracing::error;
 
 use crate::{
     scope::Scope,
     serdes::{Decode, Encode},
+    version::cleaner::CleanTag,
     DbOption, Offset,
 };
 
@@ -31,6 +41,7 @@ where
 {
     pub(crate) num: usize,
     pub(crate) level_slice: [Vec<Scope<K>>; MAX_LEVEL],
+    clean_sender: Sender<CleanTag>,
 }
 
 impl<K> Clone for Version<K>
@@ -49,6 +60,7 @@ where
         Self {
             num: self.num,
             level_slice,
+            clean_sender: self.clean_sender.clone(),
         }
     }
 }
@@ -145,6 +157,25 @@ where
     }
 }
 
+impl<K> Drop for Version<K>
+where
+    K: Encode + Decode + Ord,
+{
+    fn drop(&mut self) {
+        block_on(async {
+            if let Err(err) = self
+                .clean_sender
+                .send(CleanTag::Clean {
+                    version_num: self.num,
+                })
+                .await
+            {
+                error!("[Version Drop Error]: {}", err)
+            }
+        });
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VersionError<K>
 where
@@ -154,8 +185,8 @@ where
     Encode(#[source] <K as Encode>::Error),
     #[error("version io error: {0}")]
     Io(#[source] std::io::Error),
-    #[error("version arrow error: {0}")]
-    Arrow(#[source] arrow::error::ArrowError),
     #[error("version parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
+    #[error("version send error: {0}")]
+    Send(#[source] SendError),
 }

@@ -3,12 +3,14 @@ use std::{fs::OpenOptions, io::SeekFrom, sync::Arc};
 use async_lock::RwLock;
 use executor::{
     fs,
-    futures::{AsyncSeekExt, AsyncWriteExt},
+    futures::{util::SinkExt, AsyncSeekExt, AsyncWriteExt},
 };
+use futures::channel::mpsc::Sender;
+use snowflake::ProcessUniqueId;
 
 use crate::{
     serdes::{Decode, Encode},
-    version::{edit::VersionEdit, Version, VersionError, VersionRef},
+    version::{cleaner::CleanTag, edit::VersionEdit, Version, VersionError, VersionRef},
     DbOption,
 };
 
@@ -25,6 +27,7 @@ where
     K: Encode + Decode + Ord,
 {
     inner: Arc<RwLock<VersionSetInner<K>>>,
+    clean_sender: Sender<CleanTag>,
 }
 
 impl<K> Clone for VersionSet<K>
@@ -34,6 +37,7 @@ where
     fn clone(&self) -> Self {
         VersionSet {
             inner: self.inner.clone(),
+            clean_sender: self.clean_sender.clone(),
         }
     }
 }
@@ -42,7 +46,10 @@ impl<K> VersionSet<K>
 where
     K: Encode + Decode + Ord,
 {
-    pub(crate) async fn new(option: &DbOption) -> Result<Self, VersionError<K>> {
+    pub(crate) async fn new(
+        option: &DbOption,
+        clean_sender: Sender<CleanTag>,
+    ) -> Result<Self, VersionError<K>> {
         let mut log = fs::File::from(
             OpenOptions::new()
                 .create(true)
@@ -59,11 +66,13 @@ where
                 current: Arc::new(Version {
                     num: 0,
                     level_slice: Version::level_slice_new(),
+                    clean_sender: clean_sender.clone(),
                 }),
                 log,
             })),
+            clean_sender,
         };
-        set.apply_edits(edits, true).await?;
+        set.apply_edits(edits, None, true).await?;
 
         Ok(set)
     }
@@ -75,6 +84,7 @@ where
     pub(crate) async fn apply_edits(
         &self,
         version_edits: Vec<VersionEdit<K>>,
+        delete_gens: Option<Vec<ProcessUniqueId>>,
         is_recover: bool,
     ) -> Result<(), VersionError<K>> {
         let mut guard = self.inner.write().await;
@@ -101,6 +111,16 @@ where
                     }
                 }
             }
+        }
+        if let Some(delete_gens) = delete_gens {
+            new_version
+                .clean_sender
+                .send(CleanTag::Add {
+                    version_num: new_version.num,
+                    gens: delete_gens,
+                })
+                .await
+                .map_err(VersionError::Send)?;
         }
         guard.log.flush().await.map_err(VersionError::Io)?;
         guard.current = Arc::new(new_version);
