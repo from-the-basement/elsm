@@ -15,7 +15,6 @@ use crate::{
     stream::StreamError,
 };
 
-#[pin_project]
 pub(crate) struct BatchStream<K, V>
 where
     K: Encode + Decode + Send + Sync + 'static,
