@@ -41,7 +41,7 @@ where
 {
     pub(crate) num: usize,
     pub(crate) level_slice: [Vec<Scope<K>>; MAX_LEVEL],
-    clean_sender: Sender<CleanTag>,
+    pub(crate) clean_sender: Sender<CleanTag>,
 }
 
 impl<K> Clone for Version<K>

@@ -388,6 +388,7 @@ mod tests {
 
     use arrow::array::{GenericBinaryBuilder, RecordBatch};
     use executor::{futures::util::io::Cursor, ExecutorBuilder};
+    use futures::channel::mpsc::channel;
     use parquet::arrow::ArrowWriter;
     use snowflake::ProcessUniqueId;
     use tempfile::TempDir;
@@ -590,9 +591,12 @@ mod tests {
             )
             .await;
 
+            let (sender, _) = channel(1);
+
             let mut version = Version {
                 num: 0,
                 level_slice: Version::level_slice_new(),
+                clean_sender: sender,
             };
             version.level_slice[0].push(Scope {
                 min: Arc::new("key_1".to_string()),
@@ -630,6 +634,7 @@ mod tests {
                 &min,
                 &max,
                 &mut version_edits,
+                &mut vec![],
             )
             .await
             .unwrap();
