@@ -15,6 +15,7 @@ use crate::{
     utils::CmpKeyItem,
 };
 
+#[pin_project]
 pub struct MergeInnerStream<'stream, K, V>
 where
     K: Ord + Encode + Decode + Send + Sync + 'static,
