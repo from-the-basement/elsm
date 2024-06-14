@@ -126,6 +126,7 @@ where
         if self.stream.is_none() {
             return Poll::Ready(None);
         }
+        // Safety: It cannot be none here, because it has been judged above
         match Pin::new(self.stream.as_mut().unwrap()).poll_next(cx) {
             Poll::Ready(None) => match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
