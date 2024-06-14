@@ -1,67 +1,74 @@
+pub(crate) mod cleaner;
 pub(crate) mod edit;
+pub(crate) mod set;
 
-use std::{
-    fs::{File, OpenOptions},
-    io::SeekFrom,
-    sync::Arc,
-};
+use std::{fs::File, sync::Arc};
 
 use arrow::{
     array::{GenericBinaryArray, RecordBatch, Scalar},
     compute::kernels::cmp::eq,
 };
-use async_lock::RwLock;
-use executor::{fs, futures::AsyncSeekExt};
+use executor::{
+    fs,
+    futures::{util::SinkExt, StreamExt},
+};
+use futures::{
+    channel::mpsc::{SendError, Sender},
+    executor::block_on,
+};
 use parquet::arrow::{
-    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
-    ProjectionMask,
+    arrow_reader::{ArrowPredicateFn, ArrowReaderMetadata, RowFilter},
+    ParquetRecordBatchStreamBuilder, ProjectionMask,
 };
 use snowflake::ProcessUniqueId;
 use thiserror::Error;
+use tracing::error;
 
 use crate::{
     scope::Scope,
     serdes::{Decode, Encode},
-    version::edit::VersionEdit,
+    version::cleaner::CleanTag,
     DbOption, Offset,
 };
 
-pub(crate) type SyncVersion<K> = Arc<RwLock<Version<K>>>;
+pub const MAX_LEVEL: usize = 7;
+
+pub(crate) type VersionRef<K> = Arc<Version<K>>;
 
 pub(crate) struct Version<K>
 where
     K: Encode + Decode + Ord,
 {
-    // FIXME: only level 0
-    pub(crate) level_slice: Vec<Scope<K>>,
-    pub(crate) log: fs::File,
+    pub(crate) num: usize,
+    pub(crate) level_slice: [Vec<Scope<K>>; MAX_LEVEL],
+    pub(crate) clean_sender: Sender<CleanTag>,
+}
+
+impl<K> Clone for Version<K>
+where
+    K: Encode + Decode + Ord,
+{
+    fn clone(&self) -> Self {
+        let mut level_slice = Version::level_slice_new();
+
+        for (level, scopes) in self.level_slice.iter().enumerate() {
+            for scope in scopes {
+                level_slice[level].push(scope.clone());
+            }
+        }
+
+        Self {
+            num: self.num,
+            level_slice,
+            clean_sender: self.clean_sender.clone(),
+        }
+    }
 }
 
 impl<K> Version<K>
 where
     K: Encode + Decode + Ord,
 {
-    pub(crate) async fn new(option: &DbOption) -> Result<Self, VersionError<K>> {
-        let mut log = fs::File::from(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .open(option.version_path())
-                .map_err(VersionError::Io)?,
-        );
-        let edits = VersionEdit::recover(&mut log).await;
-
-        log.seek(SeekFrom::End(0)).await.map_err(VersionError::Io)?;
-        let mut version = Version {
-            level_slice: vec![],
-            log,
-        };
-        apply_edits(&mut version, edits, true).await?;
-
-        Ok(version)
-    }
-
     pub(crate) async fn query(
         &self,
         key: &K,
@@ -74,7 +81,7 @@ where
 
         let key_scalar = GenericBinaryArray::<Offset>::from(vec![key_bytes.as_slice()]);
 
-        for scope in self.level_slice.iter().rev() {
+        for scope in self.level_slice[0].iter().rev() {
             if !scope.is_between(key) {
                 continue;
             }
@@ -82,7 +89,42 @@ where
                 return Ok(Some(batch));
             }
         }
+        for level in self.level_slice[1..6].iter() {
+            if level.is_empty() {
+                continue;
+            }
+            let index = Self::scope_search(key, level);
+            if !level[index].is_between(key) {
+                continue;
+            }
+            if let Some(batch) = Self::read_parquet(&level[index].gen, &key_scalar, option).await? {
+                return Ok(Some(batch));
+            }
+        }
+
         Ok(None)
+    }
+
+    pub(crate) fn scope_search(key: &K, level: &[Scope<K>]) -> usize {
+        level
+            .binary_search_by(|scope| scope.min.as_ref().cmp(key))
+            .unwrap_or_else(|index| index.saturating_sub(1))
+    }
+
+    pub(crate) fn tables_len(&self, level: usize) -> usize {
+        self.level_slice[level].len()
+    }
+
+    pub(crate) fn level_slice_new() -> [Vec<Scope<K>>; 7] {
+        [
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]
     }
 
     async fn read_parquet(
@@ -90,12 +132,12 @@ where
         key_scalar: &GenericBinaryArray<Offset>,
         option: &DbOption,
     ) -> Result<Option<RecordBatch>, VersionError<K>> {
-        let file = File::open(option.table_path(scope_gen)).map_err(VersionError::Io)?;
-
-        // FIXME: Async Reader
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(VersionError::<K>::Parquet)?
-            .with_batch_size(8192);
+        let mut file =
+            fs::File::from(File::open(option.table_path(scope_gen)).map_err(VersionError::Io)?);
+        let meta = ArrowReaderMetadata::load_async(&mut file, Default::default())
+            .await
+            .map_err(VersionError::Parquet)?;
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(file, meta);
         let file_metadata = builder.metadata().file_metadata();
 
         let scalar = key_scalar.clone();
@@ -108,94 +150,43 @@ where
 
         let mut stream = builder.build().map_err(VersionError::Parquet)?;
 
-        if let Some(result) = stream.next() {
-            return Ok(Some(result.map_err(VersionError::Arrow)?));
+        if let Some(result) = stream.next().await {
+            return Ok(Some(result.map_err(VersionError::Parquet)?));
         }
         Ok(None)
     }
 }
 
-pub(crate) async fn apply_edits<K: Encode + Decode + Ord>(
-    version: &mut Version<K>,
-    version_edits: Vec<VersionEdit<K>>,
-    is_recover: bool,
-) -> Result<(), VersionError<K>> {
-    for version_edit in version_edits {
-        if !is_recover {
-            version_edit
-                .encode(&mut version.log)
+impl<K> Drop for Version<K>
+where
+    K: Encode + Decode + Ord,
+{
+    fn drop(&mut self) {
+        block_on(async {
+            if let Err(err) = self
+                .clean_sender
+                .send(CleanTag::Clean {
+                    version_num: self.num,
+                })
                 .await
-                .map_err(VersionError::Encode)?;
-        }
-        match version_edit {
-            VersionEdit::Add { scope } => {
-                version.level_slice.push(scope);
+            {
+                error!("[Version Drop Error]: {}", err)
             }
-            VersionEdit::Remove { .. } => {
-                todo!()
-            }
-        }
+        });
     }
-    Ok(())
 }
 
 #[derive(Debug, Error)]
 pub enum VersionError<K>
 where
-    K: Encode + Decode,
+    K: Encode,
 {
     #[error("version encode error: {0}")]
     Encode(#[source] <K as Encode>::Error),
-    #[error("version decode error: {0}")]
-    Decode(#[source] <K as Decode>::Error),
     #[error("version io error: {0}")]
     Io(#[source] std::io::Error),
-    #[error("version arrow error: {0}")]
-    Arrow(#[source] arrow::error::ArrowError),
     #[error("version parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use futures::{executor::block_on, io::Cursor};
-
-    use crate::{scope::Scope, serdes::Encode, version::edit::VersionEdit};
-
-    #[test]
-    fn encode_and_decode() {
-        block_on(async {
-            let edits = vec![
-                VersionEdit::Add {
-                    scope: Scope {
-                        min: Arc::new("Min".to_string()),
-                        max: Arc::new("Max".to_string()),
-                        gen: Default::default(),
-                    },
-                },
-                VersionEdit::Remove {
-                    gen: Default::default(),
-                },
-            ];
-
-            let bytes = {
-                let mut cursor = Cursor::new(vec![]);
-
-                for edit in edits.clone() {
-                    edit.encode(&mut cursor).await.unwrap();
-                }
-                cursor.into_inner()
-            };
-
-            let decode_edits = {
-                let mut cursor = Cursor::new(bytes);
-
-                VersionEdit::<String>::recover(&mut cursor).await
-            };
-
-            assert_eq!(edits, decode_edits);
-        })
-    }
+    #[error("version send error: {0}")]
+    Send(#[source] SendError),
 }

@@ -15,7 +15,8 @@ use pin_project::pin_project;
 use crate::{
     index_batch::{decode_value, IndexBatch},
     mem_table::InternalKey,
-    serdes::Decode,
+    serdes::{Decode, Encode},
+    stream::StreamError,
 };
 
 #[pin_project]
@@ -38,13 +39,13 @@ where
 
 impl<'a, K, T, V, G, F> Stream for IndexBatchStream<'a, K, T, V, G, F>
 where
-    K: Ord + Debug,
+    K: Ord + Debug + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<G>), V::Error>;
+    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -55,7 +56,7 @@ where
                     Some(true) | None
                 )
             {
-                let mut future = pin!(decode_value::<V>(this.batch, *offset));
+                let mut future = pin!(decode_value::<V>(this.batch, 1, *offset as usize));
 
                 return match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(option)) => Poll::Ready(
@@ -63,7 +64,7 @@ where
                             .replace((key.clone(), option.map(|v| (this.f)(&v))))
                             .map(Ok),
                     ),
-                    Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
+                    Poll::Ready(Err(err)) => Poll::Ready(Some(Err(StreamError::ValueDecode(err)))),
                     Poll::Pending => Poll::Pending,
                 };
             }
@@ -74,7 +75,7 @@ where
 
 impl<K, T> IndexBatch<K, T>
 where
-    K: Ord + Debug,
+    K: Ord + Debug + Encode + Decode,
     T: Ord + Copy + Default,
 {
     pub(crate) async fn range<V, G, F>(
@@ -83,7 +84,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<IndexBatchStream<K, T, V, G, F>, V::Error>
+    ) -> Result<IndexBatchStream<K, T, V, G, F>, StreamError<K, V>>
     where
         V: Decode + Sync + Send,
         G: Send + 'static,

@@ -10,7 +10,8 @@ use pin_project::pin_project;
 
 use crate::{
     mem_table::{InternalKey, MemTable},
-    serdes::Decode,
+    serdes::{Decode, Encode},
+    stream::StreamError,
 };
 
 #[pin_project]
@@ -29,13 +30,13 @@ where
 
 impl<'a, K, V, T, G, F> Stream for MemTableStream<'a, K, T, V, G, F>
 where
-    K: Ord,
+    K: Ord + Encode + Decode,
     T: Ord + Copy,
     V: Decode,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<G>), V::Error>;
+    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -59,7 +60,7 @@ where
 
 impl<K, V, T> MemTable<K, V, T>
 where
-    K: Ord,
+    K: Ord + Encode + Decode,
     T: Ord + Copy + Default,
     V: Decode,
 {
@@ -93,7 +94,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &T,
         f: F,
-    ) -> Result<MemTableStream<K, T, V, G, F>, V::Error>
+    ) -> Result<MemTableStream<K, T, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,

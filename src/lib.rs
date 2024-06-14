@@ -59,8 +59,8 @@ use crate::{
     compactor::Compactor,
     index_batch::{decode_value, IndexBatch},
     serdes::Decode,
-    stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
-    version::{SyncVersion, Version},
+    stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
+    version::{cleaner::Cleaner, set::VersionSet, Version},
     wal::WalRecover,
 };
 
@@ -86,6 +86,10 @@ pub struct DbOption {
     pub path: PathBuf,
     pub max_mem_table_size: usize,
     pub immutable_chunk_num: usize,
+    pub major_threshold_with_sst_size: usize,
+    pub level_sst_magnification: usize,
+    pub max_sst_file_size: usize,
+    pub clean_channel_buffer: usize,
 }
 
 #[derive(Debug)]
@@ -111,13 +115,13 @@ where
     #[allow(clippy::type_complexity)]
     pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
     pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
-    pub(crate) version: SyncVersion<K>,
+    pub(crate) version_set: VersionSet<K>,
 }
 
 impl<K, V, O, WP> Db<K, V, O, WP>
 where
     K: Encode + Decode + Debug + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + Sync + 'static,
+    V: Encode + Decode + Debug + Send + Sync + 'static,
     O: Oracle<K> + 'static,
     O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,
@@ -138,13 +142,23 @@ where
         let wal = Arc::new(Mutex::new(block_on(wal_manager.create_wal_file()).unwrap()));
 
         let immutable = Arc::new(RwLock::new(VecDeque::new()));
-        let version = Arc::new(RwLock::new(Version::new(&option).await.unwrap()));
         let option = Arc::new(option);
 
         let (task_tx, mut task_rx) = channel(1);
-        let mut compactor =
-            Compactor::<K, O>::new(immutable.clone(), option.clone(), version.clone());
+        let (mut cleaner, clean_sender) = Cleaner::new(option.clone());
 
+        let version_set = VersionSet::<K>::new(&option, clean_sender.clone())
+            .await
+            .unwrap();
+        let mut compactor =
+            Compactor::<K, O, V>::new(immutable.clone(), option.clone(), version_set.clone());
+
+        spawn(async move {
+            if let Err(err) = cleaner.listen().await {
+                error!("[Cleaner Error]: {}", err)
+            }
+        })
+        .detach();
         spawn(async move {
             loop {
                 match task_rx.next().await {
@@ -169,7 +183,7 @@ where
             immutable,
             wal,
             compaction_tx: Mutex::new(task_tx),
-            version,
+            version_set,
         };
         let mut file_stream = pin!(wal_manager.wal_provider.list());
 
@@ -301,9 +315,9 @@ where
         }
         drop(guard);
 
-        let guard = self.version.read().await;
+        let guard = self.version_set.current().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
-            if let Ok(value) = decode_value(&record_batch, 0).await {
+            if let Ok(value) = decode_value(&record_batch, 1, 0).await {
                 return value.map(|v| f(&v));
             }
         }
@@ -318,7 +332,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &O::Timestamp,
         f: F,
-    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, <V as Decode>::Error>
+    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -335,7 +349,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
+    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -508,7 +522,7 @@ where
 
 pub(crate) trait GetWrite<K, V>: Oracle<K>
 where
-    K: Ord,
+    K: Ord + Encode + Decode,
     V: Decode,
 {
     fn get<G, F>(
@@ -541,9 +555,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &Self::Timestamp,
         f: F,
-    ) -> impl Future<
-        Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, <V as Decode>::Error>,
-    >
+    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, StreamError<K, V>>>
     where
         K: 'a,
         Self::Timestamp: 'a,
@@ -596,7 +608,7 @@ where
         upper: Option<&Arc<K>>,
         ts: &<O as Oracle<K>>::Timestamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, <V as Decode>::Error>
+    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, StreamError<K, V>>
     where
         K: 'a,
         Self::Timestamp: 'a,
@@ -609,11 +621,31 @@ where
 }
 
 impl DbOption {
+    pub(crate) fn new(path: impl Into<PathBuf> + Send) -> Self {
+        DbOption {
+            path: path.into(),
+            max_mem_table_size: 8 * 1024 * 1024,
+            immutable_chunk_num: 5,
+            major_threshold_with_sst_size: 10,
+            level_sst_magnification: 10,
+            max_sst_file_size: 64 * 1024 * 1024,
+            clean_channel_buffer: 10,
+        }
+    }
+
     pub(crate) fn table_path(&self, gen: &ProcessUniqueId) -> PathBuf {
         self.path.join(format!("{}.parquet", gen))
     }
     pub(crate) fn version_path(&self) -> PathBuf {
         self.path.join("version.log")
+    }
+
+    pub(crate) fn is_threshold_exceeded_major<K>(&self, version: &Version<K>, level: usize) -> bool
+    where
+        K: Ord + Encode + Decode + Debug,
+    {
+        version.tables_len(level)
+            >= (self.major_threshold_with_sst_size * self.level_sst_magnification.pow(level as u32))
     }
 }
 
@@ -641,11 +673,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -693,11 +721,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -775,11 +799,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     InMemProvider::default(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -834,6 +854,10 @@ mod tests {
                         path: temp_dir.path().to_path_buf(),
                         max_mem_table_size: 25,
                         immutable_chunk_num: 1,
+                        major_threshold_with_sst_size: 5,
+                        level_sst_magnification: 10,
+                        max_sst_file_size: 2 * 1024 * 1024,
+                        clean_channel_buffer: 10,
                     },
                 )
                 .await
@@ -1130,10 +1154,11 @@ mod tests {
             .unwrap();
 
             assert_eq!(
-                db.get(&Arc::new("key2000".to_owned()), &0, |v| v.clone())
+                db.get(&Arc::new("key20".to_owned()), &0, |v: &String| v.clone())
                     .await,
                 Some(value_1.clone())
             );
+
             drop(db);
 
             let db = Arc::new(
@@ -1145,6 +1170,10 @@ mod tests {
                         path: temp_dir.path().to_path_buf(),
                         max_mem_table_size: 25,
                         immutable_chunk_num: 1,
+                        major_threshold_with_sst_size: 5,
+                        level_sst_magnification: 10,
+                        max_sst_file_size: 2 * 1024 * 1024,
+                        clean_channel_buffer: 10,
                     },
                 )
                 .await
@@ -1152,7 +1181,7 @@ mod tests {
             );
 
             assert_eq!(
-                db.get(&Arc::new("key2000".to_owned()), &0, |v: &String| v.clone())
+                db.get(&Arc::new("key20".to_owned()), &0, |v: &String| v.clone())
                     .await,
                 Some(value_1)
             );
@@ -1168,11 +1197,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
@@ -1189,11 +1214,7 @@ mod tests {
                 Db::new(
                     LocalOracle::default(),
                     Fs::new(temp_dir.path()).unwrap(),
-                    DbOption {
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 64 * 1024 * 1024,
-                        immutable_chunk_num: 5,
-                    },
+                    DbOption::new(temp_dir.path().to_path_buf()),
                 )
                 .await
                 .unwrap(),
