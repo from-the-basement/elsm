@@ -15,32 +15,31 @@ use pin_project::pin_project;
 use crate::{
     index_batch::{decode_value, IndexBatch},
     mem_table::InternalKey,
+    oracle::TimeStamp,
     serdes::{Decode, Encode},
     stream::StreamError,
 };
 
 #[pin_project]
 #[derive(Debug)]
-pub(crate) struct IndexBatchStream<'a, K, T, V, G, F>
+pub(crate) struct IndexBatchStream<'a, K, V, G, F>
 where
     K: Ord,
-    T: Ord + Copy + Default,
     V: Decode,
     G: Send + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
     batch: &'a RecordBatch,
     item_buf: Option<(Arc<K>, Option<G>)>,
-    inner: Range<'a, InternalKey<K, T>, u32>,
-    ts: T,
+    inner: Range<'a, InternalKey<K>, u32>,
+    ts: TimeStamp,
     f: F,
     _p: PhantomData<V>,
 }
 
-impl<'a, K, T, V, G, F> Stream for IndexBatchStream<'a, K, T, V, G, F>
+impl<'a, K, V, G, F> Stream for IndexBatchStream<'a, K, V, G, F>
 where
     K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + 'static,
     F: Fn(&V) -> G + Sync + 'static,
@@ -73,18 +72,17 @@ where
     }
 }
 
-impl<K, T> IndexBatch<K, T>
+impl<K> IndexBatch<K>
 where
     K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
 {
     pub(crate) async fn range<V, G, F>(
         &self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
-        ts: &T,
+        ts: &TimeStamp,
         f: F,
-    ) -> Result<IndexBatchStream<K, T, V, G, F>, StreamError<K, V>>
+    ) -> Result<IndexBatchStream<K, V, G, F>, StreamError<K, V>>
     where
         V: Decode + Sync + Send,
         G: Send + 'static,
@@ -105,7 +103,7 @@ where
                     .map(|k| {
                         Bound::Included(InternalKey {
                             key: k.clone(),
-                            ts: T::default(),
+                            ts: TimeStamp::default(),
                         })
                     })
                     .unwrap_or(Bound::Unbounded),

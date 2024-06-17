@@ -4,10 +4,12 @@ pub(crate) mod index_batch;
 pub(crate) mod mem_table;
 pub(crate) mod oracle;
 pub(crate) mod record;
+pub(crate) mod schema;
 pub(crate) mod scope;
 pub mod serdes;
 pub mod stream;
 pub mod transaction;
+pub(crate) mod user;
 pub(crate) mod utils;
 mod version;
 pub mod wal;
@@ -58,6 +60,7 @@ use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 use crate::{
     compactor::Compactor,
     index_batch::{decode_value, IndexBatch},
+    oracle::TimeStamp,
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
     version::{cleaner::Cleaner, set::VersionSet, Version},
@@ -74,7 +77,7 @@ lazy_static! {
 }
 
 pub type Offset = i64;
-pub type Immutable<K, T> = Arc<RwLock<VecDeque<IndexBatch<K, T>>>>;
+pub type Immutable<K> = Arc<RwLock<VecDeque<IndexBatch<K>>>>;
 
 #[derive(Debug)]
 pub enum CompactTask {
@@ -93,12 +96,11 @@ pub struct DbOption {
 }
 
 #[derive(Debug)]
-struct MutableShard<K, V, T>
+struct MutableShard<K, V>
 where
     K: Ord,
-    T: Ord,
 {
-    mutable: MemTable<K, V, T>,
+    mutable: MemTable<K, V>,
 }
 
 pub struct Db<K, V, O, WP>
@@ -110,10 +112,10 @@ where
     option: Arc<DbOption>,
     pub(crate) oracle: O,
     wal_manager: Arc<WalManager<WP>>,
-    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V, O::Timestamp>>>,
-    pub(crate) immutable: Immutable<K, O::Timestamp>,
+    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V>>>,
+    pub(crate) immutable: Immutable<K>,
     #[allow(clippy::type_complexity)]
-    pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V, O::Timestamp>>>,
+    pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V>>>,
     pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
     pub(crate) version_set: VersionSet<K>,
 }
@@ -123,7 +125,6 @@ where
     K: Encode + Decode + Debug + Ord + Hash + Send + Sync + 'static,
     V: Encode + Decode + Debug + Send + Sync + 'static,
     O: Oracle<K> + 'static,
-    O::Timestamp: Encode + Decode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite + AsyncRead,
     io::Error: From<<V as Decode>::Error>,
@@ -132,7 +133,7 @@ where
         oracle: O,
         wal_provider: WP,
         option: DbOption,
-    ) -> Result<Self, WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
+    ) -> Result<Self, WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
         let wal_manager = Arc::new(WalManager::new(wal_provider));
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
@@ -151,7 +152,7 @@ where
             .await
             .unwrap();
         let mut compactor =
-            Compactor::<K, O, V>::new(immutable.clone(), option.clone(), version_set.clone());
+            Compactor::<K, V>::new(immutable.clone(), option.clone(), version_set.clone());
 
         spawn(async move {
             if let Err(err) = cleaner.listen().await {
@@ -209,7 +210,6 @@ where
     K: Encode + Decode + Ord + Debug + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
-    O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
     io::Error: From<<V as Decode>::Error>,
@@ -222,9 +222,9 @@ where
         &self,
         record_type: RecordType,
         key: Arc<K>,
-        ts: O::Timestamp,
+        ts: TimeStamp,
         value: Option<V>,
-    ) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
+    ) -> Result<(), WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(&key), executor::worker_num()) as usize;
         let wal_manager = self.wal_manager.clone();
@@ -237,7 +237,7 @@ where
                 let mut local = local.write().await;
                 wal.lock()
                     .await
-                    .write(Record::new(record_type, &key, &ts, value.as_ref()))
+                    .write(Record::new(record_type, &key, ts, value.as_ref()))
                     .await?;
 
                 local.mutable.insert(key, ts, value);
@@ -256,8 +256,8 @@ where
                     mem::swap(&mut local.mutable, &mut mem_table);
 
                     return Ok::<
-                        Option<MemTable<K, V, <O as Oracle<K>>::Timestamp>>,
-                        WriteError<<Record<&K, &V, &<O as Oracle<K>>::Timestamp> as Encode>::Error>,
+                        Option<MemTable<K, V>>,
+                        WriteError<<Record<&K, &V> as Encode>::Error>,
                     >(Some(mem_table));
                 }
                 Ok(None)
@@ -280,10 +280,9 @@ where
         Ok(())
     }
 
-    async fn get<G, F>(&self, key: &Arc<K>, ts: &O::Timestamp, f: F) -> Option<G>
+    async fn get<G, F>(&self, key: &Arc<K>, ts: &TimeStamp, f: F) -> Option<G>
     where
         G: Send + 'static,
-        O::Timestamp: Sync,
         F: Fn(&V) -> G + Sync + 'static,
     {
         let consistent_hash =
@@ -293,7 +292,7 @@ where
         let (key, ts, f) = unsafe {
             (
                 mem::transmute::<_, &Arc<K>>(key),
-                mem::transmute::<_, &O::Timestamp>(ts),
+                mem::transmute::<_, &TimeStamp>(ts),
                 mem::transmute::<_, &'static F>(&f),
             )
         };
@@ -330,13 +329,12 @@ where
         &self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
-        ts: &O::Timestamp,
+        ts: &TimeStamp,
         f: F,
-    ) -> Result<MergeStream<K, O::Timestamp, V, G, F>, StreamError<K, V>>
+    ) -> Result<MergeStream<K, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
-        O::Timestamp: Sync,
     {
         let iters = self.inner_range(lower, upper, ts, f).await?;
 
@@ -347,9 +345,9 @@ where
         &'s self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
-        ts: &<O as Oracle<K>>::Timestamp,
+        ts: &TimeStamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<K, O::Timestamp, V, G, F>>, StreamError<K, V>>
+    ) -> Result<Vec<EStreamImpl<K, V, G, F>>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,
@@ -397,8 +395,8 @@ where
 
     async fn write_batch(
         &self,
-        mut kvs: impl ExactSizeIterator<Item = (Arc<K>, O::Timestamp, Option<V>)>,
-    ) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>> {
+        mut kvs: impl ExactSizeIterator<Item = (Arc<K>, TimeStamp, Option<V>)>,
+    ) -> Result<(), WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
         match kvs.len() {
             0 => Ok(()),
             1 => {
@@ -420,11 +418,8 @@ where
     }
 
     async fn freeze(
-        mem_table: MemTable<K, V, <O as Oracle<K>>::Timestamp>,
-    ) -> Result<
-        IndexBatch<K, O::Timestamp>,
-        WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>,
-    > {
+        mem_table: MemTable<K, V>,
+    ) -> Result<IndexBatch<K>, WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
         fn clear(buf: &mut Cursor<Vec<u8>>) {
             buf.get_mut().clear();
             buf.set_position(0);
@@ -468,9 +463,9 @@ where
     async fn recover<W>(
         &mut self,
         wal: &mut W,
-    ) -> Result<(), WriteError<<Record<Arc<K>, V, O::Timestamp> as Encode>::Error>>
+    ) -> Result<(), WriteError<<Record<Arc<K>, V> as Encode>::Error>>
     where
-        W: WalRecover<Arc<K>, V, O::Timestamp>,
+        W: WalRecover<Arc<K>, V>,
     {
         let mut stream = pin!(wal.recover());
         while let Some(record) = stream.next().await {
@@ -496,24 +491,22 @@ where
     O: Oracle<K>,
     WP: WalProvider,
 {
-    type Timestamp = O::Timestamp;
-
-    fn start_read(&self) -> Self::Timestamp {
+    fn start_read(&self) -> TimeStamp {
         self.oracle.start_read()
     }
 
-    fn read_commit(&self, ts: Self::Timestamp) {
+    fn read_commit(&self, ts: TimeStamp) {
         self.oracle.read_commit(ts)
     }
 
-    fn start_write(&self) -> Self::Timestamp {
+    fn start_write(&self) -> TimeStamp {
         self.oracle.start_write()
     }
 
     fn write_commit(
         &self,
-        read_at: Self::Timestamp,
-        write_at: Self::Timestamp,
+        read_at: TimeStamp,
+        write_at: TimeStamp,
         in_write: std::collections::HashSet<Arc<K>>,
     ) -> Result<(), oracle::WriteConflict<K>> {
         self.oracle.write_commit(read_at, write_at, in_write)
@@ -525,40 +518,35 @@ where
     K: Ord + Encode + Decode,
     V: Decode,
 {
-    fn get<G, F>(
-        &self,
-        key: &Arc<K>,
-        ts: &Self::Timestamp,
-        f: F,
-    ) -> impl Future<Output = Option<G>>
+    fn get<G, F>(&self, key: &Arc<K>, ts: &TimeStamp, f: F) -> impl Future<Output = Option<G>>
     where
         G: Send + 'static,
-        Self::Timestamp: Sync,
+        TimeStamp: Sync,
         F: Fn(&V) -> G + Sync + 'static;
 
     fn write(
         &self,
         record_type: RecordType,
         key: Arc<K>,
-        ts: Self::Timestamp,
+        ts: TimeStamp,
         value: Option<V>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
     fn write_batch(
         &self,
-        kvs: impl ExactSizeIterator<Item = (Arc<K>, Self::Timestamp, Option<V>)>,
+        kvs: impl ExactSizeIterator<Item = (Arc<K>, TimeStamp, Option<V>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
     fn inner_range<'a, G, F>(
         &'a self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
-        ts: &Self::Timestamp,
+        ts: &TimeStamp,
         f: F,
-    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, K, Self::Timestamp, V, G, F>>, StreamError<K, V>>>
+    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, K, V, G, F>>, StreamError<K, V>>>
     where
         K: 'a,
-        Self::Timestamp: 'a,
+        TimeStamp: 'a,
         V: 'a,
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy;
@@ -569,7 +557,6 @@ where
     K: Encode + Decode + Ord + Debug + Hash + Send + Sync + 'static,
     V: Encode + Decode + Send + Sync + 'static,
     O: Oracle<K>,
-    O::Timestamp: Encode + Copy + Send + Sync + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite,
     io::Error: From<<V as Decode>::Error>,
@@ -578,17 +565,16 @@ where
         &self,
         record_type: RecordType,
         key: Arc<K>,
-        ts: O::Timestamp,
+        ts: TimeStamp,
         value: Option<V>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
         Db::write(self, record_type, key, ts, value).await?;
         Ok(())
     }
 
-    async fn get<G, F>(&self, key: &Arc<K>, ts: &O::Timestamp, f: F) -> Option<G>
+    async fn get<G, F>(&self, key: &Arc<K>, ts: &TimeStamp, f: F) -> Option<G>
     where
         G: Send + 'static,
-        O::Timestamp: Sync,
         F: Fn(&V) -> G + Sync + 'static,
     {
         Db::get(self, key, ts, f).await
@@ -596,7 +582,7 @@ where
 
     async fn write_batch(
         &self,
-        kvs: impl ExactSizeIterator<Item = (Arc<K>, O::Timestamp, Option<V>)>,
+        kvs: impl ExactSizeIterator<Item = (Arc<K>, TimeStamp, Option<V>)>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
         Db::write_batch(self, kvs).await?;
         Ok(())
@@ -606,12 +592,12 @@ where
         &'a self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
-        ts: &<O as Oracle<K>>::Timestamp,
+        ts: &TimeStamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<'a, K, O::Timestamp, V, G, F>>, StreamError<K, V>>
+    ) -> Result<Vec<EStreamImpl<'a, K, V, G, F>>, StreamError<K, V>>
     where
         K: 'a,
-        Self::Timestamp: 'a,
+        TimeStamp: 'a,
         V: 'a,
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + Send + 'static + Copy,

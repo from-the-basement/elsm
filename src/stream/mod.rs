@@ -25,17 +25,16 @@ pub(crate) mod merge_stream;
 pub(crate) mod table_stream;
 
 #[pin_project(project = EStreamImplProj)]
-pub(crate) enum EStreamImpl<'a, K, T, V, G, F>
+pub(crate) enum EStreamImpl<'a, K, V, G, F>
 where
     K: Ord + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
     Buf(#[pin] BufStream<'a, K, G, StreamError<K, V>>),
-    IndexBatch(#[pin] IndexBatchStream<'a, K, T, V, G, F>),
-    MemTable(#[pin] MemTableStream<'a, K, T, V, G, F>),
+    IndexBatch(#[pin] IndexBatchStream<'a, K, V, G, F>),
+    MemTable(#[pin] MemTableStream<'a, K, V, G, F>),
     TransactionInner(#[pin] TransactionStream<'a, K, V, G, F, StreamError<K, V>>),
 }
 
@@ -49,10 +48,9 @@ where
     Level(#[pin] LevelStream<'a, K, V>),
 }
 
-impl<'a, K, T, V, G, F> Stream for EStreamImpl<'a, K, T, V, G, F>
+impl<'a, K, V, G, F> Stream for EStreamImpl<'a, K, V, G, F>
 where
     K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,

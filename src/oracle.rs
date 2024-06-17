@@ -11,22 +11,22 @@ use std::{
 
 use thiserror::Error;
 
+pub(crate) type TimeStamp = u64;
+
 pub trait Oracle<K>: Sized
 where
     K: Ord,
 {
-    type Timestamp: Ord + Clone + Copy + Default + Debug;
+    fn start_read(&self) -> TimeStamp;
 
-    fn start_read(&self) -> Self::Timestamp;
+    fn read_commit(&self, ts: TimeStamp);
 
-    fn read_commit(&self, ts: Self::Timestamp);
-
-    fn start_write(&self) -> Self::Timestamp;
+    fn start_write(&self) -> TimeStamp;
 
     fn write_commit(
         &self,
-        read_at: Self::Timestamp,
-        write_at: Self::Timestamp,
+        read_at: TimeStamp,
+        write_at: TimeStamp,
         in_write: HashSet<Arc<K>>,
     ) -> Result<(), WriteConflict<K>>;
 }
@@ -70,9 +70,7 @@ impl<K> Oracle<K> for LocalOracle<K>
 where
     K: Ord + Hash,
 {
-    type Timestamp = u64;
-
-    fn start_read(&self) -> Self::Timestamp {
+    fn start_read(&self) -> TimeStamp {
         let mut in_read = self.in_read.lock().unwrap();
         let now = self.now.load(Ordering::Relaxed);
         match in_read.entry(now) {
@@ -86,7 +84,7 @@ where
         now
     }
 
-    fn read_commit(&self, ts: Self::Timestamp) {
+    fn read_commit(&self, ts: TimeStamp) {
         match self.in_read.lock().unwrap().entry(ts) {
             Entry::Vacant(_) => panic!("commit non-existing read"),
             Entry::Occupied(mut o) => match o.get_mut() {
@@ -100,14 +98,14 @@ where
         }
     }
 
-    fn start_write(&self) -> Self::Timestamp {
+    fn start_write(&self) -> TimeStamp {
         self.now.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn write_commit(
         &self,
-        read_at: Self::Timestamp,
-        write_at: Self::Timestamp,
+        read_at: TimeStamp,
+        write_at: TimeStamp,
         in_write: HashSet<Arc<K>>,
     ) -> Result<(), WriteConflict<K>> {
         let mut committed_txns = self.committed_txns.lock().unwrap();

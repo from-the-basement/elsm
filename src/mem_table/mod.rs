@@ -5,31 +5,30 @@ use std::{cmp, cmp::Ordering, collections::BTreeMap, ops::Bound, pin::pin, sync:
 use futures::StreamExt;
 
 use crate::{
+    oracle::TimeStamp,
     record::RecordType,
     serdes::{Decode, Encode},
     wal::WalRecover,
 };
 
 #[derive(PartialEq, Eq, Debug)]
-pub(crate) struct InternalKey<K, T> {
+pub(crate) struct InternalKey<K> {
     pub(crate) key: Arc<K>,
-    pub(crate) ts: T,
+    pub(crate) ts: TimeStamp,
 }
 
-impl<K, T> PartialOrd<Self> for InternalKey<K, T>
+impl<K> PartialOrd<Self> for InternalKey<K>
 where
     K: Ord,
-    T: Ord,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<K, T> Ord for InternalKey<K, T>
+impl<K> Ord for InternalKey<K>
 where
     K: Ord,
-    T: Ord,
 {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key
@@ -39,39 +38,36 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct MemTable<K, V, T>
+pub(crate) struct MemTable<K, V>
 where
     K: Ord,
-    T: Ord,
 {
-    pub(crate) data: BTreeMap<InternalKey<K, T>, Option<V>>,
-    max_ts: T,
+    pub(crate) data: BTreeMap<InternalKey<K>, Option<V>>,
+    max_ts: TimeStamp,
     written_size: usize,
 }
 
-impl<K, V, T> Default for MemTable<K, V, T>
+impl<K, V> Default for MemTable<K, V>
 where
     K: Ord,
-    T: Ord + Default,
 {
     fn default() -> Self {
         Self {
             data: BTreeMap::default(),
-            max_ts: T::default(),
+            max_ts: TimeStamp::default(),
             written_size: 0,
         }
     }
 }
 
-impl<K, V, T> MemTable<K, V, T>
+impl<K, V> MemTable<K, V>
 where
     K: Encode + Ord,
-    T: Encode + Ord + Copy + Default,
     V: Encode + Decode,
 {
     pub(crate) async fn from_wal<W>(wal: &mut W) -> Result<Self, W::Error>
     where
-        W: WalRecover<Arc<K>, V, T>,
+        W: WalRecover<Arc<K>, V>,
     {
         let mut mem_table = Self::default();
 
@@ -82,7 +78,7 @@ where
 
     pub(crate) async fn recover<W>(&mut self, wal: &mut W) -> Result<(), W::Error>
     where
-        W: WalRecover<Arc<K>, V, T>,
+        W: WalRecover<Arc<K>, V>,
     {
         let mut stream = pin!(wal.recover());
         let mut batch = None;
@@ -120,10 +116,9 @@ where
     }
 }
 
-impl<K, V, T> MemTable<K, V, T>
+impl<K, V> MemTable<K, V>
 where
     K: Encode + Ord,
-    T: Encode + Ord + Copy + Default,
     V: Encode + Decode,
 {
     pub(crate) fn is_excess(&self, max_size: usize) -> bool {
@@ -138,14 +133,14 @@ where
         self.data.len()
     }
 
-    pub(crate) fn insert(&mut self, key: Arc<K>, ts: T, value: Option<V>) {
+    pub(crate) fn insert(&mut self, key: Arc<K>, ts: TimeStamp, value: Option<V>) {
         self.max_ts = cmp::max(self.max_ts, ts);
         self.written_size = key.size() + ts.size() + value.as_ref().map(Encode::size).unwrap_or(0);
 
         let _ = self.data.insert(InternalKey { key, ts }, value);
     }
 
-    pub(crate) fn get(&self, key: &Arc<K>, ts: &T) -> Option<Option<&V>> {
+    pub(crate) fn get(&self, key: &Arc<K>, ts: &TimeStamp) -> Option<Option<&V>> {
         let internal_key = InternalKey {
             key: key.clone(),
             ts: *ts,
@@ -210,14 +205,14 @@ mod tests {
         block_on(async {
             {
                 let mut wal = WalFile::new(Cursor::new(&mut file));
-                wal.write(Record::new(RecordType::Full, &key, &0, Some(&value)))
+                wal.write(Record::new(RecordType::Full, &key, 0, Some(&value)))
                     .await
                     .unwrap();
                 wal.flush().await.unwrap();
             }
             {
                 let mut wal = WalFile::new(Cursor::new(&mut file));
-                let mem_table: MemTable<String, String, u64> =
+                let mem_table: MemTable<String, String> =
                     MemTable::from_wal(&mut wal).await.unwrap();
                 assert_eq!(mem_table.get(&key, &0), Some(Some(&value)));
             }

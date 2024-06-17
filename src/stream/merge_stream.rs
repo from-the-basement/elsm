@@ -18,30 +18,28 @@ use crate::{
 };
 
 #[pin_project]
-pub struct MergeStream<'stream, K, T, V, G, F>
+pub struct MergeStream<'stream, K, V, G, F>
 where
     K: Ord + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
     #[allow(clippy::type_complexity)]
     heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<K>, Option<G>>, usize)>>,
-    iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
+    iters: Vec<EStreamImpl<'stream, K, V, G, F>>,
     item_buf: Option<(Arc<K>, Option<G>)>,
 }
 
-impl<'stream, K, T, V, G, F> MergeStream<'stream, K, T, V, G, F>
+impl<'stream, K, V, G, F> MergeStream<'stream, K, V, G, F>
 where
     K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
     pub(crate) async fn new(
-        mut iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
+        mut iters: Vec<EStreamImpl<'stream, K, V, G, F>>,
     ) -> Result<Self, StreamError<K, V>> {
         let mut heap = BinaryHeap::new();
 
@@ -67,10 +65,9 @@ where
     }
 }
 
-impl<'stream, K, T, V, G, F> Stream for MergeStream<'stream, K, T, V, G, F>
+impl<'stream, K, V, G, F> Stream for MergeStream<'stream, K, V, G, F>
 where
     K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode + Send + Sync,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
@@ -135,7 +132,7 @@ mod tests {
             ]);
 
             let mut iterator =
-                MergeStream::<String, u64, String, String, fn(&String) -> String>::new(vec![
+                MergeStream::<String, String, String, fn(&String) -> String>::new(vec![
                     EStreamImpl::Buf(iter_3),
                     EStreamImpl::Buf(iter_2),
                     EStreamImpl::Buf(iter_1),

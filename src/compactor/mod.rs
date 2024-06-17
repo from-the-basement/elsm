@@ -17,7 +17,6 @@ use thiserror::Error;
 
 use crate::{
     index_batch::IndexBatch,
-    oracle::Oracle,
     scope::Scope,
     serdes::{Decode, Encode},
     stream::{
@@ -28,30 +27,28 @@ use crate::{
     DbOption, Immutable, Offset, ELSM_SCHEMA,
 };
 
-pub(crate) struct Compactor<K, O, V>
+pub(crate) struct Compactor<K, V>
 where
     K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
     V: Debug + Encode + Decode + Send + Sync + 'static,
-    O: Oracle<K>,
 {
     pub(crate) option: Arc<DbOption>,
-    pub(crate) immutable: Immutable<K, O::Timestamp>,
+    pub(crate) immutable: Immutable<K>,
     pub(crate) version_set: VersionSet<K>,
     _p: PhantomData<V>,
 }
 
-impl<K, O, V> Compactor<K, O, V>
+impl<K, V> Compactor<K, V>
 where
     K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
     V: Debug + Encode + Decode + Send + Sync + 'static,
-    O: Oracle<K>,
 {
     pub(crate) fn new(
-        immutable: Immutable<K, O::Timestamp>,
+        immutable: Immutable<K>,
         option: Arc<DbOption>,
         version_set: VersionSet<K>,
     ) -> Self {
-        Compactor::<K, O, V> {
+        Compactor::<K, V> {
             option,
             immutable,
             version_set,
@@ -100,7 +97,7 @@ where
 
     pub(crate) async fn minor_compaction(
         option: &DbOption,
-        batches: VecDeque<IndexBatch<K, O::Timestamp>>,
+        batches: VecDeque<IndexBatch<K>>,
     ) -> Result<Option<Scope<K>>, CompactionError<K, V>> {
         if !batches.is_empty() {
             let mut min = None;
@@ -397,14 +394,13 @@ mod tests {
         compactor::Compactor,
         index_batch::IndexBatch,
         mem_table::InternalKey,
-        oracle::LocalOracle,
         scope::Scope,
         serdes::Encode,
         version::{edit::VersionEdit, Version},
         DbOption, Offset, ELSM_SCHEMA,
     };
 
-    async fn build_index_batch<K, V>(items: &[(Arc<K>, Option<V>)]) -> IndexBatch<K, u64>
+    async fn build_index_batch<K, V>(items: &[(Arc<K>, Option<V>)]) -> IndexBatch<K>
     where
         K: Encode + Ord,
         V: Encode,
@@ -512,7 +508,7 @@ mod tests {
             ])
             .await;
 
-            let scope = Compactor::<String, LocalOracle<String>, String>::minor_compaction(
+            let scope = Compactor::<String, String>::minor_compaction(
                 &option,
                 VecDeque::from(vec![batch_2, batch_1]),
             )
@@ -628,7 +624,7 @@ mod tests {
             let max = Arc::new("key_5".to_string());
             let mut version_edits = Vec::new();
 
-            Compactor::<String, LocalOracle<String>, String>::major_compaction(
+            Compactor::<String, String>::major_compaction(
                 &version,
                 &option,
                 &min,

@@ -10,28 +10,27 @@ use pin_project::pin_project;
 
 use crate::{
     mem_table::{InternalKey, MemTable},
+    oracle::TimeStamp,
     serdes::{Decode, Encode},
     stream::StreamError,
 };
 
 #[pin_project]
-pub(crate) struct MemTableStream<'a, K, T, V, G, F>
+pub(crate) struct MemTableStream<'a, K, V, G, F>
 where
     K: Ord,
-    T: Ord,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
 {
-    inner: btree_map::Range<'a, InternalKey<K, T>, Option<V>>,
+    inner: btree_map::Range<'a, InternalKey<K>, Option<V>>,
     item_buf: Option<(Arc<K>, Option<G>)>,
-    ts: T,
+    ts: TimeStamp,
     f: F,
 }
 
-impl<'a, K, V, T, G, F> Stream for MemTableStream<'a, K, T, V, G, F>
+impl<'a, K, V, G, F> Stream for MemTableStream<'a, K, V, G, F>
 where
     K: Ord + Encode + Decode,
-    T: Ord + Copy,
     V: Decode,
     G: Send + Sync + 'static,
     F: Fn(&V) -> G + Sync + 'static,
@@ -58,13 +57,12 @@ where
     }
 }
 
-impl<K, V, T> MemTable<K, V, T>
+impl<K, V> MemTable<K, V>
 where
     K: Ord + Encode + Decode,
-    T: Ord + Copy + Default,
     V: Decode,
 {
-    pub(crate) async fn iter<G, F>(&self, f: F) -> Result<MemTableStream<K, T, V, G, F>, V::Error>
+    pub(crate) async fn iter<G, F>(&self, f: F) -> Result<MemTableStream<K, V, G, F>, V::Error>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
@@ -72,9 +70,10 @@ where
         let mut iterator = MemTableStream {
             inner: self
                 .data
-                .range::<InternalKey<K, T>, (Bound<InternalKey<K, T>>, Bound<InternalKey<K, T>>)>(
-                    (Bound::Unbounded, Bound::Unbounded),
-                ),
+                .range::<InternalKey<K>, (Bound<InternalKey<K>>, Bound<InternalKey<K>>)>((
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                )),
             item_buf: None,
             ts: self.max_ts,
             f,
@@ -92,9 +91,9 @@ where
         &self,
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
-        ts: &T,
+        ts: &TimeStamp,
         f: F,
-    ) -> Result<MemTableStream<K, T, V, G, F>, StreamError<K, V>>
+    ) -> Result<MemTableStream<K, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Sync + 'static,
@@ -113,7 +112,7 @@ where
                     .map(|k| {
                         Bound::Included(InternalKey {
                             key: k.clone(),
-                            ts: T::default(),
+                            ts: TimeStamp::default(),
                         })
                     })
                     .unwrap_or(Bound::Unbounded),

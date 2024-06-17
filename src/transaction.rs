@@ -14,7 +14,7 @@ use pin_project::pin_project;
 use thiserror::Error;
 
 use crate::{
-    oracle::WriteConflict,
+    oracle::{TimeStamp, WriteConflict},
     serdes::{Decode, Encode},
     stream::{merge_stream::MergeStream, EStreamImpl, StreamError},
     GetWrite,
@@ -27,7 +27,7 @@ where
     V: Decode,
     DB: GetWrite<K, V>,
 {
-    pub(crate) read_at: DB::Timestamp,
+    pub(crate) read_at: TimeStamp,
     pub(crate) local: BTreeMap<Arc<K>, Option<V>>,
     share: Arc<DB>,
 }
@@ -37,7 +37,6 @@ where
     K: Hash + Ord + Debug + Encode + Decode + Send + Sync,
     V: Decode + Send + Sync,
     DB: GetWrite<K, V>,
-    DB::Timestamp: Send + Sync,
 {
     pub(crate) fn new(share: Arc<DB>) -> Self {
         let read_at = share.start_read();
@@ -95,7 +94,7 @@ where
         lower: Option<&Arc<K>>,
         upper: Option<&Arc<K>>,
         f: F,
-    ) -> Result<MergeStream<K, DB::Timestamp, V, G, F>, StreamError<K, V>>
+    ) -> Result<MergeStream<K, V, G, F>, StreamError<K, V>>
     where
         G: Send + Sync + 'static,
         F: Fn(&V) -> G + Send + Sync + 'static + Copy,

@@ -10,24 +10,26 @@ use std::{
 use arrow::array::{AsArray, RecordBatch};
 use executor::futures::util::io::Cursor;
 
-use crate::{mem_table::InternalKey, serdes::Decode, Offset};
+use crate::{mem_table::InternalKey, oracle::TimeStamp, serdes::Decode, Offset};
 
 #[derive(Debug)]
-pub(crate) struct IndexBatch<K, T>
+pub(crate) struct IndexBatch<K>
 where
     K: Ord,
-    T: Ord,
 {
     pub(crate) batch: RecordBatch,
-    pub(crate) index: BTreeMap<InternalKey<K, T>, u32>,
+    pub(crate) index: BTreeMap<InternalKey<K>, u32>,
 }
 
-impl<K, T> IndexBatch<K, T>
+impl<K> IndexBatch<K>
 where
     K: Ord,
-    T: Ord + Copy + Default,
 {
-    pub(crate) async fn find<V>(&self, key: &Arc<K>, ts: &T) -> Result<Option<Option<V>>, V::Error>
+    pub(crate) async fn find<V>(
+        &self,
+        key: &Arc<K>,
+        ts: &TimeStamp,
+    ) -> Result<Option<Option<V>>, V::Error>
     where
         V: Decode + Sync + Send,
     {
