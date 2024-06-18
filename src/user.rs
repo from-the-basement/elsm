@@ -1,31 +1,103 @@
-use std::io;
+use std::{io, sync::Arc};
 
-use arrow::datatypes::{DataType, Field};
+use arrow::{
+    array::{
+        Array, RecordBatch, StringArray, StringBuilder, StructArray, StructBuilder, UInt64Array,
+        UInt64Builder,
+    },
+    datatypes::{DataType, Field, Fields, SchemaRef},
+};
 use executor::futures::{AsyncRead, AsyncWrite};
+use lazy_static::lazy_static;
 
 use crate::{
-    schema::Schema,
+    schema::{Builder, Schema},
     serdes::{Decode, Encode},
 };
 
+lazy_static! {
+    pub static ref USER_INNER_SCHEMA: SchemaRef = {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("inner", DataType::Struct(USER_INNER_FIELDS.clone()), true),
+        ]))
+    };
+    pub static ref USER_SCHEMA: SchemaRef = {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+    };
+    pub static ref USER_INNER_FIELDS: Fields =
+        Fields::from(vec![Field::new("name", DataType::Utf8, false)]);
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct User {
+pub(crate) struct User {
     pub(crate) id: u64,
     pub(crate) name: String,
 }
 
 impl Schema for User {
     type PrimaryKey = u64;
+    type Builder = UserBuilder;
+    type PrimaryKeyArray = UInt64Array;
 
-    fn arrow_schema() -> arrow::datatypes::Schema {
-        arrow::datatypes::Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            Field::new("name", DataType::Utf8, true),
-        ])
+    fn arrow_schema() -> SchemaRef {
+        USER_SCHEMA.clone()
+    }
+
+    fn inner_schema() -> SchemaRef {
+        USER_INNER_SCHEMA.clone()
     }
 
     fn primary_key(&self) -> Self::PrimaryKey {
         self.id
+    }
+
+    fn builder() -> Self::Builder {
+        UserBuilder {
+            id: Default::default(),
+            inner: StructBuilder::new(
+                USER_INNER_FIELDS.clone(),
+                vec![Box::new(StringBuilder::new())],
+            ),
+        }
+    }
+
+    fn from_batch(batch: &RecordBatch, offset: usize) -> (Self::PrimaryKey, Option<Self>) {
+        let id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(offset);
+        let name_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        if name_array.is_null(offset) {
+            return (id, None);
+        }
+        let name = name_array.value(offset);
+
+        (
+            id,
+            Some(User {
+                id,
+                name: name.to_string(),
+            }),
+        )
+    }
+
+    fn to_primary_key_array(keys: Vec<Self::PrimaryKey>) -> Self::PrimaryKeyArray {
+        UInt64Array::from(keys)
     }
 }
 
@@ -55,6 +127,38 @@ impl Decode for User {
         let name = String::decode(reader).await?;
 
         Ok(User { id, name })
+    }
+}
+
+pub(crate) struct UserBuilder {
+    id: UInt64Builder,
+    inner: StructBuilder,
+}
+
+impl Builder<User> for UserBuilder {
+    fn add(&mut self, primary_key: &<User as Schema>::PrimaryKey, schema: Option<User>) {
+        self.id.append_value(*primary_key);
+
+        if let Some(schema) = schema {
+            self.inner
+                .field_builder::<StringBuilder>(0)
+                .unwrap()
+                .append_value(&schema.name);
+            self.inner.append(true);
+        } else {
+            self.inner
+                .field_builder::<StringBuilder>(0)
+                .unwrap()
+                .append_null();
+            self.inner.append_null();
+        }
+    }
+
+    fn finish(&mut self) -> RecordBatch {
+        let ids = self.id.finish();
+        let structs = self.inner.finish();
+
+        RecordBatch::try_new(User::inner_schema(), vec![Arc::new(ids), Arc::new(structs)]).unwrap()
     }
 }
 
@@ -93,7 +197,7 @@ mod tests {
                 name: "2333".to_string(),
             };
             let user_2 = User {
-                id: 1,
+                id: 2,
                 name: "ghost".to_string(),
             };
 

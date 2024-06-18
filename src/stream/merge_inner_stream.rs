@@ -10,31 +10,29 @@ use executor::futures::{Stream, StreamExt};
 use pin_project::pin_project;
 
 use crate::{
-    serdes::{Decode, Encode},
+    schema::Schema,
     stream::{EInnerStreamImpl, StreamError},
     utils::CmpKeyItem,
 };
 
 #[pin_project]
-pub struct MergeInnerStream<'stream, K, V>
+pub struct MergeInnerStream<'stream, S>
 where
-    K: Ord + Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     #[allow(clippy::type_complexity)]
-    heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<K>, Option<V>>, usize)>>,
-    iters: Vec<EInnerStreamImpl<'stream, K, V>>,
-    item_buf: Option<(Arc<K>, Option<V>)>,
+    heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<S::PrimaryKey>, Option<S>>, usize)>>,
+    iters: Vec<EInnerStreamImpl<'stream, S>>,
+    item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
 }
 
-impl<'stream, K, V> MergeInnerStream<'stream, K, V>
+impl<'stream, S> MergeInnerStream<'stream, S>
 where
-    K: Ord + Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pub(crate) async fn new(
-        mut iters: Vec<EInnerStreamImpl<'stream, K, V>>,
-    ) -> Result<Self, StreamError<K, V>> {
+        mut iters: Vec<EInnerStreamImpl<'stream, S>>,
+    ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
@@ -59,12 +57,11 @@ where
     }
 }
 
-impl<'stream, K, V> Stream for MergeInnerStream<'stream, K, V>
+impl<'stream, S> Stream for MergeInnerStream<'stream, S>
 where
-    K: Ord + Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();

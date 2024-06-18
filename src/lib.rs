@@ -19,7 +19,6 @@ use std::{
     error,
     fmt::Debug,
     future::Future,
-    hash::Hash,
     io, mem,
     ops::DerefMut,
     path::PathBuf,
@@ -27,10 +26,6 @@ use std::{
     sync::Arc,
 };
 
-use arrow::{
-    array::{GenericBinaryBuilder, RecordBatch},
-    datatypes::{DataType, Field, Schema, SchemaRef},
-};
 use async_lock::{Mutex, RwLock};
 use consistent_hash::jump_consistent_hash;
 use executor::{
@@ -44,10 +39,8 @@ use futures::{
         oneshot,
     },
     executor::block_on,
-    io::Cursor,
     AsyncWrite,
 };
-use lazy_static::lazy_static;
 use mem_table::MemTable;
 use oracle::Oracle;
 use record::{Record, RecordType};
@@ -59,25 +52,17 @@ use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
 
 use crate::{
     compactor::Compactor,
-    index_batch::{decode_value, IndexBatch},
+    index_batch::IndexBatch,
     oracle::TimeStamp,
+    schema::Builder,
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
     version::{cleaner::Cleaner, set::VersionSet, Version},
     wal::WalRecover,
 };
 
-lazy_static! {
-    pub static ref ELSM_SCHEMA: SchemaRef = {
-        Arc::new(Schema::new(vec![
-            Field::new("key", DataType::LargeBinary, false),
-            Field::new("value", DataType::LargeBinary, true),
-        ]))
-    };
-}
-
 pub type Offset = i64;
-pub type Immutable<K> = Arc<RwLock<VecDeque<IndexBatch<K>>>>;
+pub(crate) type Immutable<S> = Arc<RwLock<VecDeque<IndexBatch<S>>>>;
 
 #[derive(Debug)]
 pub enum CompactTask {
@@ -96,44 +81,43 @@ pub struct DbOption {
 }
 
 #[derive(Debug)]
-struct MutableShard<K, V>
+struct MutableShard<S>
 where
-    K: Ord,
+    S: schema::Schema,
 {
-    mutable: MemTable<K, V>,
+    mutable: MemTable<S>,
 }
 
-pub struct Db<K, V, O, WP>
+pub struct Db<S, O, WP>
 where
-    K: Ord + Encode + Decode,
-    O: Oracle<K>,
+    S: schema::Schema,
+    O: Oracle<S::PrimaryKey>,
     WP: WalProvider,
 {
     option: Arc<DbOption>,
     pub(crate) oracle: O,
     wal_manager: Arc<WalManager<WP>>,
-    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<K, V>>>,
-    pub(crate) immutable: Immutable<K>,
+    pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<S>>>,
+    pub(crate) immutable: Immutable<S>,
     #[allow(clippy::type_complexity)]
-    pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<K>, V>>>,
+    pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<S::PrimaryKey>, S>>>,
     pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
-    pub(crate) version_set: VersionSet<K>,
+    pub(crate) version_set: VersionSet<S>,
 }
 
-impl<K, V, O, WP> Db<K, V, O, WP>
+impl<S, O, WP> Db<S, O, WP>
 where
-    K: Encode + Decode + Debug + Ord + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Debug + Send + Sync + 'static,
-    O: Oracle<K> + 'static,
+    S: schema::Schema,
+    O: Oracle<S::PrimaryKey> + 'static,
     WP: WalProvider,
     WP::File: AsyncWrite + AsyncRead,
-    io::Error: From<<V as Decode>::Error>,
+    io::Error: From<<S as Decode>::Error>,
 {
     pub async fn new(
         oracle: O,
         wal_provider: WP,
         option: DbOption,
-    ) -> Result<Self, WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
+    ) -> Result<Self, WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
         let wal_manager = Arc::new(WalManager::new(wal_provider));
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
@@ -148,11 +132,11 @@ where
         let (task_tx, mut task_rx) = channel(1);
         let (mut cleaner, clean_sender) = Cleaner::new(option.clone());
 
-        let version_set = VersionSet::<K>::new(&option, clean_sender.clone())
+        let version_set = VersionSet::<S>::new(&option, clean_sender.clone())
             .await
             .unwrap();
         let mut compactor =
-            Compactor::<K, V>::new(immutable.clone(), option.clone(), version_set.clone());
+            Compactor::<S>::new(immutable.clone(), option.clone(), version_set.clone());
 
         spawn(async move {
             if let Err(err) = cleaner.listen().await {
@@ -205,26 +189,25 @@ where
     }
 }
 
-impl<K, V, O, WP> Db<K, V, O, WP>
+impl<S, O, WP> Db<S, O, WP>
 where
-    K: Encode + Decode + Ord + Debug + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + Sync + 'static,
-    O: Oracle<K>,
+    S: schema::Schema,
+    O: Oracle<S::PrimaryKey>,
     WP: WalProvider,
     WP::File: AsyncWrite,
-    io::Error: From<<V as Decode>::Error>,
+    io::Error: From<<S as Decode>::Error>,
 {
-    pub fn new_txn(self: &Arc<Self>) -> Transaction<K, V, Self> {
+    pub fn new_txn(self: &Arc<Self>) -> Transaction<S, Self> {
         Transaction::new(self.clone())
     }
 
     async fn write(
         &self,
         record_type: RecordType,
-        key: Arc<K>,
+        key: Arc<S::PrimaryKey>,
         ts: TimeStamp,
-        value: Option<V>,
-    ) -> Result<(), WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
+        value: Option<S>,
+    ) -> Result<(), WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(&key), executor::worker_num()) as usize;
         let wal_manager = self.wal_manager.clone();
@@ -256,8 +239,8 @@ where
                     mem::swap(&mut local.mutable, &mut mem_table);
 
                     return Ok::<
-                        Option<MemTable<K, V>>,
-                        WriteError<<Record<&K, &V> as Encode>::Error>,
+                        Option<MemTable<S>>,
+                        WriteError<<Record<&S::PrimaryKey, &S> as Encode>::Error>,
                     >(Some(mem_table));
                 }
                 Ok(None)
@@ -280,10 +263,10 @@ where
         Ok(())
     }
 
-    async fn get<G, F>(&self, key: &Arc<K>, ts: &TimeStamp, f: F) -> Option<G>
+    async fn get<G, F>(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp, f: F) -> Option<G>
     where
         G: Send + 'static,
-        F: Fn(&V) -> G + Sync + 'static,
+        F: Fn(&S) -> G + Sync + 'static,
     {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(key), executor::worker_num()) as usize;
@@ -291,7 +274,7 @@ where
         // Safety: read-only would not break data.
         let (key, ts, f) = unsafe {
             (
-                mem::transmute::<_, &Arc<K>>(key),
+                mem::transmute::<_, &Arc<S::PrimaryKey>>(key),
                 mem::transmute::<_, &TimeStamp>(ts),
                 mem::transmute::<_, &'static F>(&f),
             )
@@ -308,7 +291,7 @@ where
         }
         let guard = self.immutable.read().await;
         for index_batch in guard.iter().rev() {
-            if let Ok(Some(value)) = index_batch.find(key, ts).await {
+            if let Some(value) = index_batch.find(key, ts).await {
                 return value.map(|v| f(&v));
             }
         }
@@ -316,9 +299,7 @@ where
 
         let guard = self.version_set.current().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
-            if let Ok(value) = decode_value(&record_batch, 1, 0).await {
-                return value.map(|v| f(&v));
-            }
+            return S::from_batch(&record_batch, 0).1.map(|v| f(&v));
         }
         drop(guard);
 
@@ -327,14 +308,14 @@ where
 
     async fn range<G, F>(
         &self,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
+        lower: Option<&Arc<S::PrimaryKey>>,
+        upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
         f: F,
-    ) -> Result<MergeStream<K, V, G, F>, StreamError<K, V>>
+    ) -> Result<MergeStream<S, G, F>, StreamError<S::PrimaryKey, S>>
     where
         G: Send + Sync + 'static,
-        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+        F: Fn(&S) -> G + Sync + Send + 'static + Copy,
     {
         let iters = self.inner_range(lower, upper, ts, f).await?;
 
@@ -343,14 +324,14 @@ where
 
     pub(crate) async fn inner_range<'s, G, F>(
         &'s self,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
+        lower: Option<&Arc<S::PrimaryKey>>,
+        upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<K, V, G, F>>, StreamError<K, V>>
+    ) -> Result<Vec<EStreamImpl<S, G, F>>, StreamError<S::PrimaryKey, S>>
     where
         G: Send + Sync + 'static,
-        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+        F: Fn(&S) -> G + Sync + Send + 'static + Copy,
     {
         let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
             let lower = lower.cloned();
@@ -395,8 +376,8 @@ where
 
     async fn write_batch(
         &self,
-        mut kvs: impl ExactSizeIterator<Item = (Arc<K>, TimeStamp, Option<V>)>,
-    ) -> Result<(), WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
+        mut kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
+    ) -> Result<(), WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
         match kvs.len() {
             0 => Ok(()),
             1 => {
@@ -418,44 +399,17 @@ where
     }
 
     async fn freeze(
-        mem_table: MemTable<K, V>,
-    ) -> Result<IndexBatch<K>, WriteError<<Record<Arc<K>, V> as Encode>::Error>> {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
-        let mut buf = Cursor::new(vec![0; 128]);
+        mem_table: MemTable<S>,
+    ) -> Result<IndexBatch<S>, WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
         let mut index = BTreeMap::new();
-        let mut key_builder = GenericBinaryBuilder::<Offset>::new();
-        let mut value_builder = GenericBinaryBuilder::<Offset>::new();
+
+        let mut builder = S::builder();
 
         for (offset, (key, value)) in mem_table.data.into_iter().enumerate() {
-            clear(&mut buf);
-            key.key
-                .encode(&mut buf)
-                .await
-                .map_err(|err| WriteError::Internal(Box::new(err)))?;
-            key_builder.append_value(buf.get_ref());
-
-            if let Some(value) = value {
-                clear(&mut buf);
-                value
-                    .encode(&mut buf)
-                    .await
-                    .map_err(|err| WriteError::Internal(Box::new(err)))?;
-                value_builder.append_value(buf.get_ref());
-            } else {
-                value_builder.append_null();
-            }
+            builder.add(&key.key, value);
             index.insert(key, offset as u32);
         }
-        let keys = key_builder.finish();
-        let values = value_builder.finish();
-
-        let batch =
-            RecordBatch::try_new(ELSM_SCHEMA.clone(), vec![Arc::new(keys), Arc::new(values)])
-                .map_err(WriteError::Arrow)?;
+        let batch = builder.finish();
 
         Ok(IndexBatch { batch, index })
     }
@@ -463,9 +417,9 @@ where
     async fn recover<W>(
         &mut self,
         wal: &mut W,
-    ) -> Result<(), WriteError<<Record<Arc<K>, V> as Encode>::Error>>
+    ) -> Result<(), WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>>
     where
-        W: WalRecover<Arc<K>, V>,
+        W: WalRecover<Arc<S::PrimaryKey>, S>,
     {
         let mut stream = pin!(wal.recover());
         while let Some(record) = stream.next().await {
@@ -485,10 +439,10 @@ where
     }
 }
 
-impl<K, V, O, WP> Oracle<K> for Db<K, V, O, WP>
+impl<S, O, WP> Oracle<S::PrimaryKey> for Db<S, O, WP>
 where
-    K: Ord + Encode + Decode,
-    O: Oracle<K>,
+    S: schema::Schema,
+    O: Oracle<S::PrimaryKey>,
     WP: WalProvider,
 {
     fn start_read(&self) -> TimeStamp {
@@ -507,82 +461,85 @@ where
         &self,
         read_at: TimeStamp,
         write_at: TimeStamp,
-        in_write: std::collections::HashSet<Arc<K>>,
-    ) -> Result<(), oracle::WriteConflict<K>> {
+        in_write: std::collections::HashSet<Arc<S::PrimaryKey>>,
+    ) -> Result<(), oracle::WriteConflict<S::PrimaryKey>> {
         self.oracle.write_commit(read_at, write_at, in_write)
     }
 }
 
-pub(crate) trait GetWrite<K, V>: Oracle<K>
+pub(crate) trait GetWrite<S>: Oracle<S::PrimaryKey>
 where
-    K: Ord + Encode + Decode,
-    V: Decode,
+    S: schema::Schema,
 {
-    fn get<G, F>(&self, key: &Arc<K>, ts: &TimeStamp, f: F) -> impl Future<Output = Option<G>>
+    fn get<G, F>(
+        &self,
+        key: &Arc<S::PrimaryKey>,
+        ts: &TimeStamp,
+        f: F,
+    ) -> impl Future<Output = Option<G>>
     where
         G: Send + 'static,
         TimeStamp: Sync,
-        F: Fn(&V) -> G + Sync + 'static;
+        F: Fn(&S) -> G + Sync + 'static;
 
     fn write(
         &self,
         record_type: RecordType,
-        key: Arc<K>,
+        key: Arc<S::PrimaryKey>,
         ts: TimeStamp,
-        value: Option<V>,
+        value: Option<S>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
     fn write_batch(
         &self,
-        kvs: impl ExactSizeIterator<Item = (Arc<K>, TimeStamp, Option<V>)>,
+        kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
     fn inner_range<'a, G, F>(
         &'a self,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
+        lower: Option<&Arc<S::PrimaryKey>>,
+        upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
         f: F,
-    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, K, V, G, F>>, StreamError<K, V>>>
+    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, S, G, F>>, StreamError<S::PrimaryKey, S>>>
     where
-        K: 'a,
+        S::PrimaryKey: 'a,
         TimeStamp: 'a,
-        V: 'a,
+        S: 'a,
         G: Send + Sync + 'static,
-        F: Fn(&V) -> G + Sync + Send + 'static + Copy;
+        F: Fn(&S) -> G + Sync + Send + 'static + Copy;
 }
 
-impl<K, V, O, WP> GetWrite<K, V> for Db<K, V, O, WP>
+impl<S, O, WP> GetWrite<S> for Db<S, O, WP>
 where
-    K: Encode + Decode + Ord + Debug + Hash + Send + Sync + 'static,
-    V: Encode + Decode + Send + Sync + 'static,
-    O: Oracle<K>,
+    S: schema::Schema,
+    O: Oracle<S::PrimaryKey>,
     WP: WalProvider,
     WP::File: AsyncWrite,
-    io::Error: From<<V as Decode>::Error>,
+    io::Error: From<<S as Decode>::Error>,
 {
     async fn write(
         &self,
         record_type: RecordType,
-        key: Arc<K>,
+        key: Arc<S::PrimaryKey>,
         ts: TimeStamp,
-        value: Option<V>,
+        value: Option<S>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
         Db::write(self, record_type, key, ts, value).await?;
         Ok(())
     }
 
-    async fn get<G, F>(&self, key: &Arc<K>, ts: &TimeStamp, f: F) -> Option<G>
+    async fn get<G, F>(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp, f: F) -> Option<G>
     where
         G: Send + 'static,
-        F: Fn(&V) -> G + Sync + 'static,
+        F: Fn(&S) -> G + Sync + 'static,
     {
         Db::get(self, key, ts, f).await
     }
 
     async fn write_batch(
         &self,
-        kvs: impl ExactSizeIterator<Item = (Arc<K>, TimeStamp, Option<V>)>,
+        kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
         Db::write_batch(self, kvs).await?;
         Ok(())
@@ -590,17 +547,17 @@ where
 
     async fn inner_range<'a, G, F>(
         &'a self,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
+        lower: Option<&Arc<S::PrimaryKey>>,
+        upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
         f: F,
-    ) -> Result<Vec<EStreamImpl<'a, K, V, G, F>>, StreamError<K, V>>
+    ) -> Result<Vec<EStreamImpl<'a, S, G, F>>, StreamError<S::PrimaryKey, S>>
     where
-        K: 'a,
+        S::PrimaryKey: 'a,
         TimeStamp: 'a,
-        V: 'a,
+        S: 'a,
         G: Send + Sync + 'static,
-        F: Fn(&V) -> G + Sync + Send + 'static + Copy,
+        F: Fn(&S) -> G + Sync + Send + 'static + Copy,
     {
         Db::inner_range(self, lower, upper, ts, f).await
     }
@@ -626,9 +583,9 @@ impl DbOption {
         self.path.join("version.log")
     }
 
-    pub(crate) fn is_threshold_exceeded_major<K>(&self, version: &Version<K>, level: usize) -> bool
+    pub(crate) fn is_threshold_exceeded_major<S>(&self, version: &Version<S>, level: usize) -> bool
     where
-        K: Ord + Encode + Decode + Debug,
+        S: schema::Schema,
     {
         version.tables_len(level)
             >= (self.major_threshold_with_sst_size * self.level_sst_magnification.pow(level as u32))
@@ -646,6 +603,7 @@ mod tests {
         oracle::LocalOracle,
         record::RecordType,
         transaction::CommitError,
+        user::User,
         wal::provider::{fs::Fs, in_mem::InMemProvider},
         Db, DbOption,
     };
@@ -666,21 +624,27 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set("key0".to_string(), 0);
-            txn.set("key1".to_string(), 1);
+            txn.set(
+                0,
+                User {
+                    id: 0,
+                    name: "0".to_string(),
+                },
+            );
+            txn.set(
+                1,
+                User {
+                    id: 1,
+                    name: "1".to_string(),
+                },
+            );
             txn.commit().await.unwrap();
 
             let mut t0 = db.new_txn();
             let mut t1 = db.new_txn();
 
-            t0.set(
-                "key0".into(),
-                t0.get(&Arc::new("key1".to_owned()), |v| *v).await.unwrap(),
-            );
-            t1.set(
-                "key1".into(),
-                t1.get(&Arc::new("key0".to_owned()), |v| *v).await.unwrap(),
-            );
+            t0.set(0, t0.get(&Arc::new(1), |v| v.clone()).await.unwrap());
+            t1.set(1, t1.get(&Arc::new(0), |v| v.clone()).await.unwrap());
 
             t0.commit().await.unwrap();
             t1.commit().await.unwrap();
@@ -688,12 +652,18 @@ mod tests {
             let txn = db.new_txn();
 
             assert_eq!(
-                txn.get(&Arc::from("key0".to_string()), |v| *v).await,
-                Some(1)
+                txn.get(&Arc::from(0), |v| v.clone()).await,
+                Some(User {
+                    id: 1,
+                    name: "1".to_string()
+                })
             );
             assert_eq!(
-                txn.get(&Arc::from("key1".to_string()), |v| *v).await,
-                Some(0)
+                txn.get(&Arc::from(1), |v| v.clone()).await,
+                Some(User {
+                    id: 0,
+                    name: "0".to_string()
+                })
             );
         });
     }
@@ -714,64 +684,139 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set("key0".to_string(), 0);
-            txn.set("key1".to_string(), 1);
-            txn.set("key2".to_string(), 2);
-            txn.set("key3".to_string(), 3);
+            txn.set(
+                0,
+                User {
+                    id: 0,
+                    name: "0".to_string(),
+                },
+            );
+            txn.set(
+                1,
+                User {
+                    id: 1,
+                    name: "1".to_string(),
+                },
+            );
+            txn.set(
+                2,
+                User {
+                    id: 2,
+                    name: "2".to_string(),
+                },
+            );
+            txn.set(
+                3,
+                User {
+                    id: 3,
+                    name: "3".to_string(),
+                },
+            );
             txn.commit().await.unwrap();
 
             let mut iter = db
-                .range(
-                    Some(&Arc::new("key1".to_string())),
-                    Some(&Arc::new("key2".to_string())),
-                    &1,
-                    |v| *v,
-                )
+                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1, |v| v.clone())
                 .await
                 .unwrap();
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new("key1".to_string()), Some(1))
+                (
+                    Arc::new(1),
+                    Some(User {
+                        id: 1,
+                        name: "1".to_string()
+                    })
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new("key2".to_string()), Some(2))
+                (
+                    Arc::new(2),
+                    Some(User {
+                        id: 2,
+                        name: "2".to_string()
+                    })
+                )
             );
 
             let mut txn_1 = db.new_txn();
-            txn_1.set("key5".to_string(), 5);
-            txn_1.set("key4".to_string(), 4);
+            txn_1.set(
+                5,
+                User {
+                    id: 5,
+                    name: "5".to_string(),
+                },
+            );
+            txn_1.set(
+                4,
+                User {
+                    id: 4,
+                    name: "4".to_string(),
+                },
+            );
 
             let mut txn_2 = db.new_txn();
-            txn_2.set("key5".to_string(), 4);
-            txn_2.set("key4".to_string(), 5);
+            txn_2.set(
+                5,
+                User {
+                    id: 4,
+                    name: "4".to_string(),
+                },
+            );
+            txn_2.set(
+                4,
+                User {
+                    id: 5,
+                    name: "5".to_string(),
+                },
+            );
             txn_2.commit().await.unwrap();
 
             let mut iter = txn_1
-                .range(
-                    Some(&Arc::new("key1".to_string())),
-                    Some(&Arc::new("key4".to_string())),
-                    |v| *v,
-                )
+                .range(Some(&Arc::new(1)), Some(&Arc::new(4)), |v| v.clone())
                 .await
                 .unwrap();
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new("key1".to_string()), Some(1))
+                (
+                    Arc::new(1),
+                    Some(User {
+                        id: 1,
+                        name: "1".to_string()
+                    })
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new("key2".to_string()), Some(2))
+                (
+                    Arc::new(2),
+                    Some(User {
+                        id: 2,
+                        name: "2".to_string()
+                    })
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new("key3".to_string()), Some(3))
+                (
+                    Arc::new(3),
+                    Some(User {
+                        id: 3,
+                        name: "3".to_string()
+                    })
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new("key4".to_string()), Some(4))
+                (
+                    Arc::new(4),
+                    Some(User {
+                        id: 4,
+                        name: "4".to_string()
+                    })
+                )
             );
         });
     }
@@ -792,24 +837,42 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set("key0".to_string(), 0);
-            txn.set("key1".to_string(), 1);
+            txn.set(
+                0,
+                User {
+                    id: 0,
+                    name: "0".to_string(),
+                },
+            );
+            txn.set(
+                1,
+                User {
+                    id: 1,
+                    name: "1".to_string(),
+                },
+            );
             txn.commit().await.unwrap();
 
             let mut t0 = db.new_txn();
             let mut t1 = db.new_txn();
             let mut t2 = db.new_txn();
 
-            t0.set(
-                "key0".into(),
-                t0.get(&Arc::new("key1".to_owned()), |v| *v).await.unwrap(),
-            );
+            t0.set(0, t0.get(&Arc::new(1), |v| v.clone()).await.unwrap());
+            t1.set(0, t1.get(&Arc::new(0), |v| v.clone()).await.unwrap());
             t1.set(
-                "key0".into(),
-                t1.get(&Arc::new("key0".to_owned()), |v| *v).await.unwrap(),
+                2,
+                User {
+                    id: 2,
+                    name: "2".to_string(),
+                },
             );
-            t1.set("key2".into(), 2);
-            t2.set("key2".into(), 3);
+            t2.set(
+                2,
+                User {
+                    id: 3,
+                    name: "3".to_string(),
+                },
+            );
 
             t0.commit().await.unwrap();
 
@@ -817,7 +880,13 @@ mod tests {
             assert!(commit.is_err());
             assert!(t2.commit().await.is_ok());
             if let Err(CommitError::WriteConflict(keys)) = commit {
-                assert_eq!(db.new_txn().get(&keys[0], |v| *v).await, Some(1));
+                assert_eq!(
+                    db.new_txn().get(&keys[0], |v| v.clone()).await,
+                    Some(User {
+                        id: 1,
+                        name: "1".to_string()
+                    })
+                );
                 return;
             }
             panic!("unreachable");
@@ -829,8 +898,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         ExecutorBuilder::new().build().unwrap().block_on(async {
-            let value_1 = "value_1".to_owned();
-
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
@@ -852,297 +919,407 @@ mod tests {
 
             db.write(
                 RecordType::Full,
-                Arc::new("key1".to_owned()),
+                Arc::new(1),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 1,
+                    name: "1".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key2".to_owned()),
+                Arc::new(2),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 2,
+                    name: "2".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key3".to_owned()),
+                Arc::new(3),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 3,
+                    name: "3".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key4".to_owned()),
+                Arc::new(4),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 4,
+                    name: "4".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key5".to_owned()),
+                Arc::new(5),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 5,
+                    name: "5".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key6".to_owned()),
+                Arc::new(6),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 6,
+                    name: "6".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key7".to_owned()),
+                Arc::new(7),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 7,
+                    name: "7".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key8".to_owned()),
+                Arc::new(8),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 8,
+                    name: "8".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key9".to_owned()),
+                Arc::new(9),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 9,
+                    name: "9".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key10".to_owned()),
+                Arc::new(10),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 10,
+                    name: "10".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key20".to_owned()),
+                Arc::new(20),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 20,
+                    name: "20".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key30".to_owned()),
+                Arc::new(30),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 30,
+                    name: "30".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key40".to_owned()),
+                Arc::new(40),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 40,
+                    name: "40".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key50".to_owned()),
+                Arc::new(50),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 50,
+                    name: "50".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key60".to_owned()),
+                Arc::new(60),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 60,
+                    name: "60".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key70".to_owned()),
+                Arc::new(70),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 70,
+                    name: "70".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key80".to_owned()),
+                Arc::new(80),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 80,
+                    name: "80".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key90".to_owned()),
+                Arc::new(90),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 90,
+                    name: "90".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key100".to_owned()),
+                Arc::new(100),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 100,
+                    name: "100".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key200".to_owned()),
+                Arc::new(200),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 200,
+                    name: "200".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key300".to_owned()),
+                Arc::new(300),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 300,
+                    name: "300".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key400".to_owned()),
+                Arc::new(400),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 400,
+                    name: "400".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key500".to_owned()),
+                Arc::new(500),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 500,
+                    name: "500".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key600".to_owned()),
+                Arc::new(600),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 600,
+                    name: "600".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key700".to_owned()),
+                Arc::new(700),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 700,
+                    name: "700".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key800".to_owned()),
+                Arc::new(800),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 800,
+                    name: "800".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key900".to_owned()),
+                Arc::new(900),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 900,
+                    name: "900".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key1000".to_owned()),
+                Arc::new(1000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 1000,
+                    name: "1000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key2000".to_owned()),
+                Arc::new(2000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 2000,
+                    name: "2000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key3000".to_owned()),
+                Arc::new(3000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 3000,
+                    name: "3000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key4000".to_owned()),
+                Arc::new(4000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 4000,
+                    name: "4000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key5000".to_owned()),
+                Arc::new(5000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 5000,
+                    name: "5000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key6000".to_owned()),
+                Arc::new(6000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 6000,
+                    name: "6000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key7000".to_owned()),
+                Arc::new(7000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 7000,
+                    name: "7000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key8000".to_owned()),
+                Arc::new(8000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 8000,
+                    name: "8000".to_string(),
+                }),
             )
             .await
             .unwrap();
             db.write(
                 RecordType::Full,
-                Arc::new("key9000".to_owned()),
+                Arc::new(9000),
                 0,
-                Some(value_1.clone()),
+                Some(User {
+                    id: 9000,
+                    name: "9000".to_string(),
+                }),
             )
             .await
             .unwrap();
 
             assert_eq!(
-                db.get(&Arc::new("key20".to_owned()), &0, |v: &String| v.clone())
-                    .await,
-                Some(value_1.clone())
+                db.get(&Arc::new(20), &0, |v| v.clone()).await,
+                Some(User {
+                    id: 20,
+                    name: "20".to_string(),
+                })
             );
 
             drop(db);
@@ -1167,9 +1344,11 @@ mod tests {
             );
 
             assert_eq!(
-                db.get(&Arc::new("key20".to_owned()), &0, |v: &String| v.clone())
-                    .await,
-                Some(value_1)
+                db.get(&Arc::new(20), &0, |v: &User| v.clone()).await,
+                Some(User {
+                    id: 20,
+                    name: "20".to_string(),
+                })
             );
         });
     }
@@ -1190,8 +1369,20 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set("key0".to_string(), "value0".to_string());
-            txn.set("key1".to_string(), "value1".to_string());
+            txn.set(
+                0,
+                User {
+                    id: 0,
+                    name: "0".to_string(),
+                },
+            );
+            txn.set(
+                1,
+                User {
+                    id: 1,
+                    name: "1".to_string(),
+                },
+            );
             txn.commit().await.unwrap();
 
             drop(db);
@@ -1207,14 +1398,18 @@ mod tests {
             );
 
             assert_eq!(
-                db.get(&Arc::new("key0".to_string()), &1, |v: &String| v.clone())
-                    .await,
-                Some("value0".to_string()),
+                db.get(&Arc::new(0), &1, |v: &User| v.clone()).await,
+                Some(User {
+                    id: 0,
+                    name: "0".to_string()
+                }),
             );
             assert_eq!(
-                db.get(&Arc::new("key1".to_string()), &1, |v: &String| v.clone())
-                    .await,
-                Some("value1".to_string()),
+                db.get(&Arc::new(1), &1, |v: &User| v.clone()).await,
+                Some(User {
+                    id: 1,
+                    name: "1".to_string()
+                }),
             );
         });
     }

@@ -1,15 +1,6 @@
-use std::{
-    cmp, collections::VecDeque, fmt::Debug, fs::File, marker::PhantomData, pin::pin, sync::Arc,
-};
+use std::{cmp, collections::VecDeque, fmt::Debug, fs::File, pin::pin, sync::Arc};
 
-use arrow::{
-    array::{GenericBinaryBuilder, GenericByteBuilder, RecordBatch},
-    datatypes::GenericBinaryType,
-};
-use executor::{
-    fs,
-    futures::{util::io::Cursor, StreamExt},
-};
+use executor::{fs, futures::StreamExt};
 use futures::channel::oneshot;
 use parquet::arrow::{ArrowWriter, AsyncArrowWriter};
 use snowflake::ProcessUniqueId;
@@ -17,49 +8,46 @@ use thiserror::Error;
 
 use crate::{
     index_batch::IndexBatch,
+    schema::{Builder, Schema},
     scope::Scope,
-    serdes::{Decode, Encode},
+    serdes::Encode,
     stream::{
         level_stream::LevelStream, merge_inner_stream::MergeInnerStream, table_stream::TableStream,
         EInnerStreamImpl, StreamError,
     },
     version::{edit::VersionEdit, set::VersionSet, Version, VersionError, MAX_LEVEL},
-    DbOption, Immutable, Offset, ELSM_SCHEMA,
+    DbOption, Immutable,
 };
 
-pub(crate) struct Compactor<K, V>
+pub(crate) struct Compactor<S>
 where
-    K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
-    V: Debug + Encode + Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pub(crate) option: Arc<DbOption>,
-    pub(crate) immutable: Immutable<K>,
-    pub(crate) version_set: VersionSet<K>,
-    _p: PhantomData<V>,
+    pub(crate) immutable: Immutable<S>,
+    pub(crate) version_set: VersionSet<S>,
 }
 
-impl<K, V> Compactor<K, V>
+impl<S> Compactor<S>
 where
-    K: Ord + Debug + Encode + Decode + Send + Sync + 'static,
-    V: Debug + Encode + Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pub(crate) fn new(
-        immutable: Immutable<K>,
+        immutable: Immutable<S>,
         option: Arc<DbOption>,
-        version_set: VersionSet<K>,
+        version_set: VersionSet<S>,
     ) -> Self {
-        Compactor::<K, V> {
+        Compactor::<S> {
             option,
             immutable,
             version_set,
-            _p: Default::default(),
         }
     }
 
     pub(crate) async fn check_then_compaction(
         &mut self,
         option_tx: Option<oneshot::Sender<()>>,
-    ) -> Result<(), CompactionError<K, V>> {
+    ) -> Result<(), CompactionError<S>> {
         let mut guard = self.immutable.write().await;
 
         if guard.len() > self.option.immutable_chunk_num {
@@ -97,8 +85,8 @@ where
 
     pub(crate) async fn minor_compaction(
         option: &DbOption,
-        batches: VecDeque<IndexBatch<K>>,
-    ) -> Result<Option<Scope<K>>, CompactionError<K, V>> {
+        batches: VecDeque<IndexBatch<S>>,
+    ) -> Result<Option<Scope<S::PrimaryKey>>, CompactionError<S>> {
         if !batches.is_empty() {
             let mut min = None;
             let mut max = None;
@@ -107,7 +95,7 @@ where
 
             let mut writer = AsyncArrowWriter::try_new(
                 fs::File::from(File::create(option.table_path(&gen)).map_err(CompactionError::Io)?),
-                ELSM_SCHEMA.clone(),
+                S::inner_schema(),
                 None,
             )
             .map_err(CompactionError::Parquet)?;
@@ -137,18 +125,13 @@ where
     }
 
     pub(crate) async fn major_compaction(
-        version: &Version<K>,
+        version: &Version<S>,
         option: &DbOption,
-        mut min: &Arc<K>,
-        mut max: &Arc<K>,
-        version_edits: &mut Vec<VersionEdit<K>>,
+        mut min: &Arc<S::PrimaryKey>,
+        mut max: &Arc<S::PrimaryKey>,
+        version_edits: &mut Vec<VersionEdit<S::PrimaryKey>>,
         delete_gens: &mut Vec<ProcessUniqueId>,
-    ) -> Result<(), CompactionError<K, V>> {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
+    ) -> Result<(), CompactionError<S>> {
         let mut level = 0;
 
         while level < MAX_LEVEL - 2 {
@@ -158,7 +141,7 @@ where
 
             let mut meet_scopes_l = Vec::new();
             {
-                let index = Version::<K>::scope_search(min, &version.level_slice[level]);
+                let index = Version::<S>::scope_search(min, &version.level_slice[level]);
 
                 for scope in version.level_slice[level][index..].iter() {
                     if scope.is_between(min) || scope.is_between(max) {
@@ -181,9 +164,9 @@ where
                     max = max_key;
 
                     let min_index =
-                        Version::<K>::scope_search(min_key, &version.level_slice[level + 1]);
+                        Version::<S>::scope_search(min_key, &version.level_slice[level + 1]);
                     let max_index =
-                        Version::<K>::scope_search(max_key, &version.level_slice[level + 1]);
+                        Version::<S>::scope_search(max_key, &version.level_slice[level + 1]);
 
                     let next_level_len = version.level_slice[level + 1].len();
                     for scope in version.level_slice[level + 1]
@@ -228,14 +211,12 @@ where
                     .await
                     .map_err(CompactionError::Stream)?,
             ));
-            let stream = MergeInnerStream::<K, V>::new(streams)
+            let stream = MergeInnerStream::<S>::new(streams)
                 .await
                 .map_err(CompactionError::Stream)?;
 
-            let mut buf = Cursor::new(vec![0; 128]);
             let mut stream = pin!(stream);
-            let mut key_builder = GenericBinaryBuilder::<Offset>::new();
-            let mut value_builder = GenericBinaryBuilder::<Offset>::new();
+            let mut builder = S::builder();
             let mut written_size = 0;
             let mut min = None;
             let mut max = None;
@@ -248,31 +229,14 @@ where
                 max = Some(key.clone());
 
                 written_size += key.size();
-                clear(&mut buf);
-                key.encode(&mut buf)
-                    .await
-                    .map_err(CompactionError::KeyEncode)?;
-                key_builder.append_value(buf.get_ref());
-
-                if let Some(value) = value {
-                    clear(&mut buf);
-                    value
-                        .encode(&mut buf)
-                        .await
-                        .map_err(CompactionError::ValueEncode)?;
-                    value_builder.append_value(buf.get_ref());
-                    written_size += value.size();
-                } else {
-                    value_builder.append_null();
-                }
+                builder.add(&key, value);
 
                 if written_size >= option.max_sst_file_size {
                     Self::build_table(
                         option,
                         version_edits,
                         level,
-                        &mut key_builder,
-                        &mut value_builder,
+                        &mut builder,
                         &mut min,
                         &mut max,
                     )?;
@@ -284,8 +248,7 @@ where
                     option,
                     version_edits,
                     level,
-                    &mut key_builder,
-                    &mut value_builder,
+                    &mut builder,
                     &mut min,
                     &mut max,
                 )?;
@@ -312,28 +275,20 @@ where
 
     fn build_table(
         option: &DbOption,
-        version_edits: &mut Vec<VersionEdit<K>>,
+        version_edits: &mut Vec<VersionEdit<S::PrimaryKey>>,
         level: usize,
-        key_builder: &mut GenericByteBuilder<GenericBinaryType<Offset>>,
-        value_builder: &mut GenericByteBuilder<GenericBinaryType<Offset>>,
-        min: &mut Option<Arc<K>>,
-        max: &mut Option<Arc<K>>,
-    ) -> Result<(), CompactionError<K, V>> {
+        builder: &mut S::Builder,
+        min: &mut Option<Arc<S::PrimaryKey>>,
+        max: &mut Option<Arc<S::PrimaryKey>>,
+    ) -> Result<(), CompactionError<S>> {
         assert!(min.is_some());
         assert!(max.is_some());
 
         let gen = ProcessUniqueId::new();
-        let batch = RecordBatch::try_new(
-            ELSM_SCHEMA.clone(),
-            vec![
-                Arc::new(key_builder.finish()),
-                Arc::new(value_builder.finish()),
-            ],
-        )
-        .map_err(CompactionError::Arrow)?;
+        let batch = builder.finish();
         let mut writer = ArrowWriter::try_new(
             File::create(option.table_path(&gen)).map_err(CompactionError::Io)?,
-            ELSM_SCHEMA.clone(),
+            S::inner_schema(),
             None,
         )
         .map_err(CompactionError::Parquet)?;
@@ -352,15 +307,10 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum CompactionError<K, V>
+pub enum CompactionError<S>
 where
-    K: Encode + Decode,
-    V: Encode + Decode,
+    S: Schema,
 {
-    #[error("compaction key encode error: {0}")]
-    KeyEncode(#[source] <K as Encode>::Error),
-    #[error("compaction value encode error: {0}")]
-    ValueEncode(#[source] <V as Encode>::Error),
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
     #[error("compaction arrow error: {0}")]
@@ -368,9 +318,9 @@ where
     #[error("compaction parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
     #[error("compaction version error: {0}")]
-    Version(#[source] VersionError<K>),
+    Version(#[source] VersionError<S>),
     #[error("compaction stream error: {0}")]
-    Stream(#[source] StreamError<K, V>),
+    Stream(#[source] StreamError<S::PrimaryKey, S>),
     #[error("the level being compacted does not have a table")]
     EmptyLevel,
 }
@@ -383,8 +333,7 @@ mod tests {
         sync::Arc,
     };
 
-    use arrow::array::{GenericBinaryBuilder, RecordBatch};
-    use executor::{futures::util::io::Cursor, ExecutorBuilder};
+    use executor::ExecutorBuilder;
     use futures::channel::mpsc::channel;
     use parquet::arrow::ArrowWriter;
     use snowflake::ProcessUniqueId;
@@ -394,98 +343,51 @@ mod tests {
         compactor::Compactor,
         index_batch::IndexBatch,
         mem_table::InternalKey,
+        schema,
+        schema::Builder,
         scope::Scope,
-        serdes::Encode,
+        user::User,
         version::{edit::VersionEdit, Version},
-        DbOption, Offset, ELSM_SCHEMA,
+        DbOption,
     };
 
-    async fn build_index_batch<K, V>(items: &[(Arc<K>, Option<V>)]) -> IndexBatch<K>
+    async fn build_index_batch<S>(items: Vec<(S, bool)>) -> IndexBatch<S>
     where
-        K: Encode + Ord,
-        V: Encode,
+        S: schema::Schema,
     {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
-        let mut buf = Cursor::new(vec![0; 128]);
         let mut index = BTreeMap::new();
-        let mut key_builder = GenericBinaryBuilder::<Offset>::new();
-        let mut value_builder = GenericBinaryBuilder::<Offset>::new();
+        let mut builder = S::builder();
 
-        for (offset, (key, value)) in items.into_iter().enumerate() {
-            clear(&mut buf);
-            key.encode(&mut buf).await.unwrap();
-            key_builder.append_value(buf.get_ref());
-
-            if let Some(value) = value {
-                clear(&mut buf);
-                value.encode(&mut buf).await.unwrap();
-                value_builder.append_value(buf.get_ref());
-            } else {
-                value_builder.append_null();
-            }
+        for (offset, (schema, is_deleted)) in items.into_iter().enumerate() {
             index.insert(
                 InternalKey {
-                    key: key.clone(),
+                    key: Arc::new(schema.primary_key()),
                     ts: 0,
                 },
                 offset as u32,
             );
+            builder.add(&schema.primary_key(), is_deleted.then(|| schema));
         }
-        let keys = key_builder.finish();
-        let values = value_builder.finish();
 
-        let batch =
-            RecordBatch::try_new(ELSM_SCHEMA.clone(), vec![Arc::new(keys), Arc::new(values)])
-                .unwrap();
+        let batch = builder.finish();
 
         IndexBatch { batch, index }
     }
 
-    async fn build_parquet_table<K: Encode, V: Encode>(
+    async fn build_parquet_table<S: schema::Schema>(
         option: &DbOption,
         gen: ProcessUniqueId,
-        items: &[(Arc<K>, Option<V>)],
+        items: Vec<(S, bool)>,
     ) {
-        fn clear(buf: &mut Cursor<Vec<u8>>) {
-            buf.get_mut().clear();
-            buf.set_position(0);
-        }
-
-        let mut buf = Cursor::new(vec![0; 128]);
-        let mut key_builder = GenericBinaryBuilder::<Offset>::new();
-        let mut value_builder = GenericBinaryBuilder::<Offset>::new();
-
-        for (key, value) in items.iter() {
-            clear(&mut buf);
-            key.encode(&mut buf).await.unwrap();
-            key_builder.append_value(buf.get_ref());
-
-            if let Some(value) = value {
-                clear(&mut buf);
-                value.encode(&mut buf).await.unwrap();
-                value_builder.append_value(buf.get_ref());
-            } else {
-                value_builder.append_null();
-            }
-        }
-        let keys = key_builder.finish();
-        let values = value_builder.finish();
-
-        let batch =
-            RecordBatch::try_new(ELSM_SCHEMA.clone(), vec![Arc::new(keys), Arc::new(values)])
-                .unwrap();
+        let batch = build_index_batch(items).await;
 
         let mut writer = ArrowWriter::try_new(
             File::create(option.table_path(&gen)).unwrap(),
-            ELSM_SCHEMA.clone(),
+            S::inner_schema(),
             None,
         )
         .unwrap();
-        writer.write(&batch).unwrap();
+        writer.write(&batch.batch).unwrap();
         writer.close().unwrap();
     }
 
@@ -495,28 +397,65 @@ mod tests {
 
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let option = DbOption::new(temp_dir.path().to_path_buf());
-            let batch_1 = build_index_batch::<String, String>(&vec![
-                (Arc::new("key_3".to_string()), Some("value_3".to_string())),
-                (Arc::new("key_5".to_string()), Some("value_5".to_string())),
-                (Arc::new("key_6".to_string()), Some("value_6".to_string())),
+
+            let batch_1 = build_index_batch::<User>(vec![
+                (
+                    User {
+                        id: 3,
+                        name: "3".to_string(),
+                    },
+                    false,
+                ),
+                (
+                    User {
+                        id: 5,
+                        name: "5".to_string(),
+                    },
+                    false,
+                ),
+                (
+                    User {
+                        id: 6,
+                        name: "6".to_string(),
+                    },
+                    false,
+                ),
             ])
             .await;
-            let batch_2 = build_index_batch::<String, String>(&vec![
-                (Arc::new("key_4".to_string()), Some("value_4".to_string())),
-                (Arc::new("key_2".to_string()), Some("value_2".to_string())),
-                (Arc::new("key_1".to_string()), Some("value_1".to_string())),
+            let batch_2 = build_index_batch::<User>(vec![
+                (
+                    User {
+                        id: 4,
+                        name: "4".to_string(),
+                    },
+                    false,
+                ),
+                (
+                    User {
+                        id: 2,
+                        name: "2".to_string(),
+                    },
+                    false,
+                ),
+                (
+                    User {
+                        id: 1,
+                        name: "1".to_string(),
+                    },
+                    false,
+                ),
             ])
             .await;
 
-            let scope = Compactor::<String, String>::minor_compaction(
+            let scope = Compactor::<User>::minor_compaction(
                 &option,
                 VecDeque::from(vec![batch_2, batch_1]),
             )
             .await
             .unwrap()
             .unwrap();
-            assert_eq!(scope.min, Arc::new("key_1".to_string()));
-            assert_eq!(scope.max, Arc::new("key_6".to_string()));
+            assert_eq!(scope.min, Arc::new(1));
+            assert_eq!(scope.max, Arc::new(6));
         })
     }
 
@@ -534,20 +473,56 @@ mod tests {
             build_parquet_table(
                 &option,
                 table_gen_1,
-                &vec![
-                    (Arc::new("key_1".to_string()), Some("value_1".to_string())),
-                    (Arc::new("key_2".to_string()), Some("value_2".to_string())),
-                    (Arc::new("key_3".to_string()), Some("value_3".to_string())),
+                vec![
+                    (
+                        User {
+                            id: 1,
+                            name: "1".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 2,
+                            name: "2".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 3,
+                            name: "3".to_string(),
+                        },
+                        false,
+                    ),
                 ],
             )
             .await;
             build_parquet_table(
                 &option,
                 table_gen_2,
-                &vec![
-                    (Arc::new("key_4".to_string()), Some("value_4".to_string())),
-                    (Arc::new("key_5".to_string()), Some("value_5".to_string())),
-                    (Arc::new("key_6".to_string()), Some("value_6".to_string())),
+                vec![
+                    (
+                        User {
+                            id: 4,
+                            name: "4".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 5,
+                            name: "5".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 6,
+                            name: "6".to_string(),
+                        },
+                        false,
+                    ),
                 ],
             )
             .await;
@@ -559,72 +534,126 @@ mod tests {
             build_parquet_table(
                 &option,
                 table_gen_3,
-                &vec![
-                    (Arc::new("key_1".to_string()), Some("value_1".to_string())),
-                    (Arc::new("key_2".to_string()), Some("value_2".to_string())),
-                    (Arc::new("key_3".to_string()), Some("value_3".to_string())),
+                vec![
+                    (
+                        User {
+                            id: 1,
+                            name: "1".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 2,
+                            name: "2".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 3,
+                            name: "3".to_string(),
+                        },
+                        false,
+                    ),
                 ],
             )
             .await;
             build_parquet_table(
                 &option,
                 table_gen_4,
-                &vec![
-                    (Arc::new("key_4".to_string()), Some("value_4".to_string())),
-                    (Arc::new("key_5".to_string()), Some("value_5".to_string())),
-                    (Arc::new("key_6".to_string()), Some("value_6".to_string())),
+                vec![
+                    (
+                        User {
+                            id: 4,
+                            name: "4".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 5,
+                            name: "5".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 6,
+                            name: "6".to_string(),
+                        },
+                        false,
+                    ),
                 ],
             )
             .await;
             build_parquet_table(
                 &option,
                 table_gen_5,
-                &vec![
-                    (Arc::new("key_7".to_string()), Some("value_7".to_string())),
-                    (Arc::new("key_8".to_string()), Some("value_8".to_string())),
-                    (Arc::new("key_9".to_string()), Some("value_9".to_string())),
+                vec![
+                    (
+                        User {
+                            id: 7,
+                            name: "7".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 8,
+                            name: "8".to_string(),
+                        },
+                        false,
+                    ),
+                    (
+                        User {
+                            id: 9,
+                            name: "9".to_string(),
+                        },
+                        false,
+                    ),
                 ],
             )
             .await;
 
             let (sender, _) = channel(1);
 
-            let mut version = Version {
+            let mut version = Version::<User> {
                 num: 0,
-                level_slice: Version::level_slice_new(),
+                level_slice: Version::<User>::level_slice_new(),
                 clean_sender: sender,
             };
             version.level_slice[0].push(Scope {
-                min: Arc::new("key_1".to_string()),
-                max: Arc::new("key_3".to_string()),
+                min: Arc::new(1),
+                max: Arc::new(3),
                 gen: table_gen_1,
             });
             version.level_slice[0].push(Scope {
-                min: Arc::new("key_4".to_string()),
-                max: Arc::new("key_6".to_string()),
+                min: Arc::new(4),
+                max: Arc::new(6),
                 gen: table_gen_2,
             });
             version.level_slice[1].push(Scope {
-                min: Arc::new("key_1".to_string()),
-                max: Arc::new("key_3".to_string()),
+                min: Arc::new(1),
+                max: Arc::new(3),
                 gen: table_gen_3,
             });
             version.level_slice[1].push(Scope {
-                min: Arc::new("key_4".to_string()),
-                max: Arc::new("key_6".to_string()),
+                min: Arc::new(4),
+                max: Arc::new(6),
                 gen: table_gen_4,
             });
             version.level_slice[1].push(Scope {
-                min: Arc::new("key_7".to_string()),
-                max: Arc::new("key_9".to_string()),
+                min: Arc::new(7),
+                max: Arc::new(9),
                 gen: table_gen_5,
             });
 
-            let min = Arc::new("key_2".to_string());
-            let max = Arc::new("key_5".to_string());
+            let min = Arc::new(2);
+            let max = Arc::new(5);
             let mut version_edits = Vec::new();
 
-            Compactor::<String, String>::major_compaction(
+            Compactor::<User>::major_compaction(
                 &version,
                 &option,
                 &min,
@@ -637,8 +666,8 @@ mod tests {
 
             if let VersionEdit::Add { level, scope } = &version_edits[0] {
                 assert_eq!(*level, 1);
-                assert_eq!(scope.min, Arc::new("key_1".to_string()));
-                assert_eq!(scope.max, Arc::new("key_6".to_string()));
+                assert_eq!(scope.min, Arc::new(1));
+                assert_eq!(scope.max, Arc::new(6));
             }
             assert_eq!(
                 version_edits[1..5].to_vec(),

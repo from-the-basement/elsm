@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::{
     index_batch::stream::IndexBatchStream,
     mem_table::stream::MemTableStream,
+    schema::Schema,
     serdes::{Decode, Encode},
     stream::{buf_stream::BufStream, level_stream::LevelStream, table_stream::TableStream},
     transaction::TransactionStream,
@@ -25,37 +26,34 @@ pub(crate) mod merge_stream;
 pub(crate) mod table_stream;
 
 #[pin_project(project = EStreamImplProj)]
-pub(crate) enum EStreamImpl<'a, K, V, G, F>
+pub(crate) enum EStreamImpl<'a, S, G, F>
 where
-    K: Ord + Encode + Decode,
-    V: Decode,
+    S: Schema,
     G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    F: Fn(&S) -> G + Sync + 'static,
 {
-    Buf(#[pin] BufStream<'a, K, G, StreamError<K, V>>),
-    IndexBatch(#[pin] IndexBatchStream<'a, K, V, G, F>),
-    MemTable(#[pin] MemTableStream<'a, K, V, G, F>),
-    TransactionInner(#[pin] TransactionStream<'a, K, V, G, F, StreamError<K, V>>),
+    Buf(#[pin] BufStream<'a, S::PrimaryKey, G, StreamError<S::PrimaryKey, S>>),
+    IndexBatch(#[pin] IndexBatchStream<'a, S, G, F>),
+    MemTable(#[pin] MemTableStream<'a, S, G, F>),
+    TransactionInner(#[pin] TransactionStream<'a, S, G, F, StreamError<S::PrimaryKey, S>>),
 }
 
 #[pin_project(project = EInnerStreamImplProj)]
-pub(crate) enum EInnerStreamImpl<'a, K, V>
+pub(crate) enum EInnerStreamImpl<'a, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    Table(#[pin] TableStream<'a, K, V>),
-    Level(#[pin] LevelStream<'a, K, V>),
+    Table(#[pin] TableStream<'a, S>),
+    Level(#[pin] LevelStream<'a, S>),
 }
 
-impl<'a, K, V, G, F> Stream for EStreamImpl<'a, K, V, G, F>
+impl<'a, S, G, F> Stream for EStreamImpl<'a, S, G, F>
 where
-    K: Ord + Debug + Encode + Decode,
-    V: Decode + Send + Sync,
+    S: Schema,
     G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    F: Fn(&S) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<G>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.project() {
@@ -67,12 +65,11 @@ where
     }
 }
 
-impl<'a, K, V> Stream for EInnerStreamImpl<'a, K, V>
+impl<'a, S> Stream for EInnerStreamImpl<'a, S>
 where
-    K: Ord + Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.project() {

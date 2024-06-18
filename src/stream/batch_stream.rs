@@ -9,27 +9,21 @@ use arrow::record_batch::RecordBatch;
 use executor::futures::{FutureExt, Stream};
 use pin_project::pin_project;
 
-use crate::{
-    index_batch::decode_value,
-    serdes::{Decode, Encode},
-    stream::StreamError,
-};
+use crate::{schema::Schema, stream::StreamError};
 
 #[pin_project]
-pub(crate) struct BatchStream<K, V>
+pub(crate) struct BatchStream<S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pos: usize,
     inner: RecordBatch,
-    _p: PhantomData<(K, V)>,
+    _p: PhantomData<S>,
 }
 
-impl<K, V> BatchStream<K, V>
+impl<S> BatchStream<S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pub(crate) fn new(batch: RecordBatch) -> Self {
         BatchStream {
@@ -39,26 +33,22 @@ where
         }
     }
 
-    async fn decode_item(&mut self) -> Result<(Arc<K>, Option<V>), StreamError<K, V>> {
-        let key = decode_value::<K>(&self.inner, 0, self.pos)
-            .await
-            .map_err(StreamError::KeyDecode)?
-            .unwrap();
-        let value = decode_value::<V>(&self.inner, 1, self.pos)
-            .await
-            .map_err(StreamError::ValueDecode)?;
+    async fn decode_item(
+        &mut self,
+    ) -> Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>> {
+        // Safety: already check offset
+        let (id, item) = S::from_batch(&self.inner, self.pos);
 
         self.pos += 1;
-        Ok((Arc::new(key), value))
+        Ok((Arc::new(id), item))
     }
 }
 
-impl<K, V> Stream for BatchStream<K, V>
+impl<S> Stream for BatchStream<S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.pos < self.inner.num_rows() {

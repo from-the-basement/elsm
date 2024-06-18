@@ -24,33 +24,32 @@ use pin_project::pin_project;
 use snowflake::ProcessUniqueId;
 
 use crate::{
-    serdes::{Decode, Encode},
+    schema::Schema,
+    serdes::Encode,
     stream::{batch_stream::BatchStream, StreamError},
     DbOption, Offset,
 };
 
 #[pin_project]
-pub(crate) struct TableStream<'stream, K, V>
+pub(crate) struct TableStream<'stream, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     inner: ParquetRecordBatchStream<fs::File>,
-    stream: Option<BatchStream<K, V>>,
+    stream: Option<BatchStream<S>>,
     _p: PhantomData<&'stream ()>,
 }
 
-impl<K, V> TableStream<'_, K, V>
+impl<S> TableStream<'_, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pub(crate) async fn new(
         option: &DbOption,
         gen: &ProcessUniqueId,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
-    ) -> Result<Self, StreamError<K, V>> {
+        lower: Option<&Arc<S::PrimaryKey>>,
+        upper: Option<&Arc<S::PrimaryKey>>,
+    ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let lower = if let Some(l) = lower {
             Some(Self::to_scalar(l).await?)
         } else {
@@ -102,8 +101,8 @@ where
     }
 
     async fn to_scalar(
-        key: &K,
-    ) -> Result<GenericByteArray<GenericBinaryType<Offset>>, StreamError<K, V>> {
+        key: &S::PrimaryKey,
+    ) -> Result<GenericByteArray<GenericBinaryType<Offset>>, StreamError<S::PrimaryKey, S>> {
         let mut key_bytes = Vec::new();
         key.encode(&mut key_bytes)
             .await
@@ -115,12 +114,11 @@ where
     }
 }
 
-impl<K, V> Stream for TableStream<'_, K, V>
+impl<S> Stream for TableStream<'_, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.stream.is_none() {

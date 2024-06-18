@@ -5,10 +5,7 @@ use std::{cmp, cmp::Ordering, collections::BTreeMap, ops::Bound, pin::pin, sync:
 use futures::StreamExt;
 
 use crate::{
-    oracle::TimeStamp,
-    record::RecordType,
-    serdes::{Decode, Encode},
-    wal::WalRecover,
+    oracle::TimeStamp, record::RecordType, schema::Schema, serdes::Encode, wal::WalRecover,
 };
 
 #[derive(PartialEq, Eq, Debug)]
@@ -38,18 +35,18 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct MemTable<K, V>
+pub(crate) struct MemTable<S>
 where
-    K: Ord,
+    S: Schema,
 {
-    pub(crate) data: BTreeMap<InternalKey<K>, Option<V>>,
+    pub(crate) data: BTreeMap<InternalKey<S::PrimaryKey>, Option<S>>,
     max_ts: TimeStamp,
     written_size: usize,
 }
 
-impl<K, V> Default for MemTable<K, V>
+impl<S> Default for MemTable<S>
 where
-    K: Ord,
+    S: Schema,
 {
     fn default() -> Self {
         Self {
@@ -60,14 +57,13 @@ where
     }
 }
 
-impl<K, V> MemTable<K, V>
+impl<S> MemTable<S>
 where
-    K: Encode + Ord,
-    V: Encode + Decode,
+    S: Schema,
 {
     pub(crate) async fn from_wal<W>(wal: &mut W) -> Result<Self, W::Error>
     where
-        W: WalRecover<Arc<K>, V>,
+        W: WalRecover<Arc<S::PrimaryKey>, S>,
     {
         let mut mem_table = Self::default();
 
@@ -78,7 +74,7 @@ where
 
     pub(crate) async fn recover<W>(&mut self, wal: &mut W) -> Result<(), W::Error>
     where
-        W: WalRecover<Arc<K>, V>,
+        W: WalRecover<Arc<S::PrimaryKey>, S>,
     {
         let mut stream = pin!(wal.recover());
         let mut batch = None;
@@ -116,10 +112,9 @@ where
     }
 }
 
-impl<K, V> MemTable<K, V>
+impl<S> MemTable<S>
 where
-    K: Encode + Ord,
-    V: Encode + Decode,
+    S: Schema,
 {
     pub(crate) fn is_excess(&self, max_size: usize) -> bool {
         self.written_size > max_size
@@ -133,14 +128,14 @@ where
         self.data.len()
     }
 
-    pub(crate) fn insert(&mut self, key: Arc<K>, ts: TimeStamp, value: Option<V>) {
+    pub(crate) fn insert(&mut self, key: Arc<S::PrimaryKey>, ts: TimeStamp, value: Option<S>) {
         self.max_ts = cmp::max(self.max_ts, ts);
         self.written_size = key.size() + ts.size() + value.as_ref().map(Encode::size).unwrap_or(0);
 
         let _ = self.data.insert(InternalKey { key, ts }, value);
     }
 
-    pub(crate) fn get(&self, key: &Arc<K>, ts: &TimeStamp) -> Option<Option<&V>> {
+    pub(crate) fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<Option<&S>> {
         let internal_key = InternalKey {
             key: key.clone(),
             ts: *ts,
@@ -164,44 +159,99 @@ mod tests {
     use super::MemTable;
     use crate::{
         record::{Record, RecordType},
+        user::User,
         wal::{WalFile, WalWrite},
     };
 
     #[test]
     fn crud() {
         block_on(async {
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
-            let key_3 = Arc::new("key_3".to_owned());
-            let key_4 = Arc::new("key_4".to_owned());
-            let value_1 = "value_1".to_owned();
-            let value_3 = "value_3".to_owned();
-
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 1, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 2, Some(value_1.clone()));
+            mem_table.insert(
+                Arc::new(1),
+                0,
+                Some(User {
+                    id: 1,
+                    name: "1".to_string(),
+                }),
+            );
+            mem_table.insert(
+                Arc::new(1),
+                1,
+                Some(User {
+                    id: 1,
+                    name: "1".to_string(),
+                }),
+            );
+            mem_table.insert(
+                Arc::new(1),
+                2,
+                Some(User {
+                    id: 1,
+                    name: "1".to_string(),
+                }),
+            );
 
-            mem_table.insert(key_3.clone(), 0, Some(value_3.clone()));
+            mem_table.insert(
+                Arc::new(3),
+                0,
+                Some(User {
+                    id: 3,
+                    name: "3".to_string(),
+                }),
+            );
 
-            assert_eq!(mem_table.get(&key_1, &0), Some(Some(&value_1)));
-            assert_eq!(mem_table.get(&key_1, &1), Some(Some(&value_1)));
-            assert_eq!(mem_table.get(&key_1, &2), Some(Some(&value_1)));
+            assert_eq!(
+                mem_table.get(&Arc::new(1), &0),
+                Some(Some(&User {
+                    id: 1,
+                    name: "1".to_string()
+                }))
+            );
+            assert_eq!(
+                mem_table.get(&Arc::new(1), &1),
+                Some(Some(&User {
+                    id: 1,
+                    name: "1".to_string()
+                }))
+            );
+            assert_eq!(
+                mem_table.get(&Arc::new(1), &2),
+                Some(Some(&User {
+                    id: 1,
+                    name: "1".to_string()
+                }))
+            );
 
-            assert_eq!(mem_table.get(&key_3, &0), Some(Some(&value_3)));
+            assert_eq!(
+                mem_table.get(&Arc::new(3), &0),
+                Some(Some(&User {
+                    id: 3,
+                    name: "3".to_string()
+                }))
+            );
 
-            assert_eq!(mem_table.get(&key_2, &0), None);
-            assert_eq!(mem_table.get(&key_4, &0), None);
-            assert_eq!(mem_table.get(&key_1, &3), Some(Some(&value_1)));
+            assert_eq!(mem_table.get(&Arc::new(2), &0), None);
+            assert_eq!(mem_table.get(&Arc::new(4), &0), None);
+            assert_eq!(
+                mem_table.get(&Arc::new(1), &3),
+                Some(Some(&User {
+                    id: 1,
+                    name: "1".to_string()
+                }))
+            );
         });
     }
 
     #[test]
     fn recover_from_wal() {
         let mut file = Vec::new();
-        let key = Arc::new("key".to_owned());
-        let value = "value".to_owned();
+        let key = Arc::new(0);
+        let value = User {
+            id: 0,
+            name: "v".to_string(),
+        };
         block_on(async {
             {
                 let mut wal = WalFile::new(Cursor::new(&mut file));
@@ -212,8 +262,7 @@ mod tests {
             }
             {
                 let mut wal = WalFile::new(Cursor::new(&mut file));
-                let mem_table: MemTable<String, String> =
-                    MemTable::from_wal(&mut wal).await.unwrap();
+                let mem_table: MemTable<User> = MemTable::from_wal(&mut wal).await.unwrap();
                 assert_eq!(mem_table.get(&key, &0), Some(Some(&value)));
             }
         });

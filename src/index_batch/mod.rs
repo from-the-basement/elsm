@@ -7,32 +7,24 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::{AsArray, RecordBatch};
-use executor::futures::util::io::Cursor;
+use arrow::array::RecordBatch;
 
-use crate::{mem_table::InternalKey, oracle::TimeStamp, serdes::Decode, Offset};
+use crate::{mem_table::InternalKey, oracle::TimeStamp, schema::Schema};
 
 #[derive(Debug)]
-pub(crate) struct IndexBatch<K>
+pub(crate) struct IndexBatch<S>
 where
-    K: Ord,
+    S: Schema,
 {
     pub(crate) batch: RecordBatch,
-    pub(crate) index: BTreeMap<InternalKey<K>, u32>,
+    pub(crate) index: BTreeMap<InternalKey<S::PrimaryKey>, u32>,
 }
 
-impl<K> IndexBatch<K>
+impl<S> IndexBatch<S>
 where
-    K: Ord,
+    S: Schema,
 {
-    pub(crate) async fn find<V>(
-        &self,
-        key: &Arc<K>,
-        ts: &TimeStamp,
-    ) -> Result<Option<Option<V>>, V::Error>
-    where
-        V: Decode + Sync + Send,
-    {
+    pub(crate) async fn find(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<Option<S>> {
         let internal_key = InternalKey {
             key: key.clone(),
             ts: *ts,
@@ -43,15 +35,15 @@ where
             .next()
         {
             if item_key == key {
-                return Ok(Some(
-                    decode_value::<V>(&self.batch, 1, *offset as usize).await?,
-                ));
+                let (_, item) = S::from_batch(&self.batch, *offset as usize);
+
+                return Some(item);
             }
         }
-        Ok(None)
+        None
     }
 
-    pub(crate) fn scope(&self) -> Option<(&Arc<K>, &Arc<K>)> {
+    pub(crate) fn scope(&self) -> Option<(&Arc<S::PrimaryKey>, &Arc<S::PrimaryKey>)> {
         if let (Some((min, _)), Some((max, _))) =
             (self.index.first_key_value(), self.index.last_key_value())
         {
@@ -61,24 +53,6 @@ where
     }
 }
 
-pub(crate) async fn decode_value<V>(
-    batch: &RecordBatch,
-    column: usize,
-    offset: usize,
-) -> Result<Option<V>, V::Error>
-where
-    V: Decode + Sync + Send,
-{
-    let bytes = batch.column(column).as_binary::<Offset>().value(offset);
-
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let mut cursor = Cursor::new(bytes);
-
-    Ok(Some(V::decode(&mut cursor).await?))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -86,40 +60,55 @@ mod tests {
     use executor::ExecutorBuilder;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, wal::provider::in_mem::InMemProvider, Db,
+        mem_table::MemTable, oracle::LocalOracle, user::User, wal::provider::in_mem::InMemProvider,
+        Db,
     };
 
     #[test]
     fn find() {
         ExecutorBuilder::new().build().unwrap().block_on(async {
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
-            let key_3 = Arc::new("key_3".to_owned());
-            let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
-
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 1, None);
-            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
-            mem_table.insert(key_3.clone(), 0, None);
+            mem_table.insert(
+                Arc::new(1),
+                0,
+                Some(User {
+                    id: 1,
+                    name: "1".to_string(),
+                }),
+            );
+            mem_table.insert(Arc::new(1), 1, None);
+            mem_table.insert(
+                Arc::new(2),
+                0,
+                Some(User {
+                    id: 2,
+                    name: "2".to_string(),
+                }),
+            );
+            mem_table.insert(Arc::new(3), 0, None);
 
-            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
+            let batch = Db::<User, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
                 .await
                 .unwrap();
 
             assert_eq!(
-                batch.find::<String>(&key_1, &0).await.unwrap(),
-                Some(Some(value_1))
+                batch.find(&Arc::new(1), &0).await,
+                Some(Some(User {
+                    id: 1,
+                    name: "1".to_string()
+                }))
             );
-            assert_eq!(batch.find::<String>(&key_1, &1).await.unwrap(), Some(None));
+            assert_eq!(batch.find(&Arc::new(1), &1).await, Some(None));
 
             assert_eq!(
-                batch.find::<String>(&key_2, &0).await.unwrap(),
-                Some(Some(value_2))
+                batch.find(&Arc::new(2), &0).await,
+                Some(Some(User {
+                    id: 2,
+                    name: "2".to_string()
+                }))
             );
-            assert_eq!(batch.find::<String>(&key_3, &0).await.unwrap(), Some(None));
+            assert_eq!(batch.find(&Arc::new(3), &0).await, Some(None));
         });
     }
 }
