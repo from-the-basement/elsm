@@ -131,23 +131,9 @@ mod tests {
             let mut mem_table = MemTable::<User>::default();
 
             mem_table.insert(Arc::new(0), 0, None);
-            mem_table.insert(
-                Arc::new(1),
-                0,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
             mem_table.insert(Arc::new(1), 1, None);
-            mem_table.insert(
-                Arc::new(2),
-                0,
-                Some(User {
-                    id: 2,
-                    name: "2".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(2), 0, Some(User::new(2, "2".to_string())));
             mem_table.insert(Arc::new(3), 0, None);
 
             let batch = Db::<User, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
@@ -164,13 +150,7 @@ mod tests {
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(2, "2".to_string())))
             );
             assert!(iterator.next().await.is_none())
         })

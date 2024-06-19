@@ -624,20 +624,8 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(
-                0,
-                User {
-                    id: 0,
-                    name: "0".to_string(),
-                },
-            );
-            txn.set(
-                1,
-                User {
-                    id: 1,
-                    name: "1".to_string(),
-                },
-            );
+            txn.set(0, User::new(0, "0".to_string()));
+            txn.set(1, User::new(1, "1".to_string()));
             txn.commit().await.unwrap();
 
             let mut t0 = db.new_txn();
@@ -653,17 +641,11 @@ mod tests {
 
             assert_eq!(
                 txn.get(&Arc::from(0), |v| v.clone()).await,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string()
-                })
+                Some(User::new(1, "1".to_string()))
             );
             assert_eq!(
                 txn.get(&Arc::from(1), |v| v.clone()).await,
-                Some(User {
-                    id: 0,
-                    name: "0".to_string()
-                })
+                Some(User::new(0, "0".to_string()))
             );
         });
     }
@@ -684,34 +666,10 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(
-                0,
-                User {
-                    id: 0,
-                    name: "0".to_string(),
-                },
-            );
-            txn.set(
-                1,
-                User {
-                    id: 1,
-                    name: "1".to_string(),
-                },
-            );
-            txn.set(
-                2,
-                User {
-                    id: 2,
-                    name: "2".to_string(),
-                },
-            );
-            txn.set(
-                3,
-                User {
-                    id: 3,
-                    name: "3".to_string(),
-                },
-            );
+            txn.set(0, User::new(0, "0".to_string()));
+            txn.set(1, User::new(1, "1".to_string()));
+            txn.set(2, User::new(2, "2".to_string()));
+            txn.set(3, User::new(3, "3".to_string()));
             txn.commit().await.unwrap();
 
             let mut iter = db
@@ -721,56 +679,20 @@ mod tests {
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(1),
-                    Some(User {
-                        id: 1,
-                        name: "1".to_string()
-                    })
-                )
+                (Arc::new(1), Some(User::new(1, "1".to_string())))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(2, "2".to_string())))
             );
 
             let mut txn_1 = db.new_txn();
-            txn_1.set(
-                5,
-                User {
-                    id: 5,
-                    name: "5".to_string(),
-                },
-            );
-            txn_1.set(
-                4,
-                User {
-                    id: 4,
-                    name: "4".to_string(),
-                },
-            );
+            txn_1.set(5, User::new(5, "5".to_string()));
+            txn_1.set(4, User::new(4, "4".to_string()));
 
             let mut txn_2 = db.new_txn();
-            txn_2.set(
-                5,
-                User {
-                    id: 4,
-                    name: "4".to_string(),
-                },
-            );
-            txn_2.set(
-                4,
-                User {
-                    id: 5,
-                    name: "5".to_string(),
-                },
-            );
+            txn_2.set(5, User::new(4, "4".to_string()));
+            txn_2.set(4, User::new(5, "5".to_string()));
             txn_2.commit().await.unwrap();
 
             let mut iter = txn_1
@@ -780,43 +702,19 @@ mod tests {
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(1),
-                    Some(User {
-                        id: 1,
-                        name: "1".to_string()
-                    })
-                )
+                (Arc::new(1), Some(User::new(1, "1".to_string())))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(2, "2".to_string())))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(3),
-                    Some(User {
-                        id: 3,
-                        name: "3".to_string()
-                    })
-                )
+                (Arc::new(3), Some(User::new(3, "3".to_string())))
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(4),
-                    Some(User {
-                        id: 4,
-                        name: "4".to_string()
-                    })
-                )
+                (Arc::new(4), Some(User::new(4, "4".to_string())))
             );
         });
     }
@@ -837,20 +735,8 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(
-                0,
-                User {
-                    id: 0,
-                    name: "0".to_string(),
-                },
-            );
-            txn.set(
-                1,
-                User {
-                    id: 1,
-                    name: "1".to_string(),
-                },
-            );
+            txn.set(0, User::new(0, "0".to_string()));
+            txn.set(1, User::new(1, "1".to_string()));
             txn.commit().await.unwrap();
 
             let mut t0 = db.new_txn();
@@ -859,20 +745,8 @@ mod tests {
 
             t0.set(0, t0.get(&Arc::new(1), |v| v.clone()).await.unwrap());
             t1.set(0, t1.get(&Arc::new(0), |v| v.clone()).await.unwrap());
-            t1.set(
-                2,
-                User {
-                    id: 2,
-                    name: "2".to_string(),
-                },
-            );
-            t2.set(
-                2,
-                User {
-                    id: 3,
-                    name: "3".to_string(),
-                },
-            );
+            t1.set(2, User::new(2, "2".to_string()));
+            t2.set(2, User::new(3, "3".to_string()));
 
             t0.commit().await.unwrap();
 
@@ -882,10 +756,7 @@ mod tests {
             if let Err(CommitError::WriteConflict(keys)) = commit {
                 assert_eq!(
                     db.new_txn().get(&keys[0], |v| v.clone()).await,
-                    Some(User {
-                        id: 1,
-                        name: "1".to_string()
-                    })
+                    Some(User::new(1, "1".to_string()))
                 );
                 return;
             }
@@ -921,10 +792,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(1),
                 0,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string(),
-                }),
+                Some(User::new(1, "1".to_string())),
             )
             .await
             .unwrap();
@@ -932,10 +800,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(2),
                 0,
-                Some(User {
-                    id: 2,
-                    name: "2".to_string(),
-                }),
+                Some(User::new(2, "2".to_string())),
             )
             .await
             .unwrap();
@@ -943,10 +808,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(3),
                 0,
-                Some(User {
-                    id: 3,
-                    name: "3".to_string(),
-                }),
+                Some(User::new(3, "3".to_string())),
             )
             .await
             .unwrap();
@@ -954,10 +816,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(4),
                 0,
-                Some(User {
-                    id: 4,
-                    name: "4".to_string(),
-                }),
+                Some(User::new(4, "4".to_string())),
             )
             .await
             .unwrap();
@@ -965,10 +824,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(5),
                 0,
-                Some(User {
-                    id: 5,
-                    name: "5".to_string(),
-                }),
+                Some(User::new(5, "5".to_string())),
             )
             .await
             .unwrap();
@@ -976,10 +832,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(6),
                 0,
-                Some(User {
-                    id: 6,
-                    name: "6".to_string(),
-                }),
+                Some(User::new(6, "6".to_string())),
             )
             .await
             .unwrap();
@@ -987,10 +840,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(7),
                 0,
-                Some(User {
-                    id: 7,
-                    name: "7".to_string(),
-                }),
+                Some(User::new(7, "7".to_string())),
             )
             .await
             .unwrap();
@@ -998,10 +848,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(8),
                 0,
-                Some(User {
-                    id: 8,
-                    name: "8".to_string(),
-                }),
+                Some(User::new(8, "8".to_string())),
             )
             .await
             .unwrap();
@@ -1009,10 +856,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(9),
                 0,
-                Some(User {
-                    id: 9,
-                    name: "9".to_string(),
-                }),
+                Some(User::new(9, "9".to_string())),
             )
             .await
             .unwrap();
@@ -1020,10 +864,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(10),
                 0,
-                Some(User {
-                    id: 10,
-                    name: "10".to_string(),
-                }),
+                Some(User::new(10, "10".to_string())),
             )
             .await
             .unwrap();
@@ -1031,10 +872,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(20),
                 0,
-                Some(User {
-                    id: 20,
-                    name: "20".to_string(),
-                }),
+                Some(User::new(20, "20".to_string())),
             )
             .await
             .unwrap();
@@ -1042,10 +880,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(30),
                 0,
-                Some(User {
-                    id: 30,
-                    name: "30".to_string(),
-                }),
+                Some(User::new(30, "30".to_string())),
             )
             .await
             .unwrap();
@@ -1053,10 +888,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(40),
                 0,
-                Some(User {
-                    id: 40,
-                    name: "40".to_string(),
-                }),
+                Some(User::new(40, "40".to_string())),
             )
             .await
             .unwrap();
@@ -1064,10 +896,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(50),
                 0,
-                Some(User {
-                    id: 50,
-                    name: "50".to_string(),
-                }),
+                Some(User::new(50, "50".to_string())),
             )
             .await
             .unwrap();
@@ -1075,10 +904,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(60),
                 0,
-                Some(User {
-                    id: 60,
-                    name: "60".to_string(),
-                }),
+                Some(User::new(60, "60".to_string())),
             )
             .await
             .unwrap();
@@ -1086,10 +912,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(70),
                 0,
-                Some(User {
-                    id: 70,
-                    name: "70".to_string(),
-                }),
+                Some(User::new(70, "70".to_string())),
             )
             .await
             .unwrap();
@@ -1097,10 +920,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(80),
                 0,
-                Some(User {
-                    id: 80,
-                    name: "80".to_string(),
-                }),
+                Some(User::new(80, "80".to_string())),
             )
             .await
             .unwrap();
@@ -1108,10 +928,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(90),
                 0,
-                Some(User {
-                    id: 90,
-                    name: "90".to_string(),
-                }),
+                Some(User::new(90, "90".to_string())),
             )
             .await
             .unwrap();
@@ -1119,10 +936,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(100),
                 0,
-                Some(User {
-                    id: 100,
-                    name: "100".to_string(),
-                }),
+                Some(User::new(100, "100".to_string())),
             )
             .await
             .unwrap();
@@ -1130,10 +944,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(200),
                 0,
-                Some(User {
-                    id: 200,
-                    name: "200".to_string(),
-                }),
+                Some(User::new(200, "200".to_string())),
             )
             .await
             .unwrap();
@@ -1141,10 +952,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(300),
                 0,
-                Some(User {
-                    id: 300,
-                    name: "300".to_string(),
-                }),
+                Some(User::new(300, "300".to_string())),
             )
             .await
             .unwrap();
@@ -1152,10 +960,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(400),
                 0,
-                Some(User {
-                    id: 400,
-                    name: "400".to_string(),
-                }),
+                Some(User::new(400, "400".to_string())),
             )
             .await
             .unwrap();
@@ -1163,10 +968,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(500),
                 0,
-                Some(User {
-                    id: 500,
-                    name: "500".to_string(),
-                }),
+                Some(User::new(500, "500".to_string())),
             )
             .await
             .unwrap();
@@ -1174,10 +976,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(600),
                 0,
-                Some(User {
-                    id: 600,
-                    name: "600".to_string(),
-                }),
+                Some(User::new(600, "600".to_string())),
             )
             .await
             .unwrap();
@@ -1185,10 +984,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(700),
                 0,
-                Some(User {
-                    id: 700,
-                    name: "700".to_string(),
-                }),
+                Some(User::new(700, "700".to_string())),
             )
             .await
             .unwrap();
@@ -1196,10 +992,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(800),
                 0,
-                Some(User {
-                    id: 800,
-                    name: "800".to_string(),
-                }),
+                Some(User::new(800, "800".to_string())),
             )
             .await
             .unwrap();
@@ -1207,10 +1000,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(900),
                 0,
-                Some(User {
-                    id: 900,
-                    name: "900".to_string(),
-                }),
+                Some(User::new(900, "900".to_string())),
             )
             .await
             .unwrap();
@@ -1218,10 +1008,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(1000),
                 0,
-                Some(User {
-                    id: 1000,
-                    name: "1000".to_string(),
-                }),
+                Some(User::new(1000, "1000".to_string())),
             )
             .await
             .unwrap();
@@ -1229,10 +1016,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(2000),
                 0,
-                Some(User {
-                    id: 2000,
-                    name: "2000".to_string(),
-                }),
+                Some(User::new(2000, "2000".to_string())),
             )
             .await
             .unwrap();
@@ -1240,10 +1024,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(3000),
                 0,
-                Some(User {
-                    id: 3000,
-                    name: "3000".to_string(),
-                }),
+                Some(User::new(3000, "3000".to_string())),
             )
             .await
             .unwrap();
@@ -1251,10 +1032,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(4000),
                 0,
-                Some(User {
-                    id: 4000,
-                    name: "4000".to_string(),
-                }),
+                Some(User::new(4000, "4000".to_string())),
             )
             .await
             .unwrap();
@@ -1262,10 +1040,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(5000),
                 0,
-                Some(User {
-                    id: 5000,
-                    name: "5000".to_string(),
-                }),
+                Some(User::new(5000, "5000".to_string())),
             )
             .await
             .unwrap();
@@ -1273,10 +1048,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(6000),
                 0,
-                Some(User {
-                    id: 6000,
-                    name: "6000".to_string(),
-                }),
+                Some(User::new(6000, "6000".to_string())),
             )
             .await
             .unwrap();
@@ -1284,10 +1056,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(7000),
                 0,
-                Some(User {
-                    id: 7000,
-                    name: "7000".to_string(),
-                }),
+                Some(User::new(7000, "7000".to_string())),
             )
             .await
             .unwrap();
@@ -1295,10 +1064,7 @@ mod tests {
                 RecordType::Full,
                 Arc::new(8000),
                 0,
-                Some(User {
-                    id: 8000,
-                    name: "8000".to_string(),
-                }),
+                Some(User::new(8000, "8000".to_string())),
             )
             .await
             .unwrap();
@@ -1306,20 +1072,14 @@ mod tests {
                 RecordType::Full,
                 Arc::new(9000),
                 0,
-                Some(User {
-                    id: 9000,
-                    name: "9000".to_string(),
-                }),
+                Some(User::new(9000, "9000".to_string())),
             )
             .await
             .unwrap();
 
             assert_eq!(
                 db.get(&Arc::new(20), &0, |v| v.clone()).await,
-                Some(User {
-                    id: 20,
-                    name: "20".to_string(),
-                })
+                Some(User::new(20, "20".to_string()))
             );
 
             drop(db);
@@ -1345,10 +1105,7 @@ mod tests {
 
             assert_eq!(
                 db.get(&Arc::new(20), &0, |v: &User| v.clone()).await,
-                Some(User {
-                    id: 20,
-                    name: "20".to_string(),
-                })
+                Some(User::new(20, "20".to_string()))
             );
         });
     }
@@ -1369,20 +1126,8 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(
-                0,
-                User {
-                    id: 0,
-                    name: "0".to_string(),
-                },
-            );
-            txn.set(
-                1,
-                User {
-                    id: 1,
-                    name: "1".to_string(),
-                },
-            );
+            txn.set(0, User::new(0, "0".to_string()));
+            txn.set(1, User::new(1, "1".to_string()));
             txn.commit().await.unwrap();
 
             drop(db);
@@ -1399,17 +1144,11 @@ mod tests {
 
             assert_eq!(
                 db.get(&Arc::new(0), &1, |v: &User| v.clone()).await,
-                Some(User {
-                    id: 0,
-                    name: "0".to_string()
-                }),
+                Some(User::new(0, "0".to_string())),
             );
             assert_eq!(
                 db.get(&Arc::new(1), &1, |v: &User| v.clone()).await,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string()
-                }),
+                Some(User::new(1, "1".to_string())),
             );
         });
     }

@@ -69,23 +69,9 @@ mod tests {
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(
-                Arc::new(1),
-                0,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
             mem_table.insert(Arc::new(1), 1, None);
-            mem_table.insert(
-                Arc::new(2),
-                0,
-                Some(User {
-                    id: 2,
-                    name: "2".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(2), 0, Some(User::new(2, "2".to_string())));
             mem_table.insert(Arc::new(3), 0, None);
 
             let batch = Db::<User, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
@@ -94,19 +80,13 @@ mod tests {
 
             assert_eq!(
                 batch.find(&Arc::new(1), &0).await,
-                Some(Some(User {
-                    id: 1,
-                    name: "1".to_string()
-                }))
+                Some(Some(User::new(1, "1".to_string())))
             );
             assert_eq!(batch.find(&Arc::new(1), &1).await, Some(None));
 
             assert_eq!(
                 batch.find(&Arc::new(2), &0).await,
-                Some(Some(User {
-                    id: 2,
-                    name: "2".to_string()
-                }))
+                Some(Some(User::new(2, "2".to_string())))
             );
             assert_eq!(batch.find(&Arc::new(3), &0).await, Some(None));
         });

@@ -32,10 +32,31 @@ lazy_static! {
         Fields::from(vec![Field::new("name", DataType::Utf8, false)]);
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct User {
+    pub(crate) inner: Arc<UserInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct UserInner {
     pub(crate) id: u64,
     pub(crate) name: String,
+}
+
+impl Clone for User {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl User {
+    pub fn new(id: u64, name: String) -> User {
+        User {
+            inner: Arc::new(UserInner { id, name }),
+        }
+    }
 }
 
 impl Schema for User {
@@ -52,7 +73,7 @@ impl Schema for User {
     }
 
     fn primary_key(&self) -> Self::PrimaryKey {
-        self.id
+        self.inner.id
     }
 
     fn builder() -> Self::Builder {
@@ -90,8 +111,10 @@ impl Schema for User {
         (
             id,
             Some(User {
-                id,
-                name: name.to_string(),
+                inner: Arc::new(UserInner {
+                    id,
+                    name: name.to_string(),
+                }),
             }),
         )
     }
@@ -108,14 +131,14 @@ impl Encode for User {
         &self,
         writer: &mut W,
     ) -> Result<(), Self::Error> {
-        self.id.encode(writer).await?;
-        self.name.encode(writer).await?;
+        self.inner.id.encode(writer).await?;
+        self.inner.name.encode(writer).await?;
 
         Ok(())
     }
 
     fn size(&self) -> usize {
-        self.id.size() + self.name.size()
+        self.inner.id.size() + self.inner.name.size()
     }
 }
 
@@ -126,7 +149,9 @@ impl Decode for User {
         let id = u64::decode(reader).await?;
         let name = String::decode(reader).await?;
 
-        Ok(User { id, name })
+        Ok(User {
+            inner: Arc::new(UserInner { id, name }),
+        })
     }
 }
 
@@ -143,7 +168,7 @@ impl Builder<User> for UserBuilder {
             self.inner
                 .field_builder::<StringBuilder>(0)
                 .unwrap()
-                .append_value(&schema.name);
+                .append_value(&schema.inner.name);
             self.inner.append(true);
         } else {
             self.inner
@@ -188,18 +213,9 @@ mod tests {
                 .await
                 .unwrap(),
             );
-            let user_0 = User {
-                id: 0,
-                name: "lizeren".to_string(),
-            };
-            let user_1 = User {
-                id: 1,
-                name: "2333".to_string(),
-            };
-            let user_2 = User {
-                id: 2,
-                name: "ghost".to_string(),
-            };
+            let user_0 = User::new(0, "lizeren".to_string());
+            let user_1 = User::new(1, "2333".to_string());
+            let user_2 = User::new(2, "ghost".to_string());
 
             let mut t0 = db.new_txn();
 

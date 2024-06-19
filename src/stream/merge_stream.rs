@@ -117,34 +117,16 @@ mod tests {
     fn iter() {
         block_on(async {
             let iter_1 = BufStream::new(vec![
-                (
-                    Arc::new(1),
-                    Some(User {
-                        id: 1,
-                        name: "1".to_string(),
-                    }),
-                ),
+                (Arc::new(1), Some(User::new(1, "1".to_string()))),
                 (Arc::new(3), None),
             ]);
             let iter_2 = BufStream::new(vec![
                 (Arc::new(1), None),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string(),
-                    }),
-                ),
+                (Arc::new(2), Some(User::new(2, "2".to_string()))),
                 (Arc::new(4), None),
             ]);
             let iter_3 = BufStream::new(vec![
-                (
-                    Arc::new(5),
-                    Some(User {
-                        id: 3,
-                        name: "3".to_string(),
-                    }),
-                ),
+                (Arc::new(5), Some(User::new(3, "3".to_string()))),
                 (Arc::new(6), None),
             ]);
 
@@ -159,25 +141,13 @@ mod tests {
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(2, "2".to_string())))
             );
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(3), None));
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(4), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(5),
-                    Some(User {
-                        id: 3,
-                        name: "3".to_string()
-                    })
-                )
+                (Arc::new(5), Some(User::new(3, "3".to_string())))
             );
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(6), None));
         });

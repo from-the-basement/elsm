@@ -399,51 +399,15 @@ mod tests {
             let option = DbOption::new(temp_dir.path().to_path_buf());
 
             let batch_1 = build_index_batch::<User>(vec![
-                (
-                    User {
-                        id: 3,
-                        name: "3".to_string(),
-                    },
-                    false,
-                ),
-                (
-                    User {
-                        id: 5,
-                        name: "5".to_string(),
-                    },
-                    false,
-                ),
-                (
-                    User {
-                        id: 6,
-                        name: "6".to_string(),
-                    },
-                    false,
-                ),
+                (User::new(3, "3".to_string()), false),
+                (User::new(5, "5".to_string()), false),
+                (User::new(6, "6".to_string()), false),
             ])
             .await;
             let batch_2 = build_index_batch::<User>(vec![
-                (
-                    User {
-                        id: 4,
-                        name: "4".to_string(),
-                    },
-                    false,
-                ),
-                (
-                    User {
-                        id: 2,
-                        name: "2".to_string(),
-                    },
-                    false,
-                ),
-                (
-                    User {
-                        id: 1,
-                        name: "1".to_string(),
-                    },
-                    false,
-                ),
+                (User::new(4, "4".to_string()), false),
+                (User::new(2, "2".to_string()), false),
+                (User::new(1, "1".to_string()), false),
             ])
             .await;
 
@@ -474,27 +438,9 @@ mod tests {
                 &option,
                 table_gen_1,
                 vec![
-                    (
-                        User {
-                            id: 1,
-                            name: "1".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 2,
-                            name: "2".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 3,
-                            name: "3".to_string(),
-                        },
-                        false,
-                    ),
+                    (User::new(1, "1".to_string()), false),
+                    (User::new(2, "2".to_string()), false),
+                    (User::new(3, "3".to_string()), false),
                 ],
             )
             .await;
@@ -502,27 +448,9 @@ mod tests {
                 &option,
                 table_gen_2,
                 vec![
-                    (
-                        User {
-                            id: 4,
-                            name: "4".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 5,
-                            name: "5".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 6,
-                            name: "6".to_string(),
-                        },
-                        false,
-                    ),
+                    (User::new(4, "4".to_string()), false),
+                    (User::new(5, "5".to_string()), false),
+                    (User::new(6, "6".to_string()), false),
                 ],
             )
             .await;
@@ -535,27 +463,9 @@ mod tests {
                 &option,
                 table_gen_3,
                 vec![
-                    (
-                        User {
-                            id: 1,
-                            name: "1".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 2,
-                            name: "2".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 3,
-                            name: "3".to_string(),
-                        },
-                        false,
-                    ),
+                    (User::new(1, "1".to_string()), false),
+                    (User::new(2, "2".to_string()), false),
+                    (User::new(3, "3".to_string()), false),
                 ],
             )
             .await;
@@ -563,27 +473,9 @@ mod tests {
                 &option,
                 table_gen_4,
                 vec![
-                    (
-                        User {
-                            id: 4,
-                            name: "4".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 5,
-                            name: "5".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 6,
-                            name: "6".to_string(),
-                        },
-                        false,
-                    ),
+                    (User::new(4, "4".to_string()), false),
+                    (User::new(5, "5".to_string()), false),
+                    (User::new(6, "6".to_string()), false),
                 ],
             )
             .await;
@@ -591,27 +483,9 @@ mod tests {
                 &option,
                 table_gen_5,
                 vec![
-                    (
-                        User {
-                            id: 7,
-                            name: "7".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 8,
-                            name: "8".to_string(),
-                        },
-                        false,
-                    ),
-                    (
-                        User {
-                            id: 9,
-                            name: "9".to_string(),
-                        },
-                        false,
-                    ),
+                    (User::new(7, "7".to_string()), false),
+                    (User::new(8, "8".to_string()), false),
+                    (User::new(9, "9".to_string()), false),
                 ],
             )
             .await;

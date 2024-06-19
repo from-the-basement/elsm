@@ -143,53 +143,20 @@ mod tests {
         block_on(async {
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(
-                Arc::new(1),
-                0,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string(),
-                }),
-            );
-            mem_table.insert(
-                Arc::new(1),
-                1,
-                Some(User {
-                    id: 2,
-                    name: "2".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(1), 1, Some(User::new(2, "2".to_string())));
 
-            mem_table.insert(
-                Arc::new(2),
-                0,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(2), 0, Some(User::new(1, "1".to_string())));
 
             let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(1),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string()
-                    })
-                )
+                (Arc::new(1), Some(User::new(2, "2".to_string())))
             );
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 1,
-                        name: "1".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(1, "1".to_string())))
             );
 
             drop(iterator);
@@ -206,88 +173,29 @@ mod tests {
         futures::executor::block_on(async {
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(
-                Arc::new(1),
-                0,
-                Some(User {
-                    id: 1,
-                    name: "1".to_string(),
-                }),
-            );
-            mem_table.insert(
-                Arc::new(2),
-                0,
-                Some(User {
-                    id: 2,
-                    name: "2".to_string(),
-                }),
-            );
-            mem_table.insert(
-                Arc::new(2),
-                1,
-                Some(User {
-                    id: 3,
-                    name: "3".to_string(),
-                }),
-            );
-            mem_table.insert(
-                Arc::new(3),
-                0,
-                Some(User {
-                    id: 3,
-                    name: "3".to_string(),
-                }),
-            );
-            mem_table.insert(
-                Arc::new(4),
-                0,
-                Some(User {
-                    id: 4,
-                    name: "4".to_string(),
-                }),
-            );
+            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(2), 0, Some(User::new(2, "2".to_string())));
+            mem_table.insert(Arc::new(2), 1, Some(User::new(3, "3".to_string())));
+            mem_table.insert(Arc::new(3), 0, Some(User::new(3, "3".to_string())));
+            mem_table.insert(Arc::new(4), 0, Some(User::new(4, "4".to_string())));
 
             let mut iterator = mem_table.iter(|v| v.clone()).await.unwrap();
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(1),
-                    Some(User {
-                        id: 1,
-                        name: "1".to_string()
-                    })
-                )
+                (Arc::new(1), Some(User::new(1, "1".to_string())))
             );
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 3,
-                        name: "3".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(3, "3".to_string())))
             );
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(3),
-                    Some(User {
-                        id: 3,
-                        name: "3".to_string()
-                    })
-                )
+                (Arc::new(3), Some(User::new(3, "3".to_string())))
             );
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(4),
-                    Some(User {
-                        id: 4,
-                        name: "4".to_string()
-                    })
-                )
+                (Arc::new(4), Some(User::new(4, "4".to_string())))
             );
             assert!(iterator.next().await.is_none());
 
@@ -298,23 +206,11 @@ mod tests {
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(2),
-                    Some(User {
-                        id: 2,
-                        name: "2".to_string()
-                    })
-                )
+                (Arc::new(2), Some(User::new(2, "2".to_string())))
             );
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (
-                    Arc::new(3),
-                    Some(User {
-                        id: 3,
-                        name: "3".to_string()
-                    })
-                )
+                (Arc::new(3), Some(User::new(3, "3".to_string())))
             );
             assert!(iterator.next().await.is_none())
         });
