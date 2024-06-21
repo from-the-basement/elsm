@@ -121,36 +121,39 @@ mod tests {
     use futures::executor::block_on;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, user::User, wal::provider::in_mem::InMemProvider,
-        Db,
+        mem_table::MemTable, oracle::LocalOracle, user::UserInner,
+        wal::provider::in_mem::InMemProvider, Db,
     };
 
     #[test]
     fn range() {
         block_on(async {
-            let mut mem_table = MemTable::<User>::default();
+            let mut mem_table = MemTable::<UserInner>::default();
 
             mem_table.insert(Arc::new(0), 0, None);
-            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(1), 0, Some(UserInner::new(1, "1".to_string())));
             mem_table.insert(Arc::new(1), 1, None);
-            mem_table.insert(Arc::new(2), 0, Some(User::new(2, "2".to_string())));
+            mem_table.insert(Arc::new(2), 0, Some(UserInner::new(2, "2".to_string())));
             mem_table.insert(Arc::new(3), 0, None);
 
-            let batch = Db::<User, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
+            let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
                 .await
                 .unwrap();
 
             let mut iterator = batch
-                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1, |v: &User| {
-                    v.clone()
-                })
+                .range(
+                    Some(&Arc::new(1)),
+                    Some(&Arc::new(2)),
+                    &1,
+                    |v: &UserInner| v.clone(),
+                )
                 .await
                 .unwrap();
 
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new(2), Some(User::new(2, "2".to_string())))
+                (Arc::new(2), Some(UserInner::new(2, "2".to_string())))
             );
             assert!(iterator.next().await.is_none())
         })

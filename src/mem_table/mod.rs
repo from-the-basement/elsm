@@ -159,7 +159,7 @@ mod tests {
     use super::MemTable;
     use crate::{
         record::{Record, RecordType},
-        user::User,
+        user::UserInner,
         wal::{WalFile, WalWrite},
     };
 
@@ -168,35 +168,35 @@ mod tests {
         block_on(async {
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
-            mem_table.insert(Arc::new(1), 1, Some(User::new(1, "1".to_string())));
-            mem_table.insert(Arc::new(1), 2, Some(User::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(1), 0, Some(UserInner::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(1), 1, Some(UserInner::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(1), 2, Some(UserInner::new(1, "1".to_string())));
 
-            mem_table.insert(Arc::new(3), 0, Some(User::new(3, "3".to_string())));
+            mem_table.insert(Arc::new(3), 0, Some(UserInner::new(3, "3".to_string())));
 
             assert_eq!(
                 mem_table.get(&Arc::new(1), &0),
-                Some(Some(&User::new(1, "1".to_string())))
+                Some(Some(&UserInner::new(1, "1".to_string())))
             );
             assert_eq!(
                 mem_table.get(&Arc::new(1), &1),
-                Some(Some(&User::new(1, "1".to_string())))
+                Some(Some(&UserInner::new(1, "1".to_string())))
             );
             assert_eq!(
                 mem_table.get(&Arc::new(1), &2),
-                Some(Some(&User::new(1, "1".to_string())))
+                Some(Some(&UserInner::new(1, "1".to_string())))
             );
 
             assert_eq!(
                 mem_table.get(&Arc::new(3), &0),
-                Some(Some(&User::new(3, "3".to_string())))
+                Some(Some(&UserInner::new(3, "3".to_string())))
             );
 
             assert_eq!(mem_table.get(&Arc::new(2), &0), None);
             assert_eq!(mem_table.get(&Arc::new(4), &0), None);
             assert_eq!(
                 mem_table.get(&Arc::new(1), &3),
-                Some(Some(&User::new(1, "1".to_string())))
+                Some(Some(&UserInner::new(1, "1".to_string())))
             );
         });
     }
@@ -205,7 +205,7 @@ mod tests {
     fn recover_from_wal() {
         let mut file = Vec::new();
         let key = Arc::new(0);
-        let value = User::new(0, "v".to_string());
+        let value = UserInner::new(0, "v".to_string());
         block_on(async {
             {
                 let mut wal = WalFile::new(Cursor::new(&mut file));
@@ -216,7 +216,7 @@ mod tests {
             }
             {
                 let mut wal = WalFile::new(Cursor::new(&mut file));
-                let mem_table: MemTable<User> = MemTable::from_wal(&mut wal).await.unwrap();
+                let mem_table: MemTable<UserInner> = MemTable::from_wal(&mut wal).await.unwrap();
                 assert_eq!(mem_table.get(&key, &0), Some(Some(&value)));
             }
         });

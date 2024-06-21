@@ -110,44 +110,45 @@ mod tests {
 
     use crate::{
         stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
-        user::User,
+        user::UserInner,
     };
 
     #[test]
     fn iter() {
         block_on(async {
             let iter_1 = BufStream::new(vec![
-                (Arc::new(1), Some(User::new(1, "1".to_string()))),
+                (Arc::new(1), Some(UserInner::new(1, "1".to_string()))),
                 (Arc::new(3), None),
             ]);
             let iter_2 = BufStream::new(vec![
                 (Arc::new(1), None),
-                (Arc::new(2), Some(User::new(2, "2".to_string()))),
+                (Arc::new(2), Some(UserInner::new(2, "2".to_string()))),
                 (Arc::new(4), None),
             ]);
             let iter_3 = BufStream::new(vec![
-                (Arc::new(5), Some(User::new(3, "3".to_string()))),
+                (Arc::new(5), Some(UserInner::new(3, "3".to_string()))),
                 (Arc::new(6), None),
             ]);
 
-            let mut iterator = MergeStream::<User, User, fn(&User) -> User>::new(vec![
-                EStreamImpl::Buf(iter_3),
-                EStreamImpl::Buf(iter_2),
-                EStreamImpl::Buf(iter_1),
-            ])
-            .await
-            .unwrap();
+            let mut iterator =
+                MergeStream::<UserInner, UserInner, fn(&UserInner) -> UserInner>::new(vec![
+                    EStreamImpl::Buf(iter_3),
+                    EStreamImpl::Buf(iter_2),
+                    EStreamImpl::Buf(iter_1),
+                ])
+                .await
+                .unwrap();
 
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new(2), Some(User::new(2, "2".to_string())))
+                (Arc::new(2), Some(UserInner::new(2, "2".to_string())))
             );
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(3), None));
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(4), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new(5), Some(User::new(3, "3".to_string())))
+                (Arc::new(5), Some(UserInner::new(3, "3".to_string())))
             );
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(6), None));
         });

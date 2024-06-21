@@ -60,8 +60,8 @@ mod tests {
     use executor::ExecutorBuilder;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, user::User, wal::provider::in_mem::InMemProvider,
-        Db,
+        mem_table::MemTable, oracle::LocalOracle, user::UserInner,
+        wal::provider::in_mem::InMemProvider, Db,
     };
 
     #[test]
@@ -69,24 +69,24 @@ mod tests {
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(Arc::new(1), 0, Some(User::new(1, "1".to_string())));
+            mem_table.insert(Arc::new(1), 0, Some(UserInner::new(1, "1".to_string())));
             mem_table.insert(Arc::new(1), 1, None);
-            mem_table.insert(Arc::new(2), 0, Some(User::new(2, "2".to_string())));
+            mem_table.insert(Arc::new(2), 0, Some(UserInner::new(2, "2".to_string())));
             mem_table.insert(Arc::new(3), 0, None);
 
-            let batch = Db::<User, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
+            let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
                 .await
                 .unwrap();
 
             assert_eq!(
                 batch.find(&Arc::new(1), &0).await,
-                Some(Some(User::new(1, "1".to_string())))
+                Some(Some(UserInner::new(1, "1".to_string())))
             );
             assert_eq!(batch.find(&Arc::new(1), &1).await, Some(None));
 
             assert_eq!(
                 batch.find(&Arc::new(2), &0).await,
-                Some(Some(User::new(2, "2".to_string())))
+                Some(Some(UserInner::new(2, "2".to_string())))
             );
             assert_eq!(batch.find(&Arc::new(3), &0).await, Some(None));
         });

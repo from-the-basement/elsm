@@ -346,7 +346,7 @@ mod tests {
         schema,
         schema::Builder,
         scope::Scope,
-        user::User,
+        user::UserInner,
         version::{edit::VersionEdit, Version},
         DbOption,
     };
@@ -398,20 +398,20 @@ mod tests {
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let option = DbOption::new(temp_dir.path().to_path_buf());
 
-            let batch_1 = build_index_batch::<User>(vec![
-                (User::new(3, "3".to_string()), false),
-                (User::new(5, "5".to_string()), false),
-                (User::new(6, "6".to_string()), false),
+            let batch_1 = build_index_batch::<UserInner>(vec![
+                (UserInner::new(3, "3".to_string()), false),
+                (UserInner::new(5, "5".to_string()), false),
+                (UserInner::new(6, "6".to_string()), false),
             ])
             .await;
-            let batch_2 = build_index_batch::<User>(vec![
-                (User::new(4, "4".to_string()), false),
-                (User::new(2, "2".to_string()), false),
-                (User::new(1, "1".to_string()), false),
+            let batch_2 = build_index_batch::<UserInner>(vec![
+                (UserInner::new(4, "4".to_string()), false),
+                (UserInner::new(2, "2".to_string()), false),
+                (UserInner::new(1, "1".to_string()), false),
             ])
             .await;
 
-            let scope = Compactor::<User>::minor_compaction(
+            let scope = Compactor::<UserInner>::minor_compaction(
                 &option,
                 VecDeque::from(vec![batch_2, batch_1]),
             )
@@ -438,9 +438,9 @@ mod tests {
                 &option,
                 table_gen_1,
                 vec![
-                    (User::new(1, "1".to_string()), false),
-                    (User::new(2, "2".to_string()), false),
-                    (User::new(3, "3".to_string()), false),
+                    (UserInner::new(1, "1".to_string()), false),
+                    (UserInner::new(2, "2".to_string()), false),
+                    (UserInner::new(3, "3".to_string()), false),
                 ],
             )
             .await;
@@ -448,9 +448,9 @@ mod tests {
                 &option,
                 table_gen_2,
                 vec![
-                    (User::new(4, "4".to_string()), false),
-                    (User::new(5, "5".to_string()), false),
-                    (User::new(6, "6".to_string()), false),
+                    (UserInner::new(4, "4".to_string()), false),
+                    (UserInner::new(5, "5".to_string()), false),
+                    (UserInner::new(6, "6".to_string()), false),
                 ],
             )
             .await;
@@ -463,9 +463,9 @@ mod tests {
                 &option,
                 table_gen_3,
                 vec![
-                    (User::new(1, "1".to_string()), false),
-                    (User::new(2, "2".to_string()), false),
-                    (User::new(3, "3".to_string()), false),
+                    (UserInner::new(1, "1".to_string()), false),
+                    (UserInner::new(2, "2".to_string()), false),
+                    (UserInner::new(3, "3".to_string()), false),
                 ],
             )
             .await;
@@ -473,9 +473,9 @@ mod tests {
                 &option,
                 table_gen_4,
                 vec![
-                    (User::new(4, "4".to_string()), false),
-                    (User::new(5, "5".to_string()), false),
-                    (User::new(6, "6".to_string()), false),
+                    (UserInner::new(4, "4".to_string()), false),
+                    (UserInner::new(5, "5".to_string()), false),
+                    (UserInner::new(6, "6".to_string()), false),
                 ],
             )
             .await;
@@ -483,18 +483,18 @@ mod tests {
                 &option,
                 table_gen_5,
                 vec![
-                    (User::new(7, "7".to_string()), false),
-                    (User::new(8, "8".to_string()), false),
-                    (User::new(9, "9".to_string()), false),
+                    (UserInner::new(7, "7".to_string()), false),
+                    (UserInner::new(8, "8".to_string()), false),
+                    (UserInner::new(9, "9".to_string()), false),
                 ],
             )
             .await;
 
             let (sender, _) = channel(1);
 
-            let mut version = Version::<User> {
+            let mut version = Version::<UserInner> {
                 num: 0,
-                level_slice: Version::<User>::level_slice_new(),
+                level_slice: Version::<UserInner>::level_slice_new(),
                 clean_sender: sender,
             };
             version.level_slice[0].push(Scope {
@@ -527,7 +527,7 @@ mod tests {
             let max = Arc::new(5);
             let mut version_edits = Vec::new();
 
-            Compactor::<User>::major_compaction(
+            Compactor::<UserInner>::major_compaction(
                 &version,
                 &option,
                 &min,
