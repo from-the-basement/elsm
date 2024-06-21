@@ -2,8 +2,8 @@ use std::{io, sync::Arc};
 
 use arrow::{
     array::{
-        Array, RecordBatch, StringArray, StringBuilder, StructArray, StructBuilder,
-        UInt64Array, UInt64Builder,
+        Array, RecordBatch, StringArray, StringBuilder, StructArray, StructBuilder, UInt64Array,
+        UInt64Builder,
     },
     datatypes::{DataType, Field, Fields, SchemaRef},
 };
