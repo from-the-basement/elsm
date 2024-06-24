@@ -24,7 +24,14 @@ use snowflake::ProcessUniqueId;
 use thiserror::Error;
 use tracing::error;
 
-use crate::{schema::Schema, scope::Scope, serdes::Encode, version::cleaner::CleanTag, DbOption};
+use crate::{
+    schema::Schema,
+    scope::Scope,
+    serdes::Encode,
+    stream::{level_stream::LevelStream, table_stream::TableStream, EStreamImpl, StreamError},
+    version::cleaner::CleanTag,
+    DbOption,
+};
 
 pub const MAX_LEVEL: usize = 7;
 
@@ -115,6 +122,27 @@ where
             Vec::new(),
             Vec::new(),
         ]
+    }
+
+    pub(crate) async fn iters<'a>(
+        &self,
+        iters: &mut Vec<EStreamImpl<'a, S>>,
+        option: &'a DbOption,
+        lower: Option<&Arc<S::PrimaryKey>>,
+        upper: Option<&Arc<S::PrimaryKey>>,
+    ) -> Result<(), StreamError<S::PrimaryKey, S>> {
+        for scope in self.level_slice[0].iter() {
+            iters.push(EStreamImpl::Table(
+                TableStream::new(option, &scope.gen, lower, upper).await?,
+            ))
+        }
+        for scopes in self.level_slice[1..].iter() {
+            let gens = scopes.iter().map(|scope| scope.gen).collect::<Vec<_>>();
+            iters.push(EStreamImpl::Level(
+                LevelStream::new(option, gens, lower, upper).await?,
+            ));
+        }
+        Ok(())
     }
 
     async fn read_parquet(

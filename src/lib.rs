@@ -355,6 +355,14 @@ where
             }
             iters.push(EStreamImpl::Buf(BufStream::new(items)));
         }
+        drop(guard);
+
+        self.version_set
+            .current()
+            .await
+            .iters(&mut iters, &self.option, lower, upper)
+            .await?;
+
         Ok(iters)
     }
 

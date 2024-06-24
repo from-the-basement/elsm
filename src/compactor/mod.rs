@@ -313,8 +313,6 @@ where
 {
     #[error("compaction io error: {0}")]
     Io(#[source] std::io::Error),
-    #[error("compaction arrow error: {0}")]
-    Arrow(#[source] arrow::error::ArrowError),
     #[error("compaction parquet error: {0}")]
     Parquet(#[source] parquet::errors::ParquetError),
     #[error("compaction version error: {0}")]
