@@ -26,46 +26,19 @@ pub(crate) mod merge_stream;
 pub(crate) mod table_stream;
 
 #[pin_project(project = EStreamImplProj)]
-pub(crate) enum EStreamImpl<'a, S, G, F>
-where
-    S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
-{
-    Buf(#[pin] BufStream<'a, S::PrimaryKey, G, StreamError<S::PrimaryKey, S>>),
-    IndexBatch(#[pin] IndexBatchStream<'a, S, G, F>),
-    MemTable(#[pin] MemTableStream<'a, S, G, F>),
-    TransactionInner(#[pin] TransactionStream<'a, S, G, F, StreamError<S::PrimaryKey, S>>),
-}
-
-#[pin_project(project = EInnerStreamImplProj)]
-pub(crate) enum EInnerStreamImpl<'a, S>
+pub(crate) enum EStreamImpl<'a, S>
 where
     S: Schema,
 {
+    Buf(#[pin] BufStream<'a, S::PrimaryKey, S, StreamError<S::PrimaryKey, S>>),
+    IndexBatch(#[pin] IndexBatchStream<'a, S>),
+    MemTable(#[pin] MemTableStream<'a, S>),
+    TransactionInner(#[pin] TransactionStream<'a, S, StreamError<S::PrimaryKey, S>>),
     Table(#[pin] TableStream<'a, S>),
     Level(#[pin] LevelStream<'a, S>),
 }
 
-impl<'a, S, G, F> Stream for EStreamImpl<'a, S, G, F>
-where
-    S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
-{
-    type Item = Result<(Arc<S::PrimaryKey>, Option<G>), StreamError<S::PrimaryKey, S>>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.project() {
-            EStreamImplProj::Buf(stream) => stream.poll_next(cx),
-            EStreamImplProj::IndexBatch(stream) => stream.poll_next(cx),
-            EStreamImplProj::MemTable(stream) => stream.poll_next(cx),
-            EStreamImplProj::TransactionInner(stream) => stream.poll_next(cx),
-        }
-    }
-}
-
-impl<'a, S> Stream for EInnerStreamImpl<'a, S>
+impl<'a, S> Stream for EStreamImpl<'a, S>
 where
     S: Schema,
 {
@@ -73,8 +46,12 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.project() {
-            EInnerStreamImplProj::Table(stream) => stream.poll_next(cx),
-            EInnerStreamImplProj::Level(stream) => stream.poll_next(cx),
+            EStreamImplProj::Buf(stream) => stream.poll_next(cx),
+            EStreamImplProj::IndexBatch(stream) => stream.poll_next(cx),
+            EStreamImplProj::MemTable(stream) => stream.poll_next(cx),
+            EStreamImplProj::TransactionInner(stream) => stream.poll_next(cx),
+            EStreamImplProj::Table(stream) => stream.poll_next(cx),
+            EStreamImplProj::Level(stream) => stream.poll_next(cx),
         }
     }
 }

@@ -9,7 +9,6 @@ pub(crate) mod scope;
 pub mod serdes;
 pub mod stream;
 pub mod transaction;
-pub(crate) mod user;
 pub(crate) mod utils;
 mod version;
 pub mod wal;
@@ -263,27 +262,22 @@ where
         Ok(())
     }
 
-    async fn get<G, F>(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp, f: F) -> Option<G>
-    where
-        G: Send + 'static,
-        F: Fn(&S) -> G + Sync + 'static,
-    {
+    async fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<S> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(key), executor::worker_num()) as usize;
 
         // Safety: read-only would not break data.
-        let (key, ts, f) = unsafe {
+        let (key, ts) = unsafe {
             (
                 mem::transmute::<_, &Arc<S::PrimaryKey>>(key),
                 mem::transmute::<_, &TimeStamp>(ts),
-                mem::transmute::<_, &'static F>(&f),
             )
         };
 
         if let Some(value) = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
-                local.read().await.mutable.get(key, ts).map(|v| v.map(f))
+                local.read().await.mutable.get(key, ts).map(|s| s.cloned())
             })
             .await
         {
@@ -292,47 +286,37 @@ where
         let guard = self.immutable.read().await;
         for index_batch in guard.iter().rev() {
             if let Some(value) = index_batch.find(key, ts).await {
-                return value.map(|v| f(&v));
+                return value;
             }
         }
         drop(guard);
 
         let guard = self.version_set.current().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
-            return S::from_batch(&record_batch, 0).1.map(|v| f(&v));
+            return S::from_batch(&record_batch, 0).1;
         }
         drop(guard);
 
         None
     }
 
-    async fn range<G, F>(
+    async fn range(
         &self,
         lower: Option<&Arc<S::PrimaryKey>>,
         upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
-        f: F,
-    ) -> Result<MergeStream<S, G, F>, StreamError<S::PrimaryKey, S>>
-    where
-        G: Send + Sync + 'static,
-        F: Fn(&S) -> G + Sync + Send + 'static + Copy,
-    {
-        let iters = self.inner_range(lower, upper, ts, f).await?;
+    ) -> Result<MergeStream<S>, StreamError<S::PrimaryKey, S>> {
+        let iters = self.inner_range(lower, upper, ts).await?;
 
         MergeStream::new(iters).await
     }
 
-    pub(crate) async fn inner_range<'s, G, F>(
+    pub(crate) async fn inner_range<'s>(
         &'s self,
         lower: Option<&Arc<S::PrimaryKey>>,
         upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
-        f: F,
-    ) -> Result<Vec<EStreamImpl<S, G, F>>, StreamError<S::PrimaryKey, S>>
-    where
-        G: Send + Sync + 'static,
-        F: Fn(&S) -> G + Sync + Send + 'static + Copy,
-    {
+    ) -> Result<Vec<EStreamImpl<S>>, StreamError<S::PrimaryKey, S>> {
         let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
             let lower = lower.cloned();
             let upper = upper.cloned();
@@ -345,7 +329,7 @@ where
                 let mut iter = pin!(
                     guard
                         .mutable
-                        .range(lower.as_ref(), upper.as_ref(), &ts, f)
+                        .range(lower.as_ref(), upper.as_ref(), &ts)
                         .await?,
                 );
 
@@ -362,7 +346,7 @@ where
 
         for batch in guard.iter() {
             let mut items = Vec::new();
-            let mut stream = pin!(batch.range(lower, upper, ts, f).await?);
+            let mut stream = pin!(batch.range(lower, upper, ts).await?);
 
             while let Some(item) = stream.next().await {
                 let (k, v) = item?;
@@ -471,16 +455,9 @@ pub(crate) trait GetWrite<S>: Oracle<S::PrimaryKey>
 where
     S: schema::Schema,
 {
-    fn get<G, F>(
-        &self,
-        key: &Arc<S::PrimaryKey>,
-        ts: &TimeStamp,
-        f: F,
-    ) -> impl Future<Output = Option<G>>
+    fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> impl Future<Output = Option<S>>
     where
-        G: Send + 'static,
-        TimeStamp: Sync,
-        F: Fn(&S) -> G + Sync + 'static;
+        TimeStamp: Sync;
 
     fn write(
         &self,
@@ -495,19 +472,16 @@ where
         kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
-    fn inner_range<'a, G, F>(
+    fn inner_range<'a>(
         &'a self,
         lower: Option<&Arc<S::PrimaryKey>>,
         upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
-        f: F,
-    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, S, G, F>>, StreamError<S::PrimaryKey, S>>>
+    ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, S>>, StreamError<S::PrimaryKey, S>>>
     where
         S::PrimaryKey: 'a,
         TimeStamp: 'a,
-        S: 'a,
-        G: Send + Sync + 'static,
-        F: Fn(&S) -> G + Sync + Send + 'static + Copy;
+        S: 'a;
 }
 
 impl<S, O, WP> GetWrite<S> for Db<S, O, WP>
@@ -529,12 +503,8 @@ where
         Ok(())
     }
 
-    async fn get<G, F>(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp, f: F) -> Option<G>
-    where
-        G: Send + 'static,
-        F: Fn(&S) -> G + Sync + 'static,
-    {
-        Db::get(self, key, ts, f).await
+    async fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<S> {
+        Db::get(self, key, ts).await
     }
 
     async fn write_batch(
@@ -545,21 +515,18 @@ where
         Ok(())
     }
 
-    async fn inner_range<'a, G, F>(
+    async fn inner_range<'a>(
         &'a self,
         lower: Option<&Arc<S::PrimaryKey>>,
         upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
-        f: F,
-    ) -> Result<Vec<EStreamImpl<'a, S, G, F>>, StreamError<S::PrimaryKey, S>>
+    ) -> Result<Vec<EStreamImpl<'a, S>>, StreamError<S::PrimaryKey, S>>
     where
         S::PrimaryKey: 'a,
         TimeStamp: 'a,
         S: 'a,
-        G: Send + Sync + 'static,
-        F: Fn(&S) -> G + Sync + Send + 'static + Copy,
     {
-        Db::inner_range(self, lower, upper, ts, f).await
+        Db::inner_range(self, lower, upper, ts).await
     }
 }
 
@@ -596,17 +563,84 @@ impl DbOption {
 mod tests {
     use std::sync::Arc;
 
-    use executor::{futures::StreamExt, ExecutorBuilder};
+    use arrow::{
+        array::{
+            Array, BooleanArray, BooleanBuilder, Int16Array, Int16Builder, Int32Array,
+            Int32Builder, Int64Array, Int64Builder, Int8Array, Int8Builder, StringArray,
+            StringBuilder, StructArray, StructBuilder, UInt16Array, UInt16Builder, UInt32Array,
+            UInt32Builder, UInt64Array, UInt64Builder, UInt8Array, UInt8Builder,
+        },
+        datatypes::{DataType, Field, Fields, SchemaRef},
+        record_batch::RecordBatch,
+    };
+    use elsm_marco::elsm_schema;
+    use executor::{
+        futures::{AsyncRead, AsyncWrite, StreamExt},
+        ExecutorBuilder,
+    };
+    use lazy_static::lazy_static;
     use tempfile::TempDir;
 
     use crate::{
+        io,
         oracle::LocalOracle,
         record::RecordType,
+        schema::Schema,
         transaction::CommitError,
-        user::UserInner,
         wal::provider::{fs::Fs, in_mem::InMemProvider},
-        Db, DbOption,
+        Builder, Db, DbOption, Decode, Encode,
     };
+
+    #[derive(Debug, Eq, PartialEq)]
+    #[elsm_schema]
+    pub(crate) struct User {
+        #[primary_key]
+        pub(crate) id: u64,
+        pub(crate) name: String,
+        pub(crate) is_human: bool,
+        pub(crate) i_number_0: i8,
+        pub(crate) i_number_1: i16,
+        pub(crate) i_number_2: i32,
+        pub(crate) i_number_3: i64,
+        pub(crate) u_number_0: u8,
+        pub(crate) u_number_1: u16,
+        pub(crate) u_number_2: u32,
+        pub(crate) u_number_3: u64,
+    }
+
+    #[test]
+    fn test_user() {
+        let temp_dir = TempDir::new().unwrap();
+
+        ExecutorBuilder::new().build().unwrap().block_on(async {
+            let db = Arc::new(
+                Db::new(
+                    LocalOracle::default(),
+                    InMemProvider::default(),
+                    DbOption::new(temp_dir.path().to_path_buf()),
+                )
+                .await
+                .unwrap(),
+            );
+            let user_0 = UserInner::new(0, "lizeren".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0);
+            let user_1 = UserInner::new(1, "2333".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0);
+            let user_2 = UserInner::new(2, "ghost".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0);
+
+            let mut t0 = db.new_txn();
+
+            t0.set(user_0.primary_key(), user_0.clone());
+            t0.set(user_1.primary_key(), user_1.clone());
+            t0.set(user_2.primary_key(), user_2.clone());
+
+            t0.commit().await.unwrap();
+
+            let txn = db.new_txn();
+
+            assert_eq!(txn.get(&Arc::new(user_0.primary_key())).await, Some(user_0));
+            assert_eq!(txn.get(&Arc::new(user_1.primary_key())).await, Some(user_1));
+            assert_eq!(txn.get(&Arc::new(user_2.primary_key())).await, Some(user_2));
+        });
+    }
 
     #[test]
     fn read_committed() {
@@ -624,15 +658,21 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(0, UserInner::new(0, "0".to_string()));
-            txn.set(1, UserInner::new(1, "1".to_string()));
+            txn.set(
+                0,
+                UserInner::new(0, "0".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn.set(
+                1,
+                UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
             txn.commit().await.unwrap();
 
             let mut t0 = db.new_txn();
             let mut t1 = db.new_txn();
 
-            t0.set(0, t0.get(&Arc::new(1), |v| v.clone()).await.unwrap());
-            t1.set(1, t1.get(&Arc::new(0), |v| v.clone()).await.unwrap());
+            t0.set(0, t0.get(&Arc::new(1)).await.unwrap());
+            t1.set(1, t1.get(&Arc::new(0)).await.unwrap());
 
             t0.commit().await.unwrap();
             t1.commit().await.unwrap();
@@ -640,12 +680,36 @@ mod tests {
             let txn = db.new_txn();
 
             assert_eq!(
-                txn.get(&Arc::from(0), |v| v.clone()).await,
-                Some(UserInner::new(1, "1".to_string()))
+                txn.get(&Arc::from(0)).await,
+                Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ))
             );
             assert_eq!(
-                txn.get(&Arc::from(1), |v| v.clone()).await,
-                Some(UserInner::new(0, "0".to_string()))
+                txn.get(&Arc::from(1)).await,
+                Some(UserInner::new(
+                    0,
+                    "0".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ))
             );
         });
     }
@@ -666,55 +730,169 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(0, UserInner::new(0, "0".to_string()));
-            txn.set(1, UserInner::new(1, "1".to_string()));
-            txn.set(2, UserInner::new(2, "2".to_string()));
-            txn.set(3, UserInner::new(3, "3".to_string()));
+            txn.set(
+                0,
+                UserInner::new(0, "0".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn.set(
+                1,
+                UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn.set(
+                2,
+                UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn.set(
+                3,
+                UserInner::new(3, "3".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
             txn.commit().await.unwrap();
 
             let mut iter = db
-                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1, |v| v.clone())
+                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1)
                 .await
                 .unwrap();
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new(1), Some(UserInner::new(1, "1".to_string())))
+                (
+                    Arc::new(1),
+                    Some(UserInner::new(
+                        1,
+                        "1".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new(2), Some(UserInner::new(2, "2".to_string())))
+                (
+                    Arc::new(2),
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
 
             let mut txn_1 = db.new_txn();
-            txn_1.set(5, UserInner::new(5, "5".to_string()));
-            txn_1.set(4, UserInner::new(4, "4".to_string()));
+            txn_1.set(
+                5,
+                UserInner::new(5, "5".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn_1.set(
+                4,
+                UserInner::new(4, "4".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
 
             let mut txn_2 = db.new_txn();
-            txn_2.set(5, UserInner::new(4, "4".to_string()));
-            txn_2.set(4, UserInner::new(5, "5".to_string()));
+            txn_2.set(
+                5,
+                UserInner::new(4, "4".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn_2.set(
+                4,
+                UserInner::new(5, "5".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
             txn_2.commit().await.unwrap();
 
             let mut iter = txn_1
-                .range(Some(&Arc::new(1)), Some(&Arc::new(4)), |v| v.clone())
+                .range(Some(&Arc::new(1)), Some(&Arc::new(4)))
                 .await
                 .unwrap();
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new(1), Some(UserInner::new(1, "1".to_string())))
+                (
+                    Arc::new(1),
+                    Some(UserInner::new(
+                        1,
+                        "1".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new(2), Some(UserInner::new(2, "2".to_string())))
+                (
+                    Arc::new(2),
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new(3), Some(UserInner::new(3, "3".to_string())))
+                (
+                    Arc::new(3),
+                    Some(UserInner::new(
+                        3,
+                        "3".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
-                (Arc::new(4), Some(UserInner::new(4, "4".to_string())))
+                (
+                    Arc::new(4),
+                    Some(UserInner::new(
+                        4,
+                        "4".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
         });
     }
@@ -735,18 +913,30 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(0, UserInner::new(0, "0".to_string()));
-            txn.set(1, UserInner::new(1, "1".to_string()));
+            txn.set(
+                0,
+                UserInner::new(0, "0".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn.set(
+                1,
+                UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
             txn.commit().await.unwrap();
 
             let mut t0 = db.new_txn();
             let mut t1 = db.new_txn();
             let mut t2 = db.new_txn();
 
-            t0.set(0, t0.get(&Arc::new(1), |v| v.clone()).await.unwrap());
-            t1.set(0, t1.get(&Arc::new(0), |v| v.clone()).await.unwrap());
-            t1.set(2, UserInner::new(2, "2".to_string()));
-            t2.set(2, UserInner::new(3, "3".to_string()));
+            t0.set(0, t0.get(&Arc::new(1)).await.unwrap());
+            t1.set(0, t1.get(&Arc::new(0)).await.unwrap());
+            t1.set(
+                2,
+                UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            t2.set(
+                2,
+                UserInner::new(3, "3".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
 
             t0.commit().await.unwrap();
 
@@ -755,8 +945,20 @@ mod tests {
             assert!(t2.commit().await.is_ok());
             if let Err(CommitError::WriteConflict(keys)) = commit {
                 assert_eq!(
-                    db.new_txn().get(&keys[0], |v| v.clone()).await,
-                    Some(UserInner::new(1, "1".to_string()))
+                    db.new_txn().get(&keys[0]).await,
+                    Some(UserInner::new(
+                        1,
+                        "1".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
                 );
                 return;
             }
@@ -792,7 +994,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(1),
                 0,
-                Some(UserInner::new(1, "1".to_string())),
+                Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -800,7 +1014,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(2),
                 0,
-                Some(UserInner::new(2, "2".to_string())),
+                Some(UserInner::new(
+                    2,
+                    "2".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -808,7 +1034,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(3),
                 0,
-                Some(UserInner::new(3, "3".to_string())),
+                Some(UserInner::new(
+                    3,
+                    "3".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -816,7 +1054,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(4),
                 0,
-                Some(UserInner::new(4, "4".to_string())),
+                Some(UserInner::new(
+                    4,
+                    "4".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -824,7 +1074,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(5),
                 0,
-                Some(UserInner::new(5, "5".to_string())),
+                Some(UserInner::new(
+                    5,
+                    "5".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -832,7 +1094,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(6),
                 0,
-                Some(UserInner::new(6, "6".to_string())),
+                Some(UserInner::new(
+                    6,
+                    "6".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -840,7 +1114,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(7),
                 0,
-                Some(UserInner::new(7, "7".to_string())),
+                Some(UserInner::new(
+                    7,
+                    "7".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -848,7 +1134,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(8),
                 0,
-                Some(UserInner::new(8, "8".to_string())),
+                Some(UserInner::new(
+                    8,
+                    "8".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -856,7 +1154,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(9),
                 0,
-                Some(UserInner::new(9, "9".to_string())),
+                Some(UserInner::new(
+                    9,
+                    "9".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -864,7 +1174,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(10),
                 0,
-                Some(UserInner::new(10, "10".to_string())),
+                Some(UserInner::new(
+                    10,
+                    "10".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -872,7 +1194,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(20),
                 0,
-                Some(UserInner::new(20, "20".to_string())),
+                Some(UserInner::new(
+                    20,
+                    "20".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -880,7 +1214,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(30),
                 0,
-                Some(UserInner::new(30, "30".to_string())),
+                Some(UserInner::new(
+                    30,
+                    "30".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -888,7 +1234,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(40),
                 0,
-                Some(UserInner::new(40, "40".to_string())),
+                Some(UserInner::new(
+                    40,
+                    "40".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -896,7 +1254,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(50),
                 0,
-                Some(UserInner::new(50, "50".to_string())),
+                Some(UserInner::new(
+                    50,
+                    "50".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -904,7 +1274,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(60),
                 0,
-                Some(UserInner::new(60, "60".to_string())),
+                Some(UserInner::new(
+                    60,
+                    "60".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -912,7 +1294,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(70),
                 0,
-                Some(UserInner::new(70, "70".to_string())),
+                Some(UserInner::new(
+                    70,
+                    "70".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -920,7 +1314,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(80),
                 0,
-                Some(UserInner::new(80, "80".to_string())),
+                Some(UserInner::new(
+                    80,
+                    "80".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -928,7 +1334,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(90),
                 0,
-                Some(UserInner::new(90, "90".to_string())),
+                Some(UserInner::new(
+                    90,
+                    "90".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -936,7 +1354,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(100),
                 0,
-                Some(UserInner::new(100, "100".to_string())),
+                Some(UserInner::new(
+                    100,
+                    "100".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -944,7 +1374,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(200),
                 0,
-                Some(UserInner::new(200, "200".to_string())),
+                Some(UserInner::new(
+                    200,
+                    "200".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -952,7 +1394,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(300),
                 0,
-                Some(UserInner::new(300, "300".to_string())),
+                Some(UserInner::new(
+                    300,
+                    "300".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -960,7 +1414,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(400),
                 0,
-                Some(UserInner::new(400, "400".to_string())),
+                Some(UserInner::new(
+                    400,
+                    "400".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -968,7 +1434,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(500),
                 0,
-                Some(UserInner::new(500, "500".to_string())),
+                Some(UserInner::new(
+                    500,
+                    "500".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -976,7 +1454,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(600),
                 0,
-                Some(UserInner::new(600, "600".to_string())),
+                Some(UserInner::new(
+                    600,
+                    "600".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -984,7 +1474,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(700),
                 0,
-                Some(UserInner::new(700, "700".to_string())),
+                Some(UserInner::new(
+                    700,
+                    "700".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -992,7 +1494,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(800),
                 0,
-                Some(UserInner::new(800, "800".to_string())),
+                Some(UserInner::new(
+                    800,
+                    "800".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1000,7 +1514,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(900),
                 0,
-                Some(UserInner::new(900, "900".to_string())),
+                Some(UserInner::new(
+                    900,
+                    "900".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1008,7 +1534,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(1000),
                 0,
-                Some(UserInner::new(1000, "1000".to_string())),
+                Some(UserInner::new(
+                    1000,
+                    "1000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1016,7 +1554,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(2000),
                 0,
-                Some(UserInner::new(2000, "2000".to_string())),
+                Some(UserInner::new(
+                    2000,
+                    "2000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1024,7 +1574,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(3000),
                 0,
-                Some(UserInner::new(3000, "3000".to_string())),
+                Some(UserInner::new(
+                    3000,
+                    "3000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1032,7 +1594,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(4000),
                 0,
-                Some(UserInner::new(4000, "4000".to_string())),
+                Some(UserInner::new(
+                    4000,
+                    "4000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1040,7 +1614,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(5000),
                 0,
-                Some(UserInner::new(5000, "5000".to_string())),
+                Some(UserInner::new(
+                    5000,
+                    "5000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1048,7 +1634,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(6000),
                 0,
-                Some(UserInner::new(6000, "6000".to_string())),
+                Some(UserInner::new(
+                    6000,
+                    "6000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1056,7 +1654,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(7000),
                 0,
-                Some(UserInner::new(7000, "7000".to_string())),
+                Some(UserInner::new(
+                    7000,
+                    "7000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1064,7 +1674,19 @@ mod tests {
                 RecordType::Full,
                 Arc::new(8000),
                 0,
-                Some(UserInner::new(8000, "8000".to_string())),
+                Some(UserInner::new(
+                    8000,
+                    "8000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
@@ -1072,14 +1694,38 @@ mod tests {
                 RecordType::Full,
                 Arc::new(9000),
                 0,
-                Some(UserInner::new(9000, "9000".to_string())),
+                Some(UserInner::new(
+                    9000,
+                    "9000".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             )
             .await
             .unwrap();
 
             assert_eq!(
-                db.get(&Arc::new(20), &0, |v| v.clone()).await,
-                Some(UserInner::new(20, "20".to_string()))
+                db.get(&Arc::new(20), &0).await,
+                Some(UserInner::new(
+                    20,
+                    "20".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ))
             );
 
             drop(db);
@@ -1104,8 +1750,20 @@ mod tests {
             );
 
             assert_eq!(
-                db.get(&Arc::new(20), &0, |v: &UserInner| v.clone()).await,
-                Some(UserInner::new(20, "20".to_string()))
+                db.get(&Arc::new(20), &0).await,
+                Some(UserInner::new(
+                    20,
+                    "20".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ))
             );
         });
     }
@@ -1126,8 +1784,14 @@ mod tests {
             );
 
             let mut txn = db.new_txn();
-            txn.set(0, UserInner::new(0, "0".to_string()));
-            txn.set(1, UserInner::new(1, "1".to_string()));
+            txn.set(
+                0,
+                UserInner::new(0, "0".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            txn.set(
+                1,
+                UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
             txn.commit().await.unwrap();
 
             drop(db);
@@ -1143,12 +1807,36 @@ mod tests {
             );
 
             assert_eq!(
-                db.get(&Arc::new(0), &1, |v: &UserInner| v.clone()).await,
-                Some(UserInner::new(0, "0".to_string())),
+                db.get(&Arc::new(0), &1).await,
+                Some(UserInner::new(
+                    0,
+                    "0".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                )),
             );
             assert_eq!(
-                db.get(&Arc::new(1), &1, |v: &UserInner| v.clone()).await,
-                Some(UserInner::new(1, "1".to_string())),
+                db.get(&Arc::new(1), &1).await,
+                Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                )),
             );
         });
     }

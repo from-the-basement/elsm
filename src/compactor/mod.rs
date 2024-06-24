@@ -13,7 +13,7 @@ use crate::{
     serdes::Encode,
     stream::{
         level_stream::LevelStream, merge_inner_stream::MergeInnerStream, table_stream::TableStream,
-        EInnerStreamImpl, StreamError,
+        EStreamImpl, StreamError,
     },
     version::{edit::VersionEdit, set::VersionSet, Version, VersionError, MAX_LEVEL},
     DbOption, Immutable,
@@ -184,7 +184,7 @@ where
             // This Level
             if level == 0 {
                 for scope in meet_scopes_l.iter() {
-                    streams.push(EInnerStreamImpl::Table(
+                    streams.push(EStreamImpl::Table(
                         TableStream::new(option, &scope.gen, None, None)
                             .await
                             .map_err(CompactionError::Stream)?,
@@ -195,7 +195,7 @@ where
                     .iter()
                     .map(|scope| scope.gen)
                     .collect::<Vec<_>>();
-                streams.push(EInnerStreamImpl::Level(
+                streams.push(EStreamImpl::Level(
                     LevelStream::new(option, gens, Some(min), Some(max))
                         .await
                         .map_err(CompactionError::Stream)?,
@@ -206,7 +206,7 @@ where
                 .iter()
                 .map(|scope| scope.gen)
                 .collect::<Vec<_>>();
-            streams.push(EInnerStreamImpl::Level(
+            streams.push(EStreamImpl::Level(
                 LevelStream::new(option, gens, None, None)
                     .await
                     .map_err(CompactionError::Stream)?,
@@ -346,7 +346,7 @@ mod tests {
         schema,
         schema::Builder,
         scope::Scope,
-        user::UserInner,
+        tests::UserInner,
         version::{edit::VersionEdit, Version},
         DbOption,
     };
@@ -399,15 +399,33 @@ mod tests {
             let option = DbOption::new(temp_dir.path().to_path_buf());
 
             let batch_1 = build_index_batch::<UserInner>(vec![
-                (UserInner::new(3, "3".to_string()), false),
-                (UserInner::new(5, "5".to_string()), false),
-                (UserInner::new(6, "6".to_string()), false),
+                (
+                    UserInner::new(3, "3".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                    false,
+                ),
+                (
+                    UserInner::new(5, "5".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                    false,
+                ),
+                (
+                    UserInner::new(6, "6".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                    false,
+                ),
             ])
             .await;
             let batch_2 = build_index_batch::<UserInner>(vec![
-                (UserInner::new(4, "4".to_string()), false),
-                (UserInner::new(2, "2".to_string()), false),
-                (UserInner::new(1, "1".to_string()), false),
+                (
+                    UserInner::new(4, "4".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                    false,
+                ),
+                (
+                    UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                    false,
+                ),
+                (
+                    UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                    false,
+                ),
             ])
             .await;
 
@@ -438,9 +456,18 @@ mod tests {
                 &option,
                 table_gen_1,
                 vec![
-                    (UserInner::new(1, "1".to_string()), false),
-                    (UserInner::new(2, "2".to_string()), false),
-                    (UserInner::new(3, "3".to_string()), false),
+                    (
+                        UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(3, "3".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
                 ],
             )
             .await;
@@ -448,9 +475,18 @@ mod tests {
                 &option,
                 table_gen_2,
                 vec![
-                    (UserInner::new(4, "4".to_string()), false),
-                    (UserInner::new(5, "5".to_string()), false),
-                    (UserInner::new(6, "6".to_string()), false),
+                    (
+                        UserInner::new(4, "4".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(5, "5".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(6, "6".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
                 ],
             )
             .await;
@@ -463,9 +499,18 @@ mod tests {
                 &option,
                 table_gen_3,
                 vec![
-                    (UserInner::new(1, "1".to_string()), false),
-                    (UserInner::new(2, "2".to_string()), false),
-                    (UserInner::new(3, "3".to_string()), false),
+                    (
+                        UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(3, "3".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
                 ],
             )
             .await;
@@ -473,9 +518,18 @@ mod tests {
                 &option,
                 table_gen_4,
                 vec![
-                    (UserInner::new(4, "4".to_string()), false),
-                    (UserInner::new(5, "5".to_string()), false),
-                    (UserInner::new(6, "6".to_string()), false),
+                    (
+                        UserInner::new(4, "4".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(5, "5".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(6, "6".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
                 ],
             )
             .await;
@@ -483,9 +537,18 @@ mod tests {
                 &option,
                 table_gen_5,
                 vec![
-                    (UserInner::new(7, "7".to_string()), false),
-                    (UserInner::new(8, "8".to_string()), false),
-                    (UserInner::new(9, "9".to_string()), false),
+                    (
+                        UserInner::new(7, "7".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(8, "8".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
+                    (
+                        UserInner::new(9, "9".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+                        false,
+                    ),
                 ],
             )
             .await;

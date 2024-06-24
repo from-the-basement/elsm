@@ -17,26 +17,21 @@ use crate::{
 
 #[pin_project]
 #[derive(Debug)]
-pub(crate) struct IndexBatchStream<'a, S, G, F>
+pub(crate) struct IndexBatchStream<'a, S>
 where
     S: Schema,
-    G: Send + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
     batch: &'a RecordBatch,
-    item_buf: Option<(Arc<S::PrimaryKey>, Option<G>)>,
+    item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
     inner: Range<'a, InternalKey<S::PrimaryKey>, u32>,
     ts: TimeStamp,
-    f: F,
 }
 
-impl<'a, S, G, F> Stream for IndexBatchStream<'a, S, G, F>
+impl<'a, S> Stream for IndexBatchStream<'a, S>
 where
     S: Schema,
-    G: Send + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<G>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -49,12 +44,7 @@ where
             {
                 return Poll::Ready(
                     this.item_buf
-                        .replace((
-                            key.clone(),
-                            S::from_batch(this.batch, *offset as usize)
-                                .1
-                                .map(|v| (this.f)(&v)),
-                        ))
+                        .replace((key.clone(), S::from_batch(this.batch, *offset as usize).1))
                         .map(Ok),
                 );
             }
@@ -67,17 +57,12 @@ impl<S> IndexBatch<S>
 where
     S: Schema,
 {
-    pub(crate) async fn range<G, F>(
+    pub(crate) async fn range(
         &self,
         lower: Option<&Arc<S::PrimaryKey>>,
         upper: Option<&Arc<S::PrimaryKey>>,
         ts: &TimeStamp,
-        f: F,
-    ) -> Result<IndexBatchStream<S, G, F>, StreamError<S::PrimaryKey, S>>
-    where
-        G: Send + 'static,
-        F: Fn(&S) -> G + Sync + 'static,
-    {
+    ) -> Result<IndexBatchStream<S>, StreamError<S::PrimaryKey, S>> {
         let mut iterator = IndexBatchStream {
             batch: &self.batch,
             inner: self.index.range((
@@ -100,7 +85,6 @@ where
             )),
             item_buf: None,
             ts: *ts,
-            f,
         };
 
         {
@@ -121,7 +105,7 @@ mod tests {
     use futures::executor::block_on;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, user::UserInner,
+        mem_table::MemTable, oracle::LocalOracle, tests::UserInner,
         wal::provider::in_mem::InMemProvider, Db,
     };
 
@@ -131,9 +115,41 @@ mod tests {
             let mut mem_table = MemTable::<UserInner>::default();
 
             mem_table.insert(Arc::new(0), 0, None);
-            mem_table.insert(Arc::new(1), 0, Some(UserInner::new(1, "1".to_string())));
+            mem_table.insert(
+                Arc::new(1),
+                0,
+                Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
+            );
             mem_table.insert(Arc::new(1), 1, None);
-            mem_table.insert(Arc::new(2), 0, Some(UserInner::new(2, "2".to_string())));
+            mem_table.insert(
+                Arc::new(2),
+                0,
+                Some(UserInner::new(
+                    2,
+                    "2".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
+            );
             mem_table.insert(Arc::new(3), 0, None);
 
             let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
@@ -141,19 +157,29 @@ mod tests {
                 .unwrap();
 
             let mut iterator = batch
-                .range(
-                    Some(&Arc::new(1)),
-                    Some(&Arc::new(2)),
-                    &1,
-                    |v: &UserInner| v.clone(),
-                )
+                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1)
                 .await
                 .unwrap();
 
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new(2), Some(UserInner::new(2, "2".to_string())))
+                (
+                    Arc::new(2),
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert!(iterator.next().await.is_none())
         })

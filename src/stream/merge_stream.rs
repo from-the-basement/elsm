@@ -17,26 +17,22 @@ use crate::{
 };
 
 #[pin_project]
-pub struct MergeStream<'stream, S, G, F>
+pub struct MergeStream<'stream, S>
 where
     S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
     #[allow(clippy::type_complexity)]
-    heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<S::PrimaryKey>, Option<G>>, usize)>>,
-    iters: Vec<EStreamImpl<'stream, S, G, F>>,
-    item_buf: Option<(Arc<S::PrimaryKey>, Option<G>)>,
+    heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<S::PrimaryKey>, Option<S>>, usize)>>,
+    iters: Vec<EStreamImpl<'stream, S>>,
+    item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
 }
 
-impl<'stream, S, G, F> MergeStream<'stream, S, G, F>
+impl<'stream, S> MergeStream<'stream, S>
 where
     S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
     pub(crate) async fn new(
-        mut iters: Vec<EStreamImpl<'stream, S, G, F>>,
+        mut iters: Vec<EStreamImpl<'stream, S>>,
     ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let mut heap = BinaryHeap::new();
 
@@ -62,13 +58,11 @@ where
     }
 }
 
-impl<'stream, S, G, F> Stream for MergeStream<'stream, S, G, F>
+impl<'stream, S> Stream for MergeStream<'stream, S>
 where
     S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<G>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -110,45 +104,119 @@ mod tests {
 
     use crate::{
         stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
-        user::UserInner,
+        tests::UserInner,
     };
 
     #[test]
     fn iter() {
         block_on(async {
             let iter_1 = BufStream::new(vec![
-                (Arc::new(1), Some(UserInner::new(1, "1".to_string()))),
+                (
+                    Arc::new(1),
+                    Some(UserInner::new(
+                        1,
+                        "1".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                ),
                 (Arc::new(3), None),
             ]);
             let iter_2 = BufStream::new(vec![
                 (Arc::new(1), None),
-                (Arc::new(2), Some(UserInner::new(2, "2".to_string()))),
+                (
+                    Arc::new(2),
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                ),
                 (Arc::new(4), None),
             ]);
             let iter_3 = BufStream::new(vec![
-                (Arc::new(5), Some(UserInner::new(3, "3".to_string()))),
+                (
+                    Arc::new(5),
+                    Some(UserInner::new(
+                        3,
+                        "3".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                ),
                 (Arc::new(6), None),
             ]);
 
-            let mut iterator =
-                MergeStream::<UserInner, UserInner, fn(&UserInner) -> UserInner>::new(vec![
-                    EStreamImpl::Buf(iter_3),
-                    EStreamImpl::Buf(iter_2),
-                    EStreamImpl::Buf(iter_1),
-                ])
-                .await
-                .unwrap();
+            let mut iterator = MergeStream::<UserInner>::new(vec![
+                EStreamImpl::Buf(iter_3),
+                EStreamImpl::Buf(iter_2),
+                EStreamImpl::Buf(iter_1),
+            ])
+            .await
+            .unwrap();
 
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new(2), Some(UserInner::new(2, "2".to_string())))
+                (
+                    Arc::new(2),
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(3), None));
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(4), None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new(5), Some(UserInner::new(3, "3".to_string())))
+                (
+                    Arc::new(5),
+                    Some(UserInner::new(
+                        3,
+                        "3".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(6), None));
         });

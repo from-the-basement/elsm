@@ -1,4 +1,5 @@
 mod arc;
+mod boolean;
 mod num;
 mod option;
 mod string;

@@ -7,7 +7,7 @@ use arrow::{
 
 use crate::serdes::{Decode, Encode};
 
-pub trait Schema: Debug + Encode + Decode + 'static {
+pub trait Schema: Debug + Clone + Encode + Decode + 'static {
     type PrimaryKey: Debug + Clone + Ord + Hash + Encode + Decode + 'static;
     type Builder: Builder<Self> + Send;
     type PrimaryKeyArray: Array;

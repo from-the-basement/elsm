@@ -11,7 +11,7 @@ use pin_project::pin_project;
 
 use crate::{
     schema::Schema,
-    stream::{EInnerStreamImpl, StreamError},
+    stream::{EStreamImpl, StreamError},
     utils::CmpKeyItem,
 };
 
@@ -22,7 +22,7 @@ where
 {
     #[allow(clippy::type_complexity)]
     heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<S::PrimaryKey>, Option<S>>, usize)>>,
-    iters: Vec<EInnerStreamImpl<'stream, S>>,
+    iters: Vec<EStreamImpl<'stream, S>>,
     item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
 }
 
@@ -31,7 +31,7 @@ where
     S: Schema,
 {
     pub(crate) async fn new(
-        mut iters: Vec<EInnerStreamImpl<'stream, S>>,
+        mut iters: Vec<EStreamImpl<'stream, S>>,
     ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let mut heap = BinaryHeap::new();
 

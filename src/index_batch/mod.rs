@@ -60,7 +60,7 @@ mod tests {
     use executor::ExecutorBuilder;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, user::UserInner,
+        mem_table::MemTable, oracle::LocalOracle, tests::UserInner,
         wal::provider::in_mem::InMemProvider, Db,
     };
 
@@ -69,9 +69,41 @@ mod tests {
         ExecutorBuilder::new().build().unwrap().block_on(async {
             let mut mem_table = MemTable::default();
 
-            mem_table.insert(Arc::new(1), 0, Some(UserInner::new(1, "1".to_string())));
+            mem_table.insert(
+                Arc::new(1),
+                0,
+                Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
+            );
             mem_table.insert(Arc::new(1), 1, None);
-            mem_table.insert(Arc::new(2), 0, Some(UserInner::new(2, "2".to_string())));
+            mem_table.insert(
+                Arc::new(2),
+                0,
+                Some(UserInner::new(
+                    2,
+                    "2".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
+            );
             mem_table.insert(Arc::new(3), 0, None);
 
             let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
@@ -80,13 +112,37 @@ mod tests {
 
             assert_eq!(
                 batch.find(&Arc::new(1), &0).await,
-                Some(Some(UserInner::new(1, "1".to_string())))
+                Some(Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                )))
             );
             assert_eq!(batch.find(&Arc::new(1), &1).await, Some(None));
 
             assert_eq!(
                 batch.find(&Arc::new(2), &0).await,
-                Some(Some(UserInner::new(2, "2".to_string())))
+                Some(Some(UserInner::new(
+                    2,
+                    "2".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                )))
             );
             assert_eq!(batch.find(&Arc::new(3), &0).await, Some(None));
         });

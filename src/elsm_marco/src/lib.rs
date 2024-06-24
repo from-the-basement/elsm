@@ -41,12 +41,19 @@ pub fn elsm_schema(_args: TokenStream, input: TokenStream) -> TokenStream {
         if let Fields::Named(fields) = &data_struct.fields {
             for field in fields.named.iter() {
                 let field_name = field.ident.as_ref().unwrap();
+                let mut is_string = false;
                 let (field_ty, mapped_type, array_ty, builder_ty) = match &field.ty {
-                    Type::Path(type_path) if type_path.path.is_ident("u64") => (
-                        quote!(u64),
-                        quote!(DataType::UInt64),
-                        quote!(UInt64Array),
-                        quote!(UInt64Builder),
+                    Type::Path(type_path) if type_path.path.is_ident("u8") => (
+                        quote!(u8),
+                        quote!(DataType::UInt8),
+                        quote!(UInt8Array),
+                        quote!(UInt8Builder),
+                    ),
+                    Type::Path(type_path) if type_path.path.is_ident("u16") => (
+                        quote!(u16),
+                        quote!(DataType::UInt16),
+                        quote!(UInt16Array),
+                        quote!(UInt16Builder),
                     ),
                     Type::Path(type_path) if type_path.path.is_ident("u32") => (
                         quote!(u32),
@@ -54,12 +61,45 @@ pub fn elsm_schema(_args: TokenStream, input: TokenStream) -> TokenStream {
                         quote!(UInt32Array),
                         quote!(UInt32Builder),
                     ),
-                    Type::Path(type_path) if type_path.path.is_ident("String") => (
-                        quote!(String),
-                        quote!(DataType::Utf8),
-                        quote!(StringArray),
-                        quote!(StringBuilder),
+                    Type::Path(type_path) if type_path.path.is_ident("u64") => (
+                        quote!(u64),
+                        quote!(DataType::UInt64),
+                        quote!(UInt64Array),
+                        quote!(UInt64Builder),
                     ),
+                    Type::Path(type_path) if type_path.path.is_ident("i8") => (
+                        quote!(i8),
+                        quote!(DataType::Int8),
+                        quote!(Int8Array),
+                        quote!(Int8Builder),
+                    ),
+                    Type::Path(type_path) if type_path.path.is_ident("i16") => (
+                        quote!(i16),
+                        quote!(DataType::Int16),
+                        quote!(Int16Array),
+                        quote!(Int16Builder),
+                    ),
+                    Type::Path(type_path) if type_path.path.is_ident("i32") => (
+                        quote!(i32),
+                        quote!(DataType::Int32),
+                        quote!(Int32Array),
+                        quote!(Int32Builder),
+                    ),
+                    Type::Path(type_path) if type_path.path.is_ident("i64") => (
+                        quote!(i64),
+                        quote!(DataType::Int64),
+                        quote!(Int64Array),
+                        quote!(Int64Builder),
+                    ),
+                    Type::Path(type_path) if type_path.path.is_ident("String") => {
+                        is_string = true;
+                        (
+                            quote!(String),
+                            quote!(DataType::Utf8),
+                            quote!(StringArray),
+                            quote!(StringBuilder),
+                        )
+                    }
                     Type::Path(type_path) if type_path.path.is_ident("bool") => (
                         quote!(bool),
                         quote!(DataType::Boolean),
@@ -69,51 +109,30 @@ pub fn elsm_schema(_args: TokenStream, input: TokenStream) -> TokenStream {
                     _ => unreachable!(),
                 };
 
-                field_definitions.push(
-                    quote! {
-                        Field::new(stringify!(#field_name), #mapped_type, false),
-                    }
-                    .into(),
-                );
-                new_args_definitions.push(
-                    quote! {
-                        #field_name: #field_ty,
-                    }
-                    .into(),
-                );
-                new_fields_definitions.push(
-                    quote! {
-                        #field_name,
-                    }
-                    .into(),
-                );
-                encode_method_fields.push(
-                    quote! {
-                        self.inner.#field_name.encode(writer).await?;
-                    }
-                    .into(),
-                );
-                decode_method_fields.push(
-                    quote! {
-                        let #field_name = #field_ty::decode(reader).await?;
-                    }
-                    .into(),
-                );
-                encode_size_fields.push(
-                    quote! {
-                        + self.inner.#field_name.size()
-                    }
-                    .into(),
-                );
+                field_definitions.push(quote! {
+                    Field::new(stringify!(#field_name), #mapped_type, false),
+                });
+                new_args_definitions.push(quote! {
+                    #field_name: #field_ty,
+                });
+                new_fields_definitions.push(quote! {
+                    #field_name,
+                });
+                encode_method_fields.push(quote! {
+                    self.inner.#field_name.encode(writer).await?;
+                });
+                decode_method_fields.push(quote! {
+                    let #field_name = #field_ty::decode(reader).await?;
+                });
+                encode_size_fields.push(quote! {
+                    + self.inner.#field_name.size()
+                });
                 match attrs.parse_field(field) {
                     Ok(false) => {
-                        inner_field_definitions.push(
-                            quote! {
-                                Field::new(stringify!(#field_name), #mapped_type, false),
-                            }
-                            .into(),
-                        );
-                        init_inner_builders.push(quote! { Box::new(#builder_ty::new()) });
+                        inner_field_definitions.push(quote! {
+                            Field::new(stringify!(#field_name), #mapped_type, false),
+                        });
+                        init_inner_builders.push(quote! { Box::new(#builder_ty::new()), });
 
                         let array_name = Ident::new(
                             &format!("array_{}", normal_field_count),
@@ -127,11 +146,19 @@ pub fn elsm_schema(_args: TokenStream, input: TokenStream) -> TokenStream {
                                 .unwrap();
                             let #field_name = #array_name.value(offset).to_owned();
                         });
-                        builder_append_value.push(quote! {
-                            self.inner
-                                .field_builder::<#builder_ty>(#normal_field_count)
-                                .unwrap()
-                                .append_value(&schema.inner.#field_name);
+                        builder_append_value.push({
+                            let field = if is_string {
+                                quote! { &schema.inner.#field_name }
+                            } else {
+                                quote! { schema.inner.#field_name }
+                            };
+
+                            quote! {
+                                self.inner
+                                    .field_builder::<#builder_ty>(#normal_field_count)
+                                    .unwrap()
+                                    .append_value(#field);
+                            }
                         });
                         builder_append_null.push(quote! {
                             self.inner
@@ -146,8 +173,7 @@ pub fn elsm_schema(_args: TokenStream, input: TokenStream) -> TokenStream {
                             name: field_name.clone(),
                             schema_field_token: quote! {
                                 Field::new(stringify!(#field_name), #mapped_type, false),
-                            }
-                            .into(),
+                            },
                             base_ty: field.ty.clone(),
                             array_ty,
                             builder_ty,
@@ -179,14 +205,8 @@ pub fn elsm_schema(_args: TokenStream, input: TokenStream) -> TokenStream {
         struct_name.span(),
     );
 
-    let inner_struct_name = Ident::new(
-        &format!("{}Inner", struct_name.to_string()),
-        struct_name.span(),
-    );
-    let builder_name = Ident::new(
-        &format!("{}Builder", struct_name.to_string()),
-        struct_name.span(),
-    );
+    let inner_struct_name = Ident::new(&format!("{}Inner", struct_name), struct_name.span());
+    let builder_name = Ident::new(&format!("{}Builder", struct_name), struct_name.span());
 
     let gen = quote! {
         lazy_static! {

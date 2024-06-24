@@ -44,14 +44,10 @@ where
         }
     }
 
-    pub async fn get<G, F>(&self, key: &Arc<S::PrimaryKey>, f: F) -> Option<G>
-    where
-        F: Fn(&S) -> G + Sync + 'static,
-        G: Send + 'static,
-    {
+    pub async fn get(&self, key: &Arc<S::PrimaryKey>) -> Option<S> {
         match self.local.get(key).and_then(|v| v.as_ref()) {
-            Some(v) => Some((f)(v)),
-            None => self.share.get(key, &self.read_at, f).await,
+            Some(v) => Some(v.clone()),
+            None => self.share.get(key, &self.read_at).await,
         }
     }
 
@@ -86,20 +82,12 @@ where
         Ok(())
     }
 
-    pub async fn range<G, F>(
+    pub async fn range(
         &self,
         lower: Option<&Arc<S::PrimaryKey>>,
         upper: Option<&Arc<S::PrimaryKey>>,
-        f: F,
-    ) -> Result<MergeStream<S, G, F>, StreamError<S::PrimaryKey, S>>
-    where
-        G: Send + Sync + 'static,
-        F: Fn(&S) -> G + Send + Sync + 'static + Copy,
-    {
-        let mut iters = self
-            .share
-            .inner_range(lower, upper, &self.read_at, f)
-            .await?;
+    ) -> Result<MergeStream<S>, StreamError<S::PrimaryKey, S>> {
+        let mut iters = self.share.inner_range(lower, upper, &self.read_at).await?;
         let range = self
             .local
             .range::<Arc<S::PrimaryKey>, (Bound<&Arc<S::PrimaryKey>>, Bound<&Arc<S::PrimaryKey>>)>(
@@ -110,7 +98,6 @@ where
             );
         let iter = TransactionStream {
             range,
-            f,
             _p: Default::default(),
         };
         iters.insert(0, EStreamImpl::TransactionInner(iter));
@@ -120,32 +107,27 @@ where
 }
 
 #[pin_project]
-pub(crate) struct TransactionStream<'a, S, G, F, E>
+pub(crate) struct TransactionStream<'a, S, E>
 where
     S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
     #[pin]
     range: btree_map::Range<'a, Arc<S::PrimaryKey>, Option<S>>,
-    f: F,
     _p: PhantomData<E>,
 }
 
-impl<'a, S, E, G, F> Stream for TransactionStream<'a, S, G, F, E>
+impl<'a, S, E> Stream for TransactionStream<'a, S, E>
 where
     S: Schema,
-    G: Send + Sync + 'static,
-    F: Fn(&S) -> G + Sync + 'static,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<G>), E>;
+    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), E>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         Poll::Ready(
             this.range
                 .next()
-                .map(|(key, value)| (key.clone(), value.as_ref().map(|v| (this.f)(v))))
+                .map(|(key, value)| (key.clone(), value.clone()))
                 .map(Ok),
         )
     }
