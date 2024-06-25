@@ -1,4 +1,4 @@
-use std::{cmp, collections::VecDeque, fmt::Debug, fs::File, pin::pin, sync::Arc};
+use std::{cmp, collections::VecDeque, fmt::Debug, fs::File, mem, pin::pin, sync::Arc};
 
 use executor::{fs, futures::StreamExt};
 use futures::channel::oneshot;
@@ -12,7 +12,7 @@ use crate::{
     scope::Scope,
     serdes::Encode,
     stream::{
-        level_stream::LevelStream, merge_inner_stream::MergeInnerStream, table_stream::TableStream,
+        level_stream::LevelStream, merge_stream::MergeStream, table_stream::TableStream,
         EStreamImpl, StreamError,
     },
     version::{edit::VersionEdit, set::VersionSet, Version, VersionError, MAX_LEVEL},
@@ -53,7 +53,9 @@ where
         if guard.len() > self.option.immutable_chunk_num {
             let excess = guard.split_off(self.option.immutable_chunk_num);
 
-            if let Some(scope) = Self::minor_compaction(&self.option, excess).await? {
+            if let Some(scope) =
+                Self::minor_compaction(&self.option, mem::replace(&mut guard, excess)).await?
+            {
                 let version_ref = self.version_set.current().await;
                 let mut version_edits = vec![];
                 let mut delete_gens = vec![];
@@ -127,8 +129,8 @@ where
     pub(crate) async fn major_compaction(
         version: &Version<S>,
         option: &DbOption,
-        mut min: &Arc<S::PrimaryKey>,
-        mut max: &Arc<S::PrimaryKey>,
+        mut min: &S::PrimaryKey,
+        mut max: &S::PrimaryKey,
         version_edits: &mut Vec<VersionEdit<S::PrimaryKey>>,
         delete_gens: &mut Vec<ProcessUniqueId>,
     ) -> Result<(), CompactionError<S>> {
@@ -211,7 +213,7 @@ where
                     .await
                     .map_err(CompactionError::Stream)?,
             ));
-            let stream = MergeInnerStream::<S>::new(streams)
+            let stream = MergeStream::<S>::new(streams)
                 .await
                 .map_err(CompactionError::Stream)?;
 
@@ -278,8 +280,8 @@ where
         version_edits: &mut Vec<VersionEdit<S::PrimaryKey>>,
         level: usize,
         builder: &mut S::Builder,
-        min: &mut Option<Arc<S::PrimaryKey>>,
-        max: &mut Option<Arc<S::PrimaryKey>>,
+        min: &mut Option<S::PrimaryKey>,
+        max: &mut Option<S::PrimaryKey>,
     ) -> Result<(), CompactionError<S>> {
         assert!(min.is_some());
         assert!(max.is_some());
@@ -328,7 +330,6 @@ mod tests {
     use std::{
         collections::{BTreeMap, VecDeque},
         fs::File,
-        sync::Arc,
     };
 
     use executor::ExecutorBuilder;
@@ -359,7 +360,7 @@ mod tests {
         for (offset, (schema, is_deleted)) in items.into_iter().enumerate() {
             index.insert(
                 InternalKey {
-                    key: Arc::new(schema.primary_key()),
+                    key: schema.primary_key(),
                     ts: 0,
                 },
                 offset as u32,
@@ -434,8 +435,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            assert_eq!(scope.min, Arc::new(1));
-            assert_eq!(scope.max, Arc::new(6));
+            assert_eq!(scope.min, 1);
+            assert_eq!(scope.max, 6);
         })
     }
 
@@ -559,33 +560,33 @@ mod tests {
                 clean_sender: sender,
             };
             version.level_slice[0].push(Scope {
-                min: Arc::new(1),
-                max: Arc::new(3),
+                min: 1,
+                max: 3,
                 gen: table_gen_1,
             });
             version.level_slice[0].push(Scope {
-                min: Arc::new(4),
-                max: Arc::new(6),
+                min: 4,
+                max: 6,
                 gen: table_gen_2,
             });
             version.level_slice[1].push(Scope {
-                min: Arc::new(1),
-                max: Arc::new(3),
+                min: 1,
+                max: 3,
                 gen: table_gen_3,
             });
             version.level_slice[1].push(Scope {
-                min: Arc::new(4),
-                max: Arc::new(6),
+                min: 4,
+                max: 6,
                 gen: table_gen_4,
             });
             version.level_slice[1].push(Scope {
-                min: Arc::new(7),
-                max: Arc::new(9),
+                min: 7,
+                max: 9,
                 gen: table_gen_5,
             });
 
-            let min = Arc::new(2);
-            let max = Arc::new(5);
+            let min = 2;
+            let max = 5;
             let mut version_edits = Vec::new();
 
             Compactor::<UserInner>::major_compaction(
@@ -601,8 +602,8 @@ mod tests {
 
             if let VersionEdit::Add { level, scope } = &version_edits[0] {
                 assert_eq!(*level, 1);
-                assert_eq!(scope.min, Arc::new(1));
-                assert_eq!(scope.max, Arc::new(6));
+                assert_eq!(scope.min, 1);
+                assert_eq!(scope.max, 6);
             }
             assert_eq!(
                 version_edits[1..5].to_vec(),

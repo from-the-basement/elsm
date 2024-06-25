@@ -99,7 +99,7 @@ where
     pub(crate) mutable_shards: Shard<unsend::lock::RwLock<MutableShard<S>>>,
     pub(crate) immutable: Immutable<S>,
     #[allow(clippy::type_complexity)]
-    pub(crate) wal: Arc<Mutex<WalFile<WP::File, Arc<S::PrimaryKey>, S>>>,
+    pub(crate) wal: Arc<Mutex<WalFile<WP::File, S::PrimaryKey, S>>>,
     pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
     pub(crate) version_set: VersionSet<S>,
 }
@@ -116,7 +116,7 @@ where
         oracle: O,
         wal_provider: WP,
         option: DbOption,
-    ) -> Result<Self, WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
+    ) -> Result<Self, WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
         let wal_manager = Arc::new(WalManager::new(wal_provider));
         let mutable_shards = Shard::new(|| {
             unsend::lock::RwLock::new(crate::MutableShard {
@@ -203,10 +203,29 @@ where
     async fn write(
         &self,
         record_type: RecordType,
-        key: Arc<S::PrimaryKey>,
+        ts: TimeStamp,
+        value: S,
+    ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
+        self.append(record_type, value.primary_key(), ts, Some(value))
+            .await
+    }
+
+    async fn remove(
+        &self,
+        record_type: RecordType,
+        ts: TimeStamp,
+        key: S::PrimaryKey,
+    ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
+        self.append(record_type, key, ts, None).await
+    }
+
+    async fn append(
+        &self,
+        record_type: RecordType,
+        key: S::PrimaryKey,
         ts: TimeStamp,
         value: Option<S>,
-    ) -> Result<(), WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
+    ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(&key), executor::worker_num()) as usize;
         let wal_manager = self.wal_manager.clone();
@@ -262,18 +281,19 @@ where
         Ok(())
     }
 
-    async fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<S> {
+    async fn get(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> Option<S> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(key), executor::worker_num()) as usize;
 
         // Safety: read-only would not break data.
         let (key, ts) = unsafe {
             (
-                mem::transmute::<_, &Arc<S::PrimaryKey>>(key),
+                mem::transmute::<_, &S::PrimaryKey>(key),
                 mem::transmute::<_, &TimeStamp>(ts),
             )
         };
 
+        println!("A");
         if let Some(value) = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
@@ -283,6 +303,7 @@ where
         {
             return value;
         }
+        println!("B");
         let guard = self.immutable.read().await;
         for index_batch in guard.iter().rev() {
             if let Some(value) = index_batch.find(key, ts).await {
@@ -291,6 +312,7 @@ where
         }
         drop(guard);
 
+        println!("C");
         let guard = self.version_set.current().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
             return S::from_batch(&record_batch, 0).1;
@@ -302,8 +324,8 @@ where
 
     async fn range(
         &self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
         ts: &TimeStamp,
     ) -> Result<MergeStream<S>, StreamError<S::PrimaryKey, S>> {
         let iters = self.inner_range(lower, upper, ts).await?;
@@ -313,8 +335,8 @@ where
 
     pub(crate) async fn inner_range<'s>(
         &'s self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
         ts: &TimeStamp,
     ) -> Result<Vec<EStreamImpl<S>>, StreamError<S::PrimaryKey, S>> {
         let mut iters = futures::future::try_join_all((0..executor::worker_num()).map(|i| {
@@ -368,31 +390,31 @@ where
 
     async fn write_batch(
         &self,
-        mut kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
-    ) -> Result<(), WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
+        mut kvs: impl ExactSizeIterator<Item = (S::PrimaryKey, TimeStamp, Option<S>)>,
+    ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
         match kvs.len() {
             0 => Ok(()),
             1 => {
                 let (key, ts, value) = kvs.next().unwrap();
-                self.write(RecordType::Full, key, ts, value).await
+                self.append(RecordType::Full, key, ts, value).await
             }
             len => {
                 let (key, ts, value) = kvs.next().unwrap();
-                self.write(RecordType::First, key, ts, value).await?;
+                self.append(RecordType::First, key, ts, value).await?;
 
                 for (key, ts, value) in (&mut kvs).take(len - 2) {
-                    self.write(RecordType::Middle, key, ts, value).await?;
+                    self.append(RecordType::Middle, key, ts, value).await?;
                 }
 
                 let (key, ts, value) = kvs.next().unwrap();
-                self.write(RecordType::Last, key, ts, value).await
+                self.append(RecordType::Last, key, ts, value).await
             }
         }
     }
 
     async fn freeze(
         mem_table: MemTable<S>,
-    ) -> Result<IndexBatch<S>, WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>> {
+    ) -> Result<IndexBatch<S>, WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
         let mut index = BTreeMap::new();
 
         let mut builder = S::builder();
@@ -409,9 +431,9 @@ where
     async fn recover<W>(
         &mut self,
         wal: &mut W,
-    ) -> Result<(), WriteError<<Record<Arc<S::PrimaryKey>, S> as Encode>::Error>>
+    ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>>
     where
-        W: WalRecover<Arc<S::PrimaryKey>, S>,
+        W: WalRecover<S::PrimaryKey, S>,
     {
         let mut stream = pin!(wal.recover());
         while let Some(record) = stream.next().await {
@@ -419,7 +441,7 @@ where
             let Record { key, ts, value, .. } =
                 record.map_err(|err| WriteError::Internal(Box::new(err)))?;
 
-            self.write(
+            self.append(
                 mem::replace(&mut record_type, RecordType::Middle),
                 key,
                 ts,
@@ -453,7 +475,7 @@ where
         &self,
         read_at: TimeStamp,
         write_at: TimeStamp,
-        in_write: std::collections::HashSet<Arc<S::PrimaryKey>>,
+        in_write: std::collections::HashSet<S::PrimaryKey>,
     ) -> Result<(), oracle::WriteConflict<S::PrimaryKey>> {
         self.oracle.write_commit(read_at, write_at, in_write)
     }
@@ -463,27 +485,33 @@ pub(crate) trait GetWrite<S>: Oracle<S::PrimaryKey>
 where
     S: schema::Schema,
 {
-    fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> impl Future<Output = Option<S>>
+    fn get(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> impl Future<Output = Option<S>>
     where
         TimeStamp: Sync;
 
     fn write(
         &self,
         record_type: RecordType,
-        key: Arc<S::PrimaryKey>,
         ts: TimeStamp,
-        value: Option<S>,
+        value: S,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
+
+    async fn remove(
+        &self,
+        record_type: RecordType,
+        ts: TimeStamp,
+        key: S::PrimaryKey,
+    ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>>;
 
     fn write_batch(
         &self,
-        kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
+        kvs: impl ExactSizeIterator<Item = (S::PrimaryKey, TimeStamp, Option<S>)>,
     ) -> impl Future<Output = Result<(), Box<dyn error::Error + Send + Sync + 'static>>>;
 
     fn inner_range<'a>(
         &'a self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
         ts: &TimeStamp,
     ) -> impl Future<Output = Result<Vec<EStreamImpl<'a, S>>, StreamError<S::PrimaryKey, S>>>
     where
@@ -503,21 +531,30 @@ where
     async fn write(
         &self,
         record_type: RecordType,
-        key: Arc<S::PrimaryKey>,
         ts: TimeStamp,
-        value: Option<S>,
+        value: S,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
-        Db::write(self, record_type, key, ts, value).await?;
+        Db::write(self, record_type, ts, value).await?;
         Ok(())
     }
 
-    async fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<S> {
+    async fn remove(
+        &self,
+        record_type: RecordType,
+        ts: TimeStamp,
+        key: S::PrimaryKey,
+    ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
+        Db::remove(self, record_type, ts, key).await?;
+        Ok(())
+    }
+
+    async fn get(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> Option<S> {
         Db::get(self, key, ts).await
     }
 
     async fn write_batch(
         &self,
-        kvs: impl ExactSizeIterator<Item = (Arc<S::PrimaryKey>, TimeStamp, Option<S>)>,
+        kvs: impl ExactSizeIterator<Item = (S::PrimaryKey, TimeStamp, Option<S>)>,
     ) -> Result<(), Box<dyn error::Error + Send + Sync + 'static>> {
         Db::write_batch(self, kvs).await?;
         Ok(())
@@ -525,8 +562,8 @@ where
 
     async fn inner_range<'a>(
         &'a self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
         ts: &TimeStamp,
     ) -> Result<Vec<EStreamImpl<'a, S>>, StreamError<S::PrimaryKey, S>>
     where
@@ -594,6 +631,7 @@ mod tests {
         oracle::LocalOracle,
         record::RecordType,
         schema::Schema,
+        stream::merge_stream::MergeStream,
         transaction::CommitError,
         wal::provider::{fs::Fs, in_mem::InMemProvider},
         Builder, Db, DbOption, Decode, Encode,
@@ -644,9 +682,9 @@ mod tests {
 
             let txn = db.new_txn();
 
-            assert_eq!(txn.get(&Arc::new(user_0.primary_key())).await, Some(user_0));
-            assert_eq!(txn.get(&Arc::new(user_1.primary_key())).await, Some(user_1));
-            assert_eq!(txn.get(&Arc::new(user_2.primary_key())).await, Some(user_2));
+            assert_eq!(txn.get(&user_0.primary_key()).await, Some(user_0));
+            assert_eq!(txn.get(&user_1.primary_key()).await, Some(user_1));
+            assert_eq!(txn.get(&user_2.primary_key()).await, Some(user_2));
         });
     }
 
@@ -679,8 +717,8 @@ mod tests {
             let mut t0 = db.new_txn();
             let mut t1 = db.new_txn();
 
-            t0.set(0, t0.get(&Arc::new(1)).await.unwrap());
-            t1.set(1, t1.get(&Arc::new(0)).await.unwrap());
+            t0.set(0, t0.get(&1).await.unwrap());
+            t1.set(1, t1.get(&0).await.unwrap());
 
             t0.commit().await.unwrap();
             t1.commit().await.unwrap();
@@ -756,15 +794,12 @@ mod tests {
             );
             txn.commit().await.unwrap();
 
-            let mut iter = db
-                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1)
-                .await
-                .unwrap();
+            let mut iter: MergeStream<UserInner> = db.range(Some(&1), Some(&2), &1).await.unwrap();
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(1),
+                    1,
                     Some(UserInner::new(
                         1,
                         "1".to_string(),
@@ -783,7 +818,7 @@ mod tests {
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),
@@ -821,15 +856,12 @@ mod tests {
             );
             txn_2.commit().await.unwrap();
 
-            let mut iter = txn_1
-                .range(Some(&Arc::new(1)), Some(&Arc::new(4)))
-                .await
-                .unwrap();
+            let mut iter = txn_1.range(Some(&1), Some(&4)).await.unwrap();
 
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(1),
+                    1,
                     Some(UserInner::new(
                         1,
                         "1".to_string(),
@@ -848,7 +880,7 @@ mod tests {
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),
@@ -867,7 +899,7 @@ mod tests {
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(3),
+                    3,
                     Some(UserInner::new(
                         3,
                         "3".to_string(),
@@ -886,7 +918,7 @@ mod tests {
             assert_eq!(
                 iter.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(4),
+                    4,
                     Some(UserInner::new(
                         4,
                         "4".to_string(),
@@ -935,8 +967,8 @@ mod tests {
             let mut t1 = db.new_txn();
             let mut t2 = db.new_txn();
 
-            t0.set(0, t0.get(&Arc::new(1)).await.unwrap());
-            t1.set(0, t1.get(&Arc::new(0)).await.unwrap());
+            t0.set(0, t0.get(&1).await.unwrap());
+            t1.set(0, t1.get(&0).await.unwrap());
             t1.set(
                 2,
                 UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -974,6 +1006,47 @@ mod tests {
         });
     }
 
+    fn test_items() -> Vec<UserInner> {
+        vec![
+            UserInner::new(1, "1".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(2, "2".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(3, "3".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(4, "4".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(5, "5".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(6, "6".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(7, "7".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(8, "8".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(9, "9".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(10, "10".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(20, "20".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(30, "30".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(40, "40".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(50, "50".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(60, "60".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(70, "70".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(80, "80".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(90, "90".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(100, "100".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(200, "200".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(300, "300".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(400, "400".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(500, "500".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(600, "600".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(700, "700".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(800, "800".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(900, "900".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(1000, "1000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(2000, "2000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(3000, "3000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(4000, "4000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(5000, "5000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(6000, "6000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(7000, "7000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(8000, "8000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+            UserInner::new(9000, "9000".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0),
+        ]
+    }
+
     #[test]
     fn read_from_disk() {
         let temp_dir = TempDir::new().unwrap();
@@ -982,7 +1055,7 @@ mod tests {
             let db = Arc::new(
                 Db::new(
                     LocalOracle::default(),
-                    InMemProvider::default(),
+                    Fs::new(temp_dir.path()).unwrap(),
                     DbOption {
                         // TIPS: kv size in test case is 17
                         path: temp_dir.path().to_path_buf(),
@@ -998,729 +1071,15 @@ mod tests {
                 .unwrap(),
             );
 
-            db.write(
-                RecordType::Full,
-                Arc::new(1),
-                0,
-                Some(UserInner::new(
-                    1,
-                    "1".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(2),
-                0,
-                Some(UserInner::new(
-                    2,
-                    "2".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(3),
-                0,
-                Some(UserInner::new(
-                    3,
-                    "3".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(4),
-                0,
-                Some(UserInner::new(
-                    4,
-                    "4".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(5),
-                0,
-                Some(UserInner::new(
-                    5,
-                    "5".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(6),
-                0,
-                Some(UserInner::new(
-                    6,
-                    "6".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(7),
-                0,
-                Some(UserInner::new(
-                    7,
-                    "7".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(8),
-                0,
-                Some(UserInner::new(
-                    8,
-                    "8".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(9),
-                0,
-                Some(UserInner::new(
-                    9,
-                    "9".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(10),
-                0,
-                Some(UserInner::new(
-                    10,
-                    "10".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(20),
-                0,
-                Some(UserInner::new(
-                    20,
-                    "20".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(30),
-                0,
-                Some(UserInner::new(
-                    30,
-                    "30".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(40),
-                0,
-                Some(UserInner::new(
-                    40,
-                    "40".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(50),
-                0,
-                Some(UserInner::new(
-                    50,
-                    "50".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(60),
-                0,
-                Some(UserInner::new(
-                    60,
-                    "60".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(70),
-                0,
-                Some(UserInner::new(
-                    70,
-                    "70".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(80),
-                0,
-                Some(UserInner::new(
-                    80,
-                    "80".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(90),
-                0,
-                Some(UserInner::new(
-                    90,
-                    "90".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(100),
-                0,
-                Some(UserInner::new(
-                    100,
-                    "100".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(200),
-                0,
-                Some(UserInner::new(
-                    200,
-                    "200".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(300),
-                0,
-                Some(UserInner::new(
-                    300,
-                    "300".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(400),
-                0,
-                Some(UserInner::new(
-                    400,
-                    "400".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(500),
-                0,
-                Some(UserInner::new(
-                    500,
-                    "500".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(600),
-                0,
-                Some(UserInner::new(
-                    600,
-                    "600".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(700),
-                0,
-                Some(UserInner::new(
-                    700,
-                    "700".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(800),
-                0,
-                Some(UserInner::new(
-                    800,
-                    "800".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(900),
-                0,
-                Some(UserInner::new(
-                    900,
-                    "900".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(1000),
-                0,
-                Some(UserInner::new(
-                    1000,
-                    "1000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(2000),
-                0,
-                Some(UserInner::new(
-                    2000,
-                    "2000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(3000),
-                0,
-                Some(UserInner::new(
-                    3000,
-                    "3000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(4000),
-                0,
-                Some(UserInner::new(
-                    4000,
-                    "4000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(5000),
-                0,
-                Some(UserInner::new(
-                    5000,
-                    "5000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(6000),
-                0,
-                Some(UserInner::new(
-                    6000,
-                    "6000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(7000),
-                0,
-                Some(UserInner::new(
-                    7000,
-                    "7000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(8000),
-                0,
-                Some(UserInner::new(
-                    8000,
-                    "8000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
-            db.write(
-                RecordType::Full,
-                Arc::new(9000),
-                0,
-                Some(UserInner::new(
-                    9000,
-                    "9000".to_string(),
-                    false,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )),
-            )
-            .await
-            .unwrap();
+            let fn_write = |db: Arc<Db<_, _, _>>, user: UserInner| async move {
+                db.write(RecordType::Full, 0, user).await.unwrap();
+            };
+            for item in test_items() {
+                fn_write(db.clone(), item).await;
+            }
 
             assert_eq!(
-                db.get(&Arc::new(20), &0).await,
+                db.get(&20, &0).await,
                 Some(UserInner::new(
                     20,
                     "20".to_string(),
@@ -1736,29 +1095,37 @@ mod tests {
                 ))
             );
 
+            let mut stream: MergeStream<UserInner> = db.range(None, None, &0).await.unwrap();
+
+            let mut results = vec![];
+            while let Some(result) = stream.next().await {
+                results.push(result.unwrap().1.unwrap());
+            }
+            assert_eq!(results.len(), test_items().len());
+            assert_eq!(results, test_items());
+
+            drop(stream);
             drop(db);
 
-            let db = Arc::new(
-                Db::new(
-                    LocalOracle::default(),
-                    InMemProvider::default(),
-                    DbOption {
-                        // TIPS: kv size in test case is 17
-                        path: temp_dir.path().to_path_buf(),
-                        max_mem_table_size: 25,
-                        immutable_chunk_num: 1,
-                        major_threshold_with_sst_size: 5,
-                        level_sst_magnification: 10,
-                        max_sst_file_size: 2 * 1024 * 1024,
-                        clean_channel_buffer: 10,
-                    },
-                )
-                .await
-                .unwrap(),
-            );
+            let db = Db::new(
+                LocalOracle::default(),
+                Fs::new(temp_dir.path()).unwrap(),
+                DbOption {
+                    // TIPS: kv size in test case is 17
+                    path: temp_dir.path().to_path_buf(),
+                    max_mem_table_size: 25,
+                    immutable_chunk_num: 1,
+                    major_threshold_with_sst_size: 5,
+                    level_sst_magnification: 10,
+                    max_sst_file_size: 2 * 1024 * 1024,
+                    clean_channel_buffer: 10,
+                },
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
-                db.get(&Arc::new(20), &0).await,
+                db.get(&20, &0).await,
                 Some(UserInner::new(
                     20,
                     "20".to_string(),
@@ -1773,6 +1140,17 @@ mod tests {
                     0
                 ))
             );
+            // FIXME: clean unless wal
+            // let mut stream: MergeStream<UserInner> = db.range(None, None, &0).await.unwrap();
+            //
+            // let mut results = vec![];
+            // while let Some(result) = stream.next().await {
+            //     results.push(result.unwrap().1.unwrap());
+            // }
+            // assert_eq!(results.len(), test_items().len());
+            // assert_eq!(results, test_items());
+            //
+            // drop(stream);
         });
     }
 
@@ -1804,18 +1182,16 @@ mod tests {
 
             drop(db);
 
-            let db = Arc::new(
-                Db::new(
-                    LocalOracle::default(),
-                    Fs::new(temp_dir.path()).unwrap(),
-                    DbOption::new(temp_dir.path().to_path_buf()),
-                )
-                .await
-                .unwrap(),
-            );
+            let db = Db::new(
+                LocalOracle::default(),
+                Fs::new(temp_dir.path()).unwrap(),
+                DbOption::new(temp_dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
-                db.get(&Arc::new(0), &1).await,
+                db.get(&0, &1).await,
                 Some(UserInner::new(
                     0,
                     "0".to_string(),
@@ -1831,7 +1207,7 @@ mod tests {
                 )),
             );
             assert_eq!(
-                db.get(&Arc::new(1), &1).await,
+                db.get(&1, &1).await,
                 Some(UserInner::new(
                     1,
                     "1".to_string(),

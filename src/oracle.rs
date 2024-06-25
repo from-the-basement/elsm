@@ -5,7 +5,7 @@ use std::{
     ops::Bound,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Mutex,
     },
 };
 
@@ -27,18 +27,18 @@ where
         &self,
         read_at: TimeStamp,
         write_at: TimeStamp,
-        in_write: HashSet<Arc<K>>,
+        in_write: HashSet<K>,
     ) -> Result<(), WriteConflict<K>>;
 }
 
 #[derive(Debug, Error)]
 #[error("transaction write conflict: {keys:?}")]
 pub struct WriteConflict<K> {
-    keys: Vec<Arc<K>>,
+    keys: Vec<K>,
 }
 
 impl<K> WriteConflict<K> {
-    pub fn to_keys(self) -> Vec<Arc<K>> {
+    pub fn to_keys(self) -> Vec<K> {
         self.keys
     }
 }
@@ -50,7 +50,7 @@ where
 {
     now: AtomicU64,
     in_read: Mutex<BTreeMap<u64, usize>>,
-    committed_txns: Mutex<BTreeMap<u64, HashSet<Arc<K>>>>,
+    committed_txns: Mutex<BTreeMap<u64, HashSet<K>>>,
 }
 
 impl<K> Default for LocalOracle<K>
@@ -68,7 +68,7 @@ where
 
 impl<K> Oracle<K> for LocalOracle<K>
 where
-    K: Ord + Hash,
+    K: Ord + Hash + Clone,
 {
     fn start_read(&self) -> TimeStamp {
         let mut in_read = self.in_read.lock().unwrap();
@@ -106,7 +106,7 @@ where
         &self,
         read_at: TimeStamp,
         write_at: TimeStamp,
-        in_write: HashSet<Arc<K>>,
+        in_write: HashSet<K>,
     ) -> Result<(), WriteConflict<K>> {
         let mut committed_txns = self.committed_txns.lock().unwrap();
         let conflicts: Vec<_> = committed_txns

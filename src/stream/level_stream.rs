@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -21,8 +20,8 @@ pub(crate) struct LevelStream<'stream, S>
 where
     S: Schema,
 {
-    lower: Option<Arc<S::PrimaryKey>>,
-    upper: Option<Arc<S::PrimaryKey>>,
+    lower: Option<S::PrimaryKey>,
+    upper: Option<S::PrimaryKey>,
     option: &'stream DbOption,
     gens: VecDeque<ProcessUniqueId>,
     stream: Option<TableStream<'stream, S>>,
@@ -35,8 +34,8 @@ where
     pub(crate) async fn new(
         option: &'stream DbOption,
         gens: Vec<ProcessUniqueId>,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
     ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let mut gens = VecDeque::from(gens);
         let mut stream = None;
@@ -59,7 +58,7 @@ impl<S> Stream for LevelStream<'_, S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(stream) = &mut self.stream {

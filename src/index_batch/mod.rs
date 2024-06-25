@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, Bound},
     fmt::Debug,
     iter::Iterator,
-    sync::Arc,
 };
 
 use arrow::array::RecordBatch;
@@ -24,7 +23,7 @@ impl<S> IndexBatch<S>
 where
     S: Schema,
 {
-    pub(crate) async fn find(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<Option<S>> {
+    pub(crate) async fn find(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> Option<Option<S>> {
         let internal_key = InternalKey {
             key: key.clone(),
             ts: *ts,
@@ -43,7 +42,7 @@ where
         None
     }
 
-    pub(crate) fn scope(&self) -> Option<(&Arc<S::PrimaryKey>, &Arc<S::PrimaryKey>)> {
+    pub(crate) fn scope(&self) -> Option<(&S::PrimaryKey, &S::PrimaryKey)> {
         if let (Some((min, _)), Some((max, _))) =
             (self.index.first_key_value(), self.index.last_key_value())
         {
@@ -55,8 +54,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use executor::ExecutorBuilder;
 
     use crate::{
@@ -70,7 +67,7 @@ mod tests {
             let mut mem_table = MemTable::default();
 
             mem_table.insert(
-                Arc::new(1),
+                1,
                 0,
                 Some(UserInner::new(
                     1,
@@ -86,9 +83,9 @@ mod tests {
                     0,
                 )),
             );
-            mem_table.insert(Arc::new(1), 1, None);
+            mem_table.insert(1, 1, None);
             mem_table.insert(
-                Arc::new(2),
+                2,
                 0,
                 Some(UserInner::new(
                     2,
@@ -104,14 +101,14 @@ mod tests {
                     0,
                 )),
             );
-            mem_table.insert(Arc::new(3), 0, None);
+            mem_table.insert(3, 0, None);
 
             let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
                 .await
                 .unwrap();
 
             assert_eq!(
-                batch.find(&Arc::new(1), &0).await,
+                batch.find(&1, &0).await,
                 Some(Some(UserInner::new(
                     1,
                     "1".to_string(),
@@ -126,10 +123,10 @@ mod tests {
                     0
                 )))
             );
-            assert_eq!(batch.find(&Arc::new(1), &1).await, Some(None));
+            assert_eq!(batch.find(&1, &1).await, Some(None));
 
             assert_eq!(
-                batch.find(&Arc::new(2), &0).await,
+                batch.find(&2, &0).await,
                 Some(Some(UserInner::new(
                     2,
                     "2".to_string(),
@@ -144,7 +141,7 @@ mod tests {
                     0
                 )))
             );
-            assert_eq!(batch.find(&Arc::new(3), &0).await, Some(None));
+            assert_eq!(batch.find(&3, &0).await, Some(None));
         });
     }
 }

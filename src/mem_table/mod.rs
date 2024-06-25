@@ -1,6 +1,6 @@
 pub(crate) mod stream;
 
-use std::{cmp, cmp::Ordering, collections::BTreeMap, ops::Bound, pin::pin, sync::Arc};
+use std::{cmp, cmp::Ordering, collections::BTreeMap, ops::Bound, pin::pin};
 
 use futures::StreamExt;
 
@@ -10,7 +10,7 @@ use crate::{
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct InternalKey<K> {
-    pub(crate) key: Arc<K>,
+    pub(crate) key: K,
     pub(crate) ts: TimeStamp,
 }
 
@@ -63,7 +63,7 @@ where
 {
     pub(crate) async fn from_wal<W>(wal: &mut W) -> Result<Self, W::Error>
     where
-        W: WalRecover<Arc<S::PrimaryKey>, S>,
+        W: WalRecover<S::PrimaryKey, S>,
     {
         let mut mem_table = Self::default();
 
@@ -74,7 +74,7 @@ where
 
     pub(crate) async fn recover<W>(&mut self, wal: &mut W) -> Result<(), W::Error>
     where
-        W: WalRecover<Arc<S::PrimaryKey>, S>,
+        W: WalRecover<S::PrimaryKey, S>,
     {
         let mut stream = pin!(wal.recover());
         let mut batch = None;
@@ -128,14 +128,14 @@ where
         self.data.len()
     }
 
-    pub(crate) fn insert(&mut self, key: Arc<S::PrimaryKey>, ts: TimeStamp, value: Option<S>) {
+    pub(crate) fn insert(&mut self, key: S::PrimaryKey, ts: TimeStamp, value: Option<S>) {
         self.max_ts = cmp::max(self.max_ts, ts);
         self.written_size = key.size() + ts.size() + value.as_ref().map(Encode::size).unwrap_or(0);
 
         let _ = self.data.insert(InternalKey { key, ts }, value);
     }
 
-    pub(crate) fn get(&self, key: &Arc<S::PrimaryKey>, ts: &TimeStamp) -> Option<Option<&S>> {
+    pub(crate) fn get(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> Option<Option<&S>> {
         let internal_key = InternalKey {
             key: key.clone(),
             ts: *ts,
@@ -152,8 +152,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use futures::{executor::block_on, io::Cursor};
 
     use super::MemTable;
@@ -169,7 +167,7 @@ mod tests {
             let mut mem_table = MemTable::default();
 
             mem_table.insert(
-                Arc::new(1),
+                1,
                 0,
                 Some(UserInner::new(
                     1,
@@ -186,7 +184,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(1),
+                1,
                 1,
                 Some(UserInner::new(
                     1,
@@ -203,7 +201,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(1),
+                1,
                 2,
                 Some(UserInner::new(
                     1,
@@ -221,7 +219,7 @@ mod tests {
             );
 
             mem_table.insert(
-                Arc::new(3),
+                3,
                 0,
                 Some(UserInner::new(
                     3,
@@ -239,7 +237,7 @@ mod tests {
             );
 
             assert_eq!(
-                mem_table.get(&Arc::new(1), &0),
+                mem_table.get(&1, &0),
                 Some(Some(&UserInner::new(
                     1,
                     "1".to_string(),
@@ -255,7 +253,7 @@ mod tests {
                 )))
             );
             assert_eq!(
-                mem_table.get(&Arc::new(1), &1),
+                mem_table.get(&1, &1),
                 Some(Some(&UserInner::new(
                     1,
                     "1".to_string(),
@@ -271,7 +269,7 @@ mod tests {
                 )))
             );
             assert_eq!(
-                mem_table.get(&Arc::new(1), &2),
+                mem_table.get(&1, &2),
                 Some(Some(&UserInner::new(
                     1,
                     "1".to_string(),
@@ -288,7 +286,7 @@ mod tests {
             );
 
             assert_eq!(
-                mem_table.get(&Arc::new(3), &0),
+                mem_table.get(&3, &0),
                 Some(Some(&UserInner::new(
                     3,
                     "3".to_string(),
@@ -304,10 +302,10 @@ mod tests {
                 )))
             );
 
-            assert_eq!(mem_table.get(&Arc::new(2), &0), None);
-            assert_eq!(mem_table.get(&Arc::new(4), &0), None);
+            assert_eq!(mem_table.get(&2, &0), None);
+            assert_eq!(mem_table.get(&4, &0), None);
             assert_eq!(
-                mem_table.get(&Arc::new(1), &3),
+                mem_table.get(&1, &3),
                 Some(Some(&UserInner::new(
                     1,
                     "1".to_string(),
@@ -328,7 +326,7 @@ mod tests {
     #[test]
     fn recover_from_wal() {
         let mut file = Vec::new();
-        let key = Arc::new(0);
+        let key = 0;
         let value = UserInner::new(0, "v".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0);
         block_on(async {
             {

@@ -2,7 +2,6 @@ use std::{
     cmp::Reverse,
     collections::BinaryHeap,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -22,9 +21,9 @@ where
     S: Schema,
 {
     #[allow(clippy::type_complexity)]
-    heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<S::PrimaryKey>, Option<S>>, usize)>>,
+    heap: BinaryHeap<Reverse<(CmpKeyItem<S::PrimaryKey, Option<S>>, usize)>>,
     iters: Vec<EStreamImpl<'stream, S>>,
-    item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
+    item_buf: Option<(S::PrimaryKey, Option<S>)>,
 }
 
 impl<'stream, S> MergeStream<'stream, S>
@@ -62,7 +61,7 @@ impl<'stream, S> Stream for MergeStream<'stream, S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -97,8 +96,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use executor::futures::StreamExt;
     use futures::executor::block_on;
 
@@ -112,7 +109,7 @@ mod tests {
         block_on(async {
             let iter_1 = BufStream::new(vec![
                 (
-                    Arc::new(1),
+                    1,
                     Some(UserInner::new(
                         1,
                         "1".to_string(),
@@ -127,12 +124,12 @@ mod tests {
                         0,
                     )),
                 ),
-                (Arc::new(3), None),
+                (3, None),
             ]);
             let iter_2 = BufStream::new(vec![
-                (Arc::new(1), None),
+                (1, None),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),
@@ -147,11 +144,11 @@ mod tests {
                         0,
                     )),
                 ),
-                (Arc::new(4), None),
+                (4, None),
             ]);
             let iter_3 = BufStream::new(vec![
                 (
-                    Arc::new(5),
+                    5,
                     Some(UserInner::new(
                         3,
                         "3".to_string(),
@@ -166,7 +163,7 @@ mod tests {
                         0,
                     )),
                 ),
-                (Arc::new(6), None),
+                (6, None),
             ]);
 
             let mut iterator = MergeStream::<UserInner>::new(vec![
@@ -177,11 +174,11 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (1, None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),
@@ -197,12 +194,12 @@ mod tests {
                     ))
                 )
             );
-            assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(3), None));
-            assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(4), None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (3, None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (4, None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(5),
+                    5,
                     Some(UserInner::new(
                         3,
                         "3".to_string(),
@@ -218,7 +215,7 @@ mod tests {
                     ))
                 )
             );
-            assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(6), None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (6, None));
         });
     }
 }

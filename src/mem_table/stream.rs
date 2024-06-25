@@ -1,7 +1,6 @@
 use std::{
     collections::{btree_map, Bound},
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -21,7 +20,7 @@ where
     S: Schema,
 {
     inner: btree_map::Range<'a, InternalKey<S::PrimaryKey>, Option<S>>,
-    item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
+    item_buf: Option<(S::PrimaryKey, Option<S>)>,
     ts: TimeStamp,
 }
 
@@ -29,7 +28,7 @@ impl<'a, S> Stream for MemTableStream<'a, S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -70,8 +69,8 @@ where
 
     pub(crate) async fn range(
         &self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
         ts: &TimeStamp,
     ) -> Result<MemTableStream<S>, StreamError<S::PrimaryKey, S>> {
         let mut iterator = MemTableStream {
@@ -109,8 +108,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use executor::futures::{future::block_on, StreamExt};
 
     use crate::{mem_table::MemTable, tests::UserInner};
@@ -121,7 +118,7 @@ mod tests {
             let mut mem_table = MemTable::default();
 
             mem_table.insert(
-                Arc::new(1),
+                1,
                 0,
                 Some(UserInner::new(
                     1,
@@ -138,7 +135,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(1),
+                1,
                 1,
                 Some(UserInner::new(
                     2,
@@ -156,7 +153,7 @@ mod tests {
             );
 
             mem_table.insert(
-                Arc::new(2),
+                2,
                 0,
                 Some(UserInner::new(
                     1,
@@ -178,7 +175,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(1),
+                    1,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),
@@ -197,7 +194,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         1,
                         "1".to_string(),
@@ -215,11 +212,11 @@ mod tests {
             );
 
             drop(iterator);
-            mem_table.insert(Arc::new(1), 3, None);
+            mem_table.insert(1, 3, None);
 
             let mut iterator = mem_table.iter().await.unwrap();
 
-            assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (1, None));
         });
     }
 
@@ -229,7 +226,7 @@ mod tests {
             let mut mem_table = MemTable::default();
 
             mem_table.insert(
-                Arc::new(1),
+                1,
                 0,
                 Some(UserInner::new(
                     1,
@@ -246,7 +243,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(2),
+                2,
                 0,
                 Some(UserInner::new(
                     2,
@@ -263,7 +260,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(2),
+                2,
                 1,
                 Some(UserInner::new(
                     3,
@@ -280,7 +277,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(3),
+                3,
                 0,
                 Some(UserInner::new(
                     3,
@@ -297,7 +294,7 @@ mod tests {
                 )),
             );
             mem_table.insert(
-                Arc::new(4),
+                4,
                 0,
                 Some(UserInner::new(
                     4,
@@ -319,7 +316,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(1),
+                    1,
                     Some(UserInner::new(
                         1,
                         "1".to_string(),
@@ -338,7 +335,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         3,
                         "3".to_string(),
@@ -357,7 +354,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(3),
+                    3,
                     Some(UserInner::new(
                         3,
                         "3".to_string(),
@@ -376,7 +373,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(4),
+                    4,
                     Some(UserInner::new(
                         4,
                         "4".to_string(),
@@ -394,15 +391,12 @@ mod tests {
             );
             assert!(iterator.next().await.is_none());
 
-            let mut iterator = mem_table
-                .range(Some(&Arc::new(2)), Some(&Arc::new(3)), &0)
-                .await
-                .unwrap();
+            let mut iterator = mem_table.range(Some(&2), Some(&3), &0).await.unwrap();
 
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),
@@ -421,7 +415,7 @@ mod tests {
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(3),
+                    3,
                     Some(UserInner::new(
                         3,
                         "3".to_string(),

@@ -2,7 +2,6 @@ use std::{
     collections::{btree_map::Range, Bound},
     fmt::Debug,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -22,7 +21,7 @@ where
     S: Schema,
 {
     batch: &'a RecordBatch,
-    item_buf: Option<(Arc<S::PrimaryKey>, Option<S>)>,
+    item_buf: Option<(S::PrimaryKey, Option<S>)>,
     inner: Range<'a, InternalKey<S::PrimaryKey>, u32>,
     ts: TimeStamp,
 }
@@ -31,7 +30,7 @@ impl<'a, S> Stream for IndexBatchStream<'a, S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -59,8 +58,8 @@ where
 {
     pub(crate) async fn range(
         &self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
         ts: &TimeStamp,
     ) -> Result<IndexBatchStream<S>, StreamError<S::PrimaryKey, S>> {
         let mut iterator = IndexBatchStream {
@@ -99,8 +98,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use executor::futures::StreamExt;
     use futures::executor::block_on;
 
@@ -114,9 +111,9 @@ mod tests {
         block_on(async {
             let mut mem_table = MemTable::<UserInner>::default();
 
-            mem_table.insert(Arc::new(0), 0, None);
+            mem_table.insert(0, 0, None);
             mem_table.insert(
-                Arc::new(1),
+                1,
                 0,
                 Some(UserInner::new(
                     1,
@@ -132,9 +129,9 @@ mod tests {
                     0,
                 )),
             );
-            mem_table.insert(Arc::new(1), 1, None);
+            mem_table.insert(1, 1, None);
             mem_table.insert(
-                Arc::new(2),
+                2,
                 0,
                 Some(UserInner::new(
                     2,
@@ -150,22 +147,19 @@ mod tests {
                     0,
                 )),
             );
-            mem_table.insert(Arc::new(3), 0, None);
+            mem_table.insert(3, 0, None);
 
             let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
                 .await
                 .unwrap();
 
-            let mut iterator = batch
-                .range(Some(&Arc::new(1)), Some(&Arc::new(2)), &1)
-                .await
-                .unwrap();
+            let mut iterator = batch.range(Some(&1), Some(&2), &1).await.unwrap();
 
-            assert_eq!(iterator.next().await.unwrap().unwrap(), (Arc::new(1), None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (1, None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
                 (
-                    Arc::new(2),
+                    2,
                     Some(UserInner::new(
                         2,
                         "2".to_string(),

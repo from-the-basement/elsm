@@ -12,7 +12,7 @@ use futures::{io::Cursor, ready, AsyncRead, AsyncWrite};
 
 use super::WalProvider;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InMemProvider {
     wals: Arc<SegQueue<Vec<u8>>>,
 }

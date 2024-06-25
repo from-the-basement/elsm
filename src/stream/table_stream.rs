@@ -2,7 +2,6 @@ use std::{
     fs::File,
     marker::PhantomData,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -47,8 +46,8 @@ where
     pub(crate) async fn new(
         option: &DbOption,
         gen: &ProcessUniqueId,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
     ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let lower = if let Some(l) = lower {
             Some(Self::to_scalar(l).await?)
@@ -118,7 +117,7 @@ impl<S> Stream for TableStream<'_, S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.stream.is_none() {

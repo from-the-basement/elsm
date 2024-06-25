@@ -14,7 +14,7 @@ use crate::{
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum VersionEdit<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     Add { level: u8, scope: Scope<K> },
     Remove { level: u8, gen: ProcessUniqueId },
@@ -22,7 +22,7 @@ where
 
 impl<K> VersionEdit<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     pub(crate) async fn recover<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<VersionEdit<K>> {
         let mut edits = Vec::new();
@@ -36,7 +36,7 @@ where
 
 impl<K> Encode for VersionEdit<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     type Error = <K as Encode>::Error;
 
@@ -72,7 +72,7 @@ where
 
 impl<K> Decode for VersionEdit<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     type Error = <K as Decode>::Error;
 
@@ -109,8 +109,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use futures::{executor::block_on, io::Cursor};
 
     use crate::{scope::Scope, serdes::Encode, version::edit::VersionEdit};
@@ -122,8 +120,8 @@ mod tests {
                 VersionEdit::Add {
                     level: 0,
                     scope: Scope {
-                        min: Arc::new("Min".to_string()),
-                        max: Arc::new("Max".to_string()),
+                        min: "Min".to_string(),
+                        max: "Max".to_string(),
                         gen: Default::default(),
                     },
                 },

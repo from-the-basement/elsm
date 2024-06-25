@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use executor::futures::{
     util::{AsyncReadExt, AsyncWriteExt},
     AsyncRead, AsyncWrite,
@@ -11,16 +9,16 @@ use crate::serdes::{Decode, Encode};
 #[derive(Debug, Eq, PartialEq)]
 pub struct Scope<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
-    pub(crate) min: Arc<K>,
-    pub(crate) max: Arc<K>,
+    pub(crate) min: K,
+    pub(crate) max: K,
     pub(crate) gen: ProcessUniqueId,
 }
 
 impl<K> Clone for Scope<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     fn clone(&self) -> Self {
         Scope {
@@ -33,10 +31,10 @@ where
 
 impl<K> Scope<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     pub(crate) fn is_between(&self, key: &K) -> bool {
-        self.min.as_ref().le(key) && self.max.as_ref().ge(key)
+        self.min.le(key) && self.max.ge(key)
     }
 
     pub(crate) fn is_meet(&self, target: &Scope<K>) -> bool {
@@ -49,7 +47,7 @@ where
 
 impl<K> Encode for Scope<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     type Error = <K as Encode>::Error;
 
@@ -74,13 +72,13 @@ where
 
 impl<K> Decode for Scope<K>
 where
-    K: Encode + Decode + Ord,
+    K: Encode + Decode + Ord + Clone,
 {
     type Error = <K as Decode>::Error;
 
     async fn decode<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self, Self::Error> {
-        let min = Arc::new(K::decode(reader).await?);
-        let max = Arc::new(K::decode(reader).await?);
+        let min = K::decode(reader).await?;
+        let max = K::decode(reader).await?;
 
         let gen = {
             let mut slice = [0; 16];

@@ -104,7 +104,7 @@ where
 
     pub(crate) fn scope_search(key: &S::PrimaryKey, level: &[Scope<S::PrimaryKey>]) -> usize {
         level
-            .binary_search_by(|scope| scope.min.as_ref().cmp(key))
+            .binary_search_by(|scope| scope.min.cmp(key))
             .unwrap_or_else(|index| index.saturating_sub(1))
     }
 
@@ -128,8 +128,8 @@ where
         &self,
         iters: &mut Vec<EStreamImpl<'a, S>>,
         option: &'a DbOption,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
     ) -> Result<(), StreamError<S::PrimaryKey, S>> {
         for scope in self.level_slice[0].iter() {
             iters.push(EStreamImpl::Table(
@@ -137,6 +137,9 @@ where
             ))
         }
         for scopes in self.level_slice[1..].iter() {
+            if scopes.is_empty() {
+                continue;
+            }
             let gens = scopes.iter().map(|scope| scope.gen).collect::<Vec<_>>();
             iters.push(EStreamImpl::Level(
                 LevelStream::new(option, gens, lower, upper).await?,

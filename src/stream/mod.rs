@@ -1,7 +1,6 @@
 use std::{
     fmt::Debug,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -21,7 +20,6 @@ use crate::{
 pub(crate) mod batch_stream;
 pub(crate) mod buf_stream;
 pub(crate) mod level_stream;
-pub(crate) mod merge_inner_stream;
 pub(crate) mod merge_stream;
 pub(crate) mod table_stream;
 
@@ -42,7 +40,7 @@ impl<'a, S> Stream for EStreamImpl<'a, S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.project() {
@@ -52,6 +50,22 @@ where
             EStreamImplProj::TransactionInner(stream) => stream.poll_next(cx),
             EStreamImplProj::Table(stream) => stream.poll_next(cx),
             EStreamImplProj::Level(stream) => stream.poll_next(cx),
+        }
+    }
+}
+
+impl<S> std::fmt::Display for EStreamImpl<'_, S>
+where
+    S: Schema,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EStreamImpl::Buf(_) => write!(f, "BufStream"),
+            EStreamImpl::IndexBatch(_) => write!(f, "IndexBatchStream"),
+            EStreamImpl::MemTable(_) => write!(f, "MemTableStream"),
+            EStreamImpl::TransactionInner(_) => write!(f, "TransactionStream"),
+            EStreamImpl::Table(_) => write!(f, "TableStream"),
+            EStreamImpl::Level(_) => write!(f, "LevelStream"),
         }
     }
 }

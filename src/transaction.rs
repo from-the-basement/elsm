@@ -26,7 +26,7 @@ where
     DB: GetWrite<S>,
 {
     pub(crate) read_at: TimeStamp,
-    pub(crate) local: BTreeMap<Arc<S::PrimaryKey>, Option<S>>,
+    pub(crate) local: BTreeMap<S::PrimaryKey, Option<S>>,
     share: Arc<DB>,
 }
 
@@ -44,7 +44,7 @@ where
         }
     }
 
-    pub async fn get(&self, key: &Arc<S::PrimaryKey>) -> Option<S> {
+    pub async fn get(&self, key: &S::PrimaryKey) -> Option<S> {
         match self.local.get(key).and_then(|v| v.as_ref()) {
             Some(v) => Some(v.clone()),
             None => self.share.get(key, &self.read_at).await,
@@ -60,7 +60,7 @@ where
     }
 
     fn entry(&mut self, key: S::PrimaryKey, value: Option<S>) {
-        match self.local.entry(Arc::from(key)) {
+        match self.local.entry(key) {
             Entry::Vacant(v) => {
                 v.insert(value);
             }
@@ -84,18 +84,16 @@ where
 
     pub async fn range(
         &self,
-        lower: Option<&Arc<S::PrimaryKey>>,
-        upper: Option<&Arc<S::PrimaryKey>>,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
     ) -> Result<MergeStream<S>, StreamError<S::PrimaryKey, S>> {
         let mut iters = self.share.inner_range(lower, upper, &self.read_at).await?;
         let range = self
             .local
-            .range::<Arc<S::PrimaryKey>, (Bound<&Arc<S::PrimaryKey>>, Bound<&Arc<S::PrimaryKey>>)>(
-                (
-                    lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
-                    upper.map(Bound::Included).unwrap_or(Bound::Unbounded),
-                ),
-            );
+            .range::<S::PrimaryKey, (Bound<&S::PrimaryKey>, Bound<&S::PrimaryKey>)>((
+                lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
+                upper.map(Bound::Included).unwrap_or(Bound::Unbounded),
+            ));
         let iter = TransactionStream {
             range,
             _p: Default::default(),
@@ -112,7 +110,7 @@ where
     S: Schema,
 {
     #[pin]
-    range: btree_map::Range<'a, Arc<S::PrimaryKey>, Option<S>>,
+    range: btree_map::Range<'a, S::PrimaryKey, Option<S>>,
     _p: PhantomData<E>,
 }
 
@@ -120,7 +118,7 @@ impl<'a, S, E> Stream for TransactionStream<'a, S, E>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), E>;
+    type Item = Result<(S::PrimaryKey, Option<S>), E>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -135,7 +133,7 @@ where
 
 #[derive(Debug, Error)]
 pub enum CommitError<K> {
-    WriteConflict(Vec<Arc<K>>),
+    WriteConflict(Vec<K>),
     WriteError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 

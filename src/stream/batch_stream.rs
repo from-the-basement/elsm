@@ -1,7 +1,6 @@
 use std::{
     marker::PhantomData,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -35,12 +34,12 @@ where
 
     async fn decode_item(
         &mut self,
-    ) -> Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>> {
+    ) -> Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>> {
         // Safety: already check offset
         let (id, item) = S::from_batch(&self.inner, self.pos);
 
         self.pos += 1;
-        Ok((Arc::new(id), item))
+        Ok((id, item))
     }
 }
 
@@ -48,7 +47,7 @@ impl<S> Stream for BatchStream<S>
 where
     S: Schema,
 {
-    type Item = Result<(Arc<S::PrimaryKey>, Option<S>), StreamError<S::PrimaryKey, S>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.pos < self.inner.num_rows() {
