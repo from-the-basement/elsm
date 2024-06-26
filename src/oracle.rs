@@ -5,40 +5,40 @@ use std::{
     ops::Bound,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Mutex,
     },
 };
 
 use thiserror::Error;
 
+pub(crate) type TimeStamp = u64;
+
 pub trait Oracle<K>: Sized
 where
     K: Ord,
 {
-    type Timestamp: Ord + Clone + Copy + Default + Debug;
+    fn start_read(&self) -> TimeStamp;
 
-    fn start_read(&self) -> Self::Timestamp;
+    fn read_commit(&self, ts: TimeStamp);
 
-    fn read_commit(&self, ts: Self::Timestamp);
-
-    fn start_write(&self) -> Self::Timestamp;
+    fn start_write(&self) -> TimeStamp;
 
     fn write_commit(
         &self,
-        read_at: Self::Timestamp,
-        write_at: Self::Timestamp,
-        in_write: HashSet<Arc<K>>,
+        read_at: TimeStamp,
+        write_at: TimeStamp,
+        in_write: HashSet<K>,
     ) -> Result<(), WriteConflict<K>>;
 }
 
 #[derive(Debug, Error)]
 #[error("transaction write conflict: {keys:?}")]
 pub struct WriteConflict<K> {
-    keys: Vec<Arc<K>>,
+    keys: Vec<K>,
 }
 
 impl<K> WriteConflict<K> {
-    pub fn to_keys(self) -> Vec<Arc<K>> {
+    pub fn to_keys(self) -> Vec<K> {
         self.keys
     }
 }
@@ -50,7 +50,7 @@ where
 {
     now: AtomicU64,
     in_read: Mutex<BTreeMap<u64, usize>>,
-    committed_txns: Mutex<BTreeMap<u64, HashSet<Arc<K>>>>,
+    committed_txns: Mutex<BTreeMap<u64, HashSet<K>>>,
 }
 
 impl<K> Default for LocalOracle<K>
@@ -68,11 +68,9 @@ where
 
 impl<K> Oracle<K> for LocalOracle<K>
 where
-    K: Ord + Hash,
+    K: Ord + Hash + Clone,
 {
-    type Timestamp = u64;
-
-    fn start_read(&self) -> Self::Timestamp {
+    fn start_read(&self) -> TimeStamp {
         let mut in_read = self.in_read.lock().unwrap();
         let now = self.now.load(Ordering::Relaxed);
         match in_read.entry(now) {
@@ -86,7 +84,7 @@ where
         now
     }
 
-    fn read_commit(&self, ts: Self::Timestamp) {
+    fn read_commit(&self, ts: TimeStamp) {
         match self.in_read.lock().unwrap().entry(ts) {
             Entry::Vacant(_) => panic!("commit non-existing read"),
             Entry::Occupied(mut o) => match o.get_mut() {
@@ -100,15 +98,15 @@ where
         }
     }
 
-    fn start_write(&self) -> Self::Timestamp {
+    fn start_write(&self) -> TimeStamp {
         self.now.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn write_commit(
         &self,
-        read_at: Self::Timestamp,
-        write_at: Self::Timestamp,
-        in_write: HashSet<Arc<K>>,
+        read_at: TimeStamp,
+        write_at: TimeStamp,
+        in_write: HashSet<K>,
     ) -> Result<(), WriteConflict<K>> {
         let mut committed_txns = self.committed_txns.lock().unwrap();
         let conflicts: Vec<_> = committed_txns

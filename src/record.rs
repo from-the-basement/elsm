@@ -3,18 +3,21 @@ use std::{io, mem::size_of};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use thiserror::Error;
 
-use crate::serdes::{Decode, Encode};
+use crate::{
+    oracle::TimeStamp,
+    serdes::{Decode, Encode},
+};
 
 #[derive(Debug)]
-pub struct Record<K, V, T = u64> {
+pub struct Record<K, V> {
     pub record_type: RecordType,
     pub key: K,
-    pub ts: T,
+    pub ts: TimeStamp,
     pub value: Option<V>,
 }
 
-impl<K, V, T> Record<K, V, T> {
-    pub fn new(record_type: RecordType, key: K, ts: T, value: Option<V>) -> Self {
+impl<K, V> Record<K, V> {
+    pub fn new(record_type: RecordType, key: K, ts: TimeStamp, value: Option<V>) -> Self {
         Self {
             record_type,
             key,
@@ -23,18 +26,17 @@ impl<K, V, T> Record<K, V, T> {
         }
     }
 
-    pub fn as_ref(&self) -> Record<&K, &V, &T> {
-        Record::new(self.record_type, &self.key, &self.ts, self.value.as_ref())
+    pub fn as_ref(&self) -> Record<&K, &V> {
+        Record::new(self.record_type, &self.key, self.ts, self.value.as_ref())
     }
 }
 
-impl<K, V, T> Encode for Record<K, V, T>
+impl<K, V> Encode for Record<K, V>
 where
     K: Encode,
     V: Encode,
-    T: Encode,
 {
-    type Error = EncodeError<K::Error, T::Error, <Option<V> as Encode>::Error>;
+    type Error = EncodeError<K::Error, <TimeStamp as Encode>::Error, <Option<V> as Encode>::Error>;
 
     async fn encode<W>(&self, writer: &mut W) -> Result<(), Self::Error>
     where
@@ -54,13 +56,12 @@ where
     }
 }
 
-impl<K, V, T> Decode for Record<K, V, T>
+impl<K, V> Decode for Record<K, V>
 where
     K: Decode,
     V: Decode,
-    T: Decode,
 {
-    type Error = DecodeError<K::Error, T::Error, <Option<V> as Decode>::Error>;
+    type Error = DecodeError<K::Error, <Option<V> as Decode>::Error>;
 
     async fn decode<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self, Self::Error> {
         let mut record_type = [0];
@@ -68,7 +69,9 @@ where
         let record_type = RecordType::from(record_type[0]);
 
         let key = K::decode(reader).await.map_err(DecodeError::Key)?;
-        let ts = T::decode(reader).await.map_err(DecodeError::Timetamp)?;
+        let ts = TimeStamp::decode(reader)
+            .await
+            .map_err(DecodeError::Timetamp)?;
         let value = Option::decode(reader).await.map_err(DecodeError::Value)?;
 
         Ok(Self {
@@ -119,10 +122,9 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum DecodeError<K, T, V>
+pub enum DecodeError<K, V>
 where
     K: std::error::Error,
-    T: std::error::Error,
     V: std::error::Error,
 {
     #[error("io error: {0}")]
@@ -130,7 +132,7 @@ where
     #[error("key error: {0}")]
     Key(#[source] K),
     #[error("timestamp error: {0}")]
-    Timetamp(#[source] T),
+    Timetamp(#[source] <TimeStamp as Decode>::Error),
     #[error("value error: {0}")]
     Value(#[source] V),
 }

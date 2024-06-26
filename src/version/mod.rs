@@ -2,10 +2,10 @@ pub(crate) mod cleaner;
 pub(crate) mod edit;
 pub(crate) mod set;
 
-use std::{fs::File, sync::Arc};
+use std::{fs::File, mem, sync::Arc};
 
 use arrow::{
-    array::{GenericBinaryArray, RecordBatch, Scalar},
+    array::{RecordBatch, Scalar},
     compute::kernels::cmp::eq,
 };
 use executor::{
@@ -25,31 +25,33 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::{
+    schema::Schema,
     scope::Scope,
-    serdes::{Decode, Encode},
+    serdes::Encode,
+    stream::{level_stream::LevelStream, table_stream::TableStream, EStreamImpl, StreamError},
     version::cleaner::CleanTag,
-    DbOption, Offset,
+    DbOption,
 };
 
 pub const MAX_LEVEL: usize = 7;
 
-pub(crate) type VersionRef<K> = Arc<Version<K>>;
+pub(crate) type VersionRef<S> = Arc<Version<S>>;
 
-pub(crate) struct Version<K>
+pub(crate) struct Version<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
     pub(crate) num: usize,
-    pub(crate) level_slice: [Vec<Scope<K>>; MAX_LEVEL],
+    pub(crate) level_slice: [Vec<Scope<S::PrimaryKey>>; MAX_LEVEL],
     pub(crate) clean_sender: Sender<CleanTag>,
 }
 
-impl<K> Clone for Version<K>
+impl<S> Clone for Version<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
     fn clone(&self) -> Self {
-        let mut level_slice = Version::level_slice_new();
+        let mut level_slice = Version::<S>::level_slice_new();
 
         for (level, scopes) in self.level_slice.iter().enumerate() {
             for scope in scopes {
@@ -65,27 +67,22 @@ where
     }
 }
 
-impl<K> Version<K>
+impl<S> Version<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
     pub(crate) async fn query(
         &self,
-        key: &K,
+        key: &S::PrimaryKey,
         option: &DbOption,
-    ) -> Result<Option<RecordBatch>, VersionError<K>> {
-        let mut key_bytes = Vec::new();
-        key.encode(&mut key_bytes)
-            .await
-            .map_err(VersionError::<K>::Encode)?;
-
-        let key_scalar = GenericBinaryArray::<Offset>::from(vec![key_bytes.as_slice()]);
+    ) -> Result<Option<RecordBatch>, VersionError<S>> {
+        let key_array = S::to_primary_key_array(vec![key.clone()]);
 
         for scope in self.level_slice[0].iter().rev() {
             if !scope.is_between(key) {
                 continue;
             }
-            if let Some(batch) = Self::read_parquet(&scope.gen, &key_scalar, option).await? {
+            if let Some(batch) = Self::read_parquet(&scope.gen, &key_array, option).await? {
                 return Ok(Some(batch));
             }
         }
@@ -97,7 +94,7 @@ where
             if !level[index].is_between(key) {
                 continue;
             }
-            if let Some(batch) = Self::read_parquet(&level[index].gen, &key_scalar, option).await? {
+            if let Some(batch) = Self::read_parquet(&level[index].gen, &key_array, option).await? {
                 return Ok(Some(batch));
             }
         }
@@ -105,9 +102,9 @@ where
         Ok(None)
     }
 
-    pub(crate) fn scope_search(key: &K, level: &[Scope<K>]) -> usize {
+    pub(crate) fn scope_search(key: &S::PrimaryKey, level: &[Scope<S::PrimaryKey>]) -> usize {
         level
-            .binary_search_by(|scope| scope.min.as_ref().cmp(key))
+            .binary_search_by(|scope| scope.min.cmp(key))
             .unwrap_or_else(|index| index.saturating_sub(1))
     }
 
@@ -115,7 +112,7 @@ where
         self.level_slice[level].len()
     }
 
-    pub(crate) fn level_slice_new() -> [Vec<Scope<K>>; 7] {
+    pub(crate) fn level_slice_new() -> [Vec<Scope<S::PrimaryKey>>; 7] {
         [
             Vec::new(),
             Vec::new(),
@@ -127,11 +124,35 @@ where
         ]
     }
 
+    pub(crate) async fn iters<'a>(
+        &self,
+        iters: &mut Vec<EStreamImpl<'a, S>>,
+        option: &'a DbOption,
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
+    ) -> Result<(), StreamError<S::PrimaryKey, S>> {
+        for scope in self.level_slice[0].iter() {
+            iters.push(EStreamImpl::Table(
+                TableStream::new(option, &scope.gen, lower, upper).await?,
+            ))
+        }
+        for scopes in self.level_slice[1..].iter() {
+            if scopes.is_empty() {
+                continue;
+            }
+            let gens = scopes.iter().map(|scope| scope.gen).collect::<Vec<_>>();
+            iters.push(EStreamImpl::Level(
+                LevelStream::new(option, gens, lower, upper).await?,
+            ));
+        }
+        Ok(())
+    }
+
     async fn read_parquet(
         scope_gen: &ProcessUniqueId,
-        key_scalar: &GenericBinaryArray<Offset>,
+        key_scalar: &S::PrimaryKeyArray,
         option: &DbOption,
-    ) -> Result<Option<RecordBatch>, VersionError<K>> {
+    ) -> Result<Option<RecordBatch>, VersionError<S>> {
         let mut file =
             fs::File::from(File::open(option.table_path(scope_gen)).map_err(VersionError::Io)?);
         let meta = ArrowReaderMetadata::load_async(&mut file, Default::default())
@@ -140,10 +161,10 @@ where
         let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(file, meta);
         let file_metadata = builder.metadata().file_metadata();
 
-        let scalar = key_scalar.clone();
+        let key_scalar = unsafe { mem::transmute::<_, &'static S::PrimaryKeyArray>(key_scalar) };
         let filter = ArrowPredicateFn::new(
             ProjectionMask::roots(file_metadata.schema_descr(), [0]),
-            move |record_batch| eq(record_batch.column(0), &Scalar::new(&scalar)),
+            move |record_batch| eq(record_batch.column(0), &Scalar::new(&key_scalar)),
         );
         let row_filter = RowFilter::new(vec![Box::new(filter)]);
         builder = builder.with_row_filter(row_filter);
@@ -157,9 +178,9 @@ where
     }
 }
 
-impl<K> Drop for Version<K>
+impl<S> Drop for Version<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
     fn drop(&mut self) {
         block_on(async {
@@ -177,12 +198,12 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum VersionError<K>
+pub enum VersionError<S>
 where
-    K: Encode,
+    S: Schema,
 {
     #[error("version encode error: {0}")]
-    Encode(#[source] <K as Encode>::Error),
+    Encode(#[source] <S::PrimaryKey as Encode>::Error),
     #[error("version io error: {0}")]
     Io(#[source] std::io::Error),
     #[error("version parquet error: {0}")]

@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -11,40 +10,38 @@ use pin_project::pin_project;
 use snowflake::ProcessUniqueId;
 
 use crate::{
-    serdes::{Decode, Encode},
+    schema::Schema,
     stream::{table_stream::TableStream, StreamError},
     DbOption,
 };
 
 #[pin_project]
-pub(crate) struct LevelStream<'stream, K, V>
+pub(crate) struct LevelStream<'stream, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    lower: Option<Arc<K>>,
-    upper: Option<Arc<K>>,
+    lower: Option<S::PrimaryKey>,
+    upper: Option<S::PrimaryKey>,
     option: &'stream DbOption,
     gens: VecDeque<ProcessUniqueId>,
-    stream: Option<TableStream<'stream, K, V>>,
+    stream: Option<TableStream<'stream, S>>,
 }
 
-impl<'stream, K, V> LevelStream<'stream, K, V>
+impl<'stream, S> LevelStream<'stream, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
     pub(crate) async fn new(
         option: &'stream DbOption,
         gens: Vec<ProcessUniqueId>,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
-    ) -> Result<Self, StreamError<K, V>> {
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
+    ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let mut gens = VecDeque::from(gens);
         let mut stream = None;
 
         if let Some(gen) = gens.pop_front() {
-            stream = Some(TableStream::<K, V>::new(option, &gen, lower, upper).await?);
+            stream = Some(TableStream::<S>::new(option, &gen, lower, upper).await?);
         }
 
         Ok(Self {
@@ -57,12 +54,11 @@ where
     }
 }
 
-impl<K, V> Stream for LevelStream<'_, K, V>
+impl<S> Stream for LevelStream<'_, S>
 where
-    K: Encode + Decode + Send + Sync + 'static,
-    V: Decode + Send + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<V>), StreamError<K, V>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(stream) = &mut self.stream {
@@ -72,7 +68,7 @@ where
                     Some(gen) => {
                         let min = self.lower.clone();
                         let max = self.upper.clone();
-                        let mut future = pin!(TableStream::<K, V>::new(
+                        let mut future = pin!(TableStream::<S>::new(
                             self.option,
                             &gen,
                             min.as_ref(),

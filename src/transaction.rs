@@ -1,7 +1,6 @@
 use std::{
     collections::{btree_map, btree_map::Entry, BTreeMap},
     fmt::Debug,
-    hash::Hash,
     marker::PhantomData,
     ops::Bound,
     pin::Pin,
@@ -14,30 +13,27 @@ use pin_project::pin_project;
 use thiserror::Error;
 
 use crate::{
-    oracle::WriteConflict,
-    serdes::{Decode, Encode},
+    oracle::{TimeStamp, WriteConflict},
+    schema::Schema,
     stream::{merge_stream::MergeStream, EStreamImpl, StreamError},
     GetWrite,
 };
 
 #[derive(Debug)]
-pub struct Transaction<K, V, DB>
+pub struct Transaction<S, DB>
 where
-    K: Ord + Encode + Decode,
-    V: Decode,
-    DB: GetWrite<K, V>,
+    S: Schema,
+    DB: GetWrite<S>,
 {
-    pub(crate) read_at: DB::Timestamp,
-    pub(crate) local: BTreeMap<Arc<K>, Option<V>>,
+    pub(crate) read_at: TimeStamp,
+    pub(crate) local: BTreeMap<S::PrimaryKey, Option<S>>,
     share: Arc<DB>,
 }
 
-impl<K, V, DB> Transaction<K, V, DB>
+impl<S, DB> Transaction<S, DB>
 where
-    K: Hash + Ord + Debug + Encode + Decode + Send + Sync,
-    V: Decode + Send + Sync,
-    DB: GetWrite<K, V>,
-    DB::Timestamp: Send + Sync,
+    S: Schema,
+    DB: GetWrite<S>,
 {
     pub(crate) fn new(share: Arc<DB>) -> Self {
         let read_at = share.start_read();
@@ -48,27 +44,23 @@ where
         }
     }
 
-    pub async fn get<G, F>(&self, key: &Arc<K>, f: F) -> Option<G>
-    where
-        F: Fn(&V) -> G + Sync + 'static,
-        G: Send + 'static,
-    {
+    pub async fn get(&self, key: &S::PrimaryKey) -> Option<S> {
         match self.local.get(key).and_then(|v| v.as_ref()) {
-            Some(v) => Some((f)(v)),
-            None => self.share.get(key, &self.read_at, f).await,
+            Some(v) => Some(v.clone()),
+            None => self.share.get(key, &self.read_at).await,
         }
     }
 
-    pub fn set(&mut self, key: K, value: V) {
+    pub fn set(&mut self, key: S::PrimaryKey, value: S) {
         self.entry(key, Some(value))
     }
 
-    pub fn remove(&mut self, key: K) {
+    pub fn remove(&mut self, key: S::PrimaryKey) {
         self.entry(key, None)
     }
 
-    fn entry(&mut self, key: K, value: Option<V>) {
-        match self.local.entry(Arc::from(key)) {
+    fn entry(&mut self, key: S::PrimaryKey, value: Option<S>) {
+        match self.local.entry(key) {
             Entry::Vacant(v) => {
                 v.insert(value);
             }
@@ -76,7 +68,7 @@ where
         }
     }
 
-    pub async fn commit(self) -> Result<(), CommitError<K>> {
+    pub async fn commit(self) -> Result<(), CommitError<S::PrimaryKey>> {
         self.share.read_commit(self.read_at);
         if self.local.is_empty() {
             return Ok(());
@@ -90,29 +82,20 @@ where
         Ok(())
     }
 
-    pub async fn range<G, F>(
+    pub async fn range(
         &self,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
-        f: F,
-    ) -> Result<MergeStream<K, DB::Timestamp, V, G, F>, StreamError<K, V>>
-    where
-        G: Send + Sync + 'static,
-        F: Fn(&V) -> G + Send + Sync + 'static + Copy,
-    {
-        let mut iters = self
-            .share
-            .inner_range(lower, upper, &self.read_at, f)
-            .await?;
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
+    ) -> Result<MergeStream<S>, StreamError<S::PrimaryKey, S>> {
+        let mut iters = self.share.inner_range(lower, upper, &self.read_at).await?;
         let range = self
             .local
-            .range::<Arc<K>, (Bound<&Arc<K>>, Bound<&Arc<K>>)>((
+            .range::<S::PrimaryKey, (Bound<&S::PrimaryKey>, Bound<&S::PrimaryKey>)>((
                 lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
                 upper.map(Bound::Included).unwrap_or(Bound::Unbounded),
             ));
         let iter = TransactionStream {
             range,
-            f,
             _p: Default::default(),
         };
         iters.insert(0, EStreamImpl::TransactionInner(iter));
@@ -122,31 +105,27 @@ where
 }
 
 #[pin_project]
-pub(crate) struct TransactionStream<'a, K, V, G, F, E>
+pub(crate) struct TransactionStream<'a, S, E>
 where
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
     #[pin]
-    range: btree_map::Range<'a, Arc<K>, Option<V>>,
-    f: F,
+    range: btree_map::Range<'a, S::PrimaryKey, Option<S>>,
     _p: PhantomData<E>,
 }
 
-impl<'a, K, V, E, G, F> Stream for TransactionStream<'a, K, V, G, F, E>
+impl<'a, S, E> Stream for TransactionStream<'a, S, E>
 where
-    K: Ord,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<G>), E>;
+    type Item = Result<(S::PrimaryKey, Option<S>), E>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         Poll::Ready(
             this.range
                 .next()
-                .map(|(key, value)| (key.clone(), value.as_ref().map(|v| (this.f)(v))))
+                .map(|(key, value)| (key.clone(), value.clone()))
                 .map(Ok),
         )
     }
@@ -154,7 +133,7 @@ where
 
 #[derive(Debug, Error)]
 pub enum CommitError<K> {
-    WriteConflict(Vec<Arc<K>>),
+    WriteConflict(Vec<K>),
     WriteError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 

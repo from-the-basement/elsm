@@ -2,7 +2,6 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     ptr::NonNull,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -10,14 +9,14 @@ use executor::futures::Stream;
 
 unsafe impl<K, V, E> Send for BufStream<'_, K, V, E>
 where
-    K: Ord + Sync,
+    K: Ord + Clone + Sync,
     V: Sync,
     E: Sync,
 {
 }
 unsafe impl<K, V, E> Sync for BufStream<'_, K, V, E>
 where
-    K: Ord + Sync,
+    K: Ord + Clone + Sync,
     V: Sync,
     E: Sync,
 {
@@ -25,19 +24,19 @@ where
 
 pub(crate) struct BufStream<'a, K, V, E>
 where
-    K: Ord,
+    K: Ord + Clone,
 {
-    inner: NonNull<Vec<(Arc<K>, Option<V>)>>,
+    inner: NonNull<Vec<(K, Option<V>)>>,
     pos: usize,
     _p: PhantomData<&'a E>,
 }
 
 impl<'a, K, V, E> BufStream<'a, K, V, E>
 where
-    K: Ord,
+    K: Ord + Clone,
     V: 'a,
 {
-    pub(crate) fn new(items: Vec<(Arc<K>, Option<V>)>) -> Self {
+    pub(crate) fn new(items: Vec<(K, Option<V>)>) -> Self {
         BufStream {
             inner: Box::leak(Box::new(items)).into(),
             pos: 0,
@@ -45,11 +44,11 @@ where
         }
     }
 
-    unsafe fn inner(&self) -> &'a [(Arc<K>, Option<V>)] {
+    unsafe fn inner(&self) -> &'a [(K, Option<V>)] {
         self.inner.as_ref()
     }
 
-    unsafe fn take_item(&mut self) -> (Arc<K>, Option<V>) {
+    unsafe fn take_item(&mut self) -> (K, Option<V>) {
         let value = self.inner.as_mut()[self.pos].1.take();
         let key = self.inner.as_ref()[self.pos].0.clone();
 
@@ -59,10 +58,10 @@ where
 
 impl<'a, K, V, E> Stream for BufStream<'a, K, V, E>
 where
-    K: Ord + 'a,
+    K: Ord + Clone + 'a,
     V: 'a,
 {
-    type Item = Result<(Arc<K>, Option<V>), E>;
+    type Item = Result<(K, Option<V>), E>;
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(unsafe { self.pos < self.inner().len() }.then(|| {
@@ -75,7 +74,7 @@ where
 
 impl<K, V, E> Drop for BufStream<'_, K, V, E>
 where
-    K: Ord,
+    K: Ord + Clone,
 {
     fn drop(&mut self) {
         unsafe { drop(Box::from_raw(self.inner.as_ptr())) }

@@ -9,30 +9,31 @@ use futures::channel::mpsc::Sender;
 use snowflake::ProcessUniqueId;
 
 use crate::{
-    serdes::{Decode, Encode},
+    schema::Schema,
+    serdes::Encode,
     version::{cleaner::CleanTag, edit::VersionEdit, Version, VersionError, VersionRef},
     DbOption,
 };
 
-pub(crate) struct VersionSetInner<K>
+pub(crate) struct VersionSetInner<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
-    current: VersionRef<K>,
+    current: VersionRef<S>,
     log: fs::File,
 }
 
-pub(crate) struct VersionSet<K>
+pub(crate) struct VersionSet<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
-    inner: Arc<RwLock<VersionSetInner<K>>>,
+    inner: Arc<RwLock<VersionSetInner<S>>>,
     clean_sender: Sender<CleanTag>,
 }
 
-impl<K> Clone for VersionSet<K>
+impl<S> Clone for VersionSet<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
     fn clone(&self) -> Self {
         VersionSet {
@@ -42,14 +43,14 @@ where
     }
 }
 
-impl<K> VersionSet<K>
+impl<S> VersionSet<S>
 where
-    K: Encode + Decode + Ord,
+    S: Schema,
 {
     pub(crate) async fn new(
         option: &DbOption,
         clean_sender: Sender<CleanTag>,
-    ) -> Result<Self, VersionError<K>> {
+    ) -> Result<Self, VersionError<S>> {
         let mut log = fs::File::from(
             OpenOptions::new()
                 .create(true)
@@ -61,11 +62,11 @@ where
         let edits = VersionEdit::recover(&mut log).await;
         log.seek(SeekFrom::End(0)).await.map_err(VersionError::Io)?;
 
-        let set = VersionSet::<K> {
+        let set = VersionSet::<S> {
             inner: Arc::new(RwLock::new(VersionSetInner {
                 current: Arc::new(Version {
                     num: 0,
-                    level_slice: Version::level_slice_new(),
+                    level_slice: Version::<S>::level_slice_new(),
                     clean_sender: clean_sender.clone(),
                 }),
                 log,
@@ -77,16 +78,16 @@ where
         Ok(set)
     }
 
-    pub(crate) async fn current(&self) -> VersionRef<K> {
+    pub(crate) async fn current(&self) -> VersionRef<S> {
         self.inner.read().await.current.clone()
     }
 
     pub(crate) async fn apply_edits(
         &self,
-        version_edits: Vec<VersionEdit<K>>,
+        version_edits: Vec<VersionEdit<S::PrimaryKey>>,
         delete_gens: Option<Vec<ProcessUniqueId>>,
         is_recover: bool,
-    ) -> Result<(), VersionError<K>> {
+    ) -> Result<(), VersionError<S>> {
         let mut guard = self.inner.write().await;
 
         let mut new_version = Version::clone(&guard.current);

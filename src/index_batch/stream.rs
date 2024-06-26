@@ -1,10 +1,7 @@
 use std::{
     collections::{btree_map::Range, Bound},
     fmt::Debug,
-    future::Future,
-    marker::PhantomData,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -13,41 +10,29 @@ use executor::futures::{Stream, StreamExt};
 use pin_project::pin_project;
 
 use crate::{
-    index_batch::{decode_value, IndexBatch},
-    mem_table::InternalKey,
-    serdes::{Decode, Encode},
+    index_batch::IndexBatch, mem_table::InternalKey, oracle::TimeStamp, schema::Schema,
     stream::StreamError,
 };
 
 #[pin_project]
 #[derive(Debug)]
-pub(crate) struct IndexBatchStream<'a, K, T, V, G, F>
+pub(crate) struct IndexBatchStream<'a, S>
 where
-    K: Ord,
-    T: Ord + Copy + Default,
-    V: Decode,
-    G: Send + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
     batch: &'a RecordBatch,
-    item_buf: Option<(Arc<K>, Option<G>)>,
-    inner: Range<'a, InternalKey<K, T>, u32>,
-    ts: T,
-    f: F,
-    _p: PhantomData<V>,
+    item_buf: Option<(S::PrimaryKey, Option<S>)>,
+    inner: Range<'a, InternalKey<S::PrimaryKey>, u32>,
+    ts: TimeStamp,
 }
 
-impl<'a, K, T, V, G, F> Stream for IndexBatchStream<'a, K, T, V, G, F>
+impl<'a, S> Stream for IndexBatchStream<'a, S>
 where
-    K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
-    V: Decode + Send + Sync,
-    G: Send + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         for (InternalKey { key, ts }, offset) in this.inner.by_ref() {
             if ts <= this.ts
@@ -56,40 +41,27 @@ where
                     Some(true) | None
                 )
             {
-                let mut future = pin!(decode_value::<V>(this.batch, 1, *offset as usize));
-
-                return match future.as_mut().poll(cx) {
-                    Poll::Ready(Ok(option)) => Poll::Ready(
-                        this.item_buf
-                            .replace((key.clone(), option.map(|v| (this.f)(&v))))
-                            .map(Ok),
-                    ),
-                    Poll::Ready(Err(err)) => Poll::Ready(Some(Err(StreamError::ValueDecode(err)))),
-                    Poll::Pending => Poll::Pending,
-                };
+                return Poll::Ready(
+                    this.item_buf
+                        .replace((key.clone(), S::from_batch(this.batch, *offset as usize).1))
+                        .map(Ok),
+                );
             }
         }
         Poll::Ready(this.item_buf.take().map(Ok))
     }
 }
 
-impl<K, T> IndexBatch<K, T>
+impl<S> IndexBatch<S>
 where
-    K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
+    S: Schema,
 {
-    pub(crate) async fn range<V, G, F>(
+    pub(crate) async fn range(
         &self,
-        lower: Option<&Arc<K>>,
-        upper: Option<&Arc<K>>,
-        ts: &T,
-        f: F,
-    ) -> Result<IndexBatchStream<K, T, V, G, F>, StreamError<K, V>>
-    where
-        V: Decode + Sync + Send,
-        G: Send + 'static,
-        F: Fn(&V) -> G + Sync + 'static,
-    {
+        lower: Option<&S::PrimaryKey>,
+        upper: Option<&S::PrimaryKey>,
+        ts: &TimeStamp,
+    ) -> Result<IndexBatchStream<S>, StreamError<S::PrimaryKey, S>> {
         let mut iterator = IndexBatchStream {
             batch: &self.batch,
             inner: self.index.range((
@@ -105,15 +77,13 @@ where
                     .map(|k| {
                         Bound::Included(InternalKey {
                             key: k.clone(),
-                            ts: T::default(),
+                            ts: TimeStamp::default(),
                         })
                     })
                     .unwrap_or(Bound::Unbounded),
             )),
             item_buf: None,
             ts: *ts,
-            f,
-            _p: Default::default(),
         };
 
         {
@@ -128,49 +98,82 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use executor::futures::StreamExt;
     use futures::executor::block_on;
 
     use crate::{
-        mem_table::MemTable, oracle::LocalOracle, wal::provider::in_mem::InMemProvider, Db,
+        mem_table::MemTable, oracle::LocalOracle, tests::UserInner,
+        wal::provider::in_mem::InMemProvider, Db,
     };
 
     #[test]
     fn range() {
         block_on(async {
-            let key_0 = Arc::new("key_0".to_owned());
-            let key_1 = Arc::new("key_1".to_owned());
-            let key_2 = Arc::new("key_2".to_owned());
-            let key_3 = Arc::new("key_3".to_owned());
-            let value_1 = "value_1".to_owned();
-            let value_2 = "value_2".to_owned();
+            let mut mem_table = MemTable::<UserInner>::default();
 
-            let mut mem_table = MemTable::default();
-
-            mem_table.insert(key_0.clone(), 0, None);
-            mem_table.insert(key_1.clone(), 0, Some(value_1.clone()));
-            mem_table.insert(key_1.clone(), 1, None);
-            mem_table.insert(key_2.clone(), 0, Some(value_2.clone()));
-            mem_table.insert(key_3.clone(), 0, None);
-
-            let batch = Db::<String, String, LocalOracle<String>, InMemProvider>::freeze(mem_table)
-                .await
-                .unwrap();
-
-            let mut iterator = batch
-                .range(Some(&key_1), Some(&key_2), &1, |v: &String| v.clone())
-                .await
-                .unwrap();
-
-            assert_eq!(
-                iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_1".to_owned()), None)
+            mem_table.insert(0, 0, None);
+            mem_table.insert(
+                1,
+                0,
+                Some(UserInner::new(
+                    1,
+                    "1".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
             );
+            mem_table.insert(1, 1, None);
+            mem_table.insert(
+                2,
+                0,
+                Some(UserInner::new(
+                    2,
+                    "2".to_string(),
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
+            );
+            mem_table.insert(3, 0, None);
+
+            let batch = Db::<UserInner, LocalOracle<u64>, InMemProvider>::freeze(mem_table)
+                .await
+                .unwrap();
+
+            let mut iterator = batch.range(Some(&1), Some(&2), &1).await.unwrap();
+
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (1, None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_2".to_owned()), Some(value_2))
+                (
+                    2,
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
             assert!(iterator.next().await.is_none())
         })

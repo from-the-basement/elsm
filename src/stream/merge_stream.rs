@@ -1,9 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
-    fmt::Debug,
     pin::{pin, Pin},
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -12,37 +10,29 @@ use futures::Stream;
 use pin_project::pin_project;
 
 use crate::{
-    serdes::{Decode, Encode},
+    schema::Schema,
     stream::{EStreamImpl, StreamError},
     utils::CmpKeyItem,
 };
 
 #[pin_project]
-pub struct MergeStream<'stream, K, T, V, G, F>
+pub struct MergeStream<'stream, S>
 where
-    K: Ord + Encode + Decode,
-    T: Ord + Copy + Default,
-    V: Decode + Send + Sync,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
     #[allow(clippy::type_complexity)]
-    heap: BinaryHeap<Reverse<(CmpKeyItem<Arc<K>, Option<G>>, usize)>>,
-    iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
-    item_buf: Option<(Arc<K>, Option<G>)>,
+    heap: BinaryHeap<Reverse<(CmpKeyItem<S::PrimaryKey, Option<S>>, usize)>>,
+    iters: Vec<EStreamImpl<'stream, S>>,
+    item_buf: Option<(S::PrimaryKey, Option<S>)>,
 }
 
-impl<'stream, K, T, V, G, F> MergeStream<'stream, K, T, V, G, F>
+impl<'stream, S> MergeStream<'stream, S>
 where
-    K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
-    V: Decode + Send + Sync,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
     pub(crate) async fn new(
-        mut iters: Vec<EStreamImpl<'stream, K, T, V, G, F>>,
-    ) -> Result<Self, StreamError<K, V>> {
+        mut iters: Vec<EStreamImpl<'stream, S>>,
+    ) -> Result<Self, StreamError<S::PrimaryKey, S>> {
         let mut heap = BinaryHeap::new();
 
         for (i, iter) in iters.iter_mut().enumerate() {
@@ -67,15 +57,11 @@ where
     }
 }
 
-impl<'stream, K, T, V, G, F> Stream for MergeStream<'stream, K, T, V, G, F>
+impl<'stream, S> Stream for MergeStream<'stream, S>
 where
-    K: Ord + Debug + Encode + Decode,
-    T: Ord + Copy + Default,
-    V: Decode + Send + Sync,
-    G: Send + Sync + 'static,
-    F: Fn(&V) -> G + Sync + 'static,
+    S: Schema,
 {
-    type Item = Result<(Arc<K>, Option<G>), StreamError<K, V>>;
+    type Item = Result<(S::PrimaryKey, Option<S>), StreamError<S::PrimaryKey, S>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -110,63 +96,126 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use executor::futures::StreamExt;
     use futures::executor::block_on;
 
-    use crate::stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl};
+    use crate::{
+        stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl},
+        tests::UserInner,
+    };
 
     #[test]
     fn iter() {
         block_on(async {
             let iter_1 = BufStream::new(vec![
-                (Arc::new("key_1".to_owned()), Some("value_1".to_owned())),
-                (Arc::new("key_3".to_owned()), None),
+                (
+                    1,
+                    Some(UserInner::new(
+                        1,
+                        "1".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                ),
+                (3, None),
             ]);
             let iter_2 = BufStream::new(vec![
-                (Arc::new("key_1".to_owned()), None),
-                (Arc::new("key_2".to_owned()), Some("value_2".to_owned())),
-                (Arc::new("key_4".to_owned()), None),
+                (1, None),
+                (
+                    2,
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                ),
+                (4, None),
             ]);
             let iter_3 = BufStream::new(vec![
-                (Arc::new("key_5".to_owned()), Some("value_3".to_owned())),
-                (Arc::new("key_6".to_owned()), None),
+                (
+                    5,
+                    Some(UserInner::new(
+                        3,
+                        "3".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                ),
+                (6, None),
             ]);
 
-            let mut iterator =
-                MergeStream::<String, u64, String, String, fn(&String) -> String>::new(vec![
-                    EStreamImpl::Buf(iter_3),
-                    EStreamImpl::Buf(iter_2),
-                    EStreamImpl::Buf(iter_1),
-                ])
-                .await
-                .unwrap();
+            let mut iterator = MergeStream::<UserInner>::new(vec![
+                EStreamImpl::Buf(iter_3),
+                EStreamImpl::Buf(iter_2),
+                EStreamImpl::Buf(iter_1),
+            ])
+            .await
+            .unwrap();
 
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (1, None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_1".to_owned()), None)
+                (
+                    2,
+                    Some(UserInner::new(
+                        2,
+                        "2".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (3, None));
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (4, None));
             assert_eq!(
                 iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_2".to_owned()), Some("value_2".to_owned()))
+                (
+                    5,
+                    Some(UserInner::new(
+                        3,
+                        "3".to_string(),
+                        false,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                    ))
+                )
             );
-            assert_eq!(
-                iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_3".to_owned()), None)
-            );
-            assert_eq!(
-                iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_4".to_owned()), None)
-            );
-            assert_eq!(
-                iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_5".to_owned()), Some("value_3".to_owned()))
-            );
-            assert_eq!(
-                iterator.next().await.unwrap().unwrap(),
-                (Arc::new("key_6".to_owned()), None)
-            );
+            assert_eq!(iterator.next().await.unwrap().unwrap(), (6, None));
         });
     }
 }
