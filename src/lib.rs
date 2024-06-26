@@ -2,9 +2,9 @@ mod compactor;
 mod consistent_hash;
 pub(crate) mod index_batch;
 pub(crate) mod mem_table;
-pub(crate) mod oracle;
-pub(crate) mod record;
-pub(crate) mod schema;
+pub mod oracle;
+pub mod record;
+pub mod schema;
 pub(crate) mod scope;
 pub mod serdes;
 pub mod stream;
@@ -200,7 +200,7 @@ where
         Transaction::new(self.clone())
     }
 
-    async fn write(
+    pub async fn write(
         &self,
         record_type: RecordType,
         ts: TimeStamp,
@@ -210,7 +210,7 @@ where
             .await
     }
 
-    async fn remove(
+    pub async fn remove(
         &self,
         record_type: RecordType,
         ts: TimeStamp,
@@ -281,7 +281,7 @@ where
         Ok(())
     }
 
-    async fn get(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> Option<S> {
+    pub async fn get(&self, key: &S::PrimaryKey, ts: &TimeStamp) -> Option<S> {
         let consistent_hash =
             jump_consistent_hash(fxhash::hash64(key), executor::worker_num()) as usize;
 
@@ -293,7 +293,6 @@ where
             )
         };
 
-        println!("A");
         if let Some(value) = self
             .mutable_shards
             .with(consistent_hash, move |local| async move {
@@ -303,7 +302,6 @@ where
         {
             return value;
         }
-        println!("B");
         let guard = self.immutable.read().await;
         for index_batch in guard.iter().rev() {
             if let Some(value) = index_batch.find(key, ts).await {
@@ -312,7 +310,6 @@ where
         }
         drop(guard);
 
-        println!("C");
         let guard = self.version_set.current().await;
         if let Ok(Some(record_batch)) = guard.query(key, &self.option).await {
             return S::from_batch(&record_batch, 0).1;
@@ -322,7 +319,7 @@ where
         None
     }
 
-    async fn range(
+    pub async fn range(
         &self,
         lower: Option<&S::PrimaryKey>,
         upper: Option<&S::PrimaryKey>,
@@ -388,7 +385,7 @@ where
         Ok(iters)
     }
 
-    async fn write_batch(
+    pub async fn write_batch(
         &self,
         mut kvs: impl ExactSizeIterator<Item = (S::PrimaryKey, TimeStamp, Option<S>)>,
     ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
@@ -576,7 +573,7 @@ where
 }
 
 impl DbOption {
-    pub(crate) fn new(path: impl Into<PathBuf> + Send) -> Self {
+    pub fn new(path: impl Into<PathBuf> + Send) -> Self {
         DbOption {
             path: path.into(),
             max_mem_table_size: 8 * 1024 * 1024,
