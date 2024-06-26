@@ -1,4 +1,4 @@
-workspace = { members = ["src/elsm_marco"] }
+workspace = { members = [ "src/benchs","src/elsm_marco"] }
 [package]
 edition = "2021"
 name = "elsm"

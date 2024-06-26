@@ -1,0 +1,20 @@
+[package]
+name = "benchs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bench]]
+name = "benchmark"
+path = "src/main.rs"
+harness = false
+
+[dependencies]
+arrow = "51"
+criterion = { version = "0.3", features = ["async"] }
+elsm = { path = "../../../elsm" }
+elsm_marco = { path = "../elsm_marco" }
+executor = { git = "https://github.com/ethe/executor.git", rev = "279fc08d7ba72b9ab8cfd73518f821ecc4956fae" }
+itertools = "0.13"
+lazy_static = "1"
