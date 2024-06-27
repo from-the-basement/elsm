@@ -128,7 +128,7 @@ where
         let version_set =
             VersionSet::<S, WP>::new(&option, clean_sender.clone(), wal_manager.clone())
                 .await
-                .unwrap();
+                .map_err(|err| WriteError::Internal(Box::new(err)))?;
         let mut compactor =
             Compactor::<S, WP>::new(immutable.clone(), option.clone(), version_set.clone());
 
