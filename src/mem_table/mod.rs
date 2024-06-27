@@ -158,7 +158,7 @@ mod tests {
     use crate::{
         record::{Record, RecordType},
         tests::UserInner,
-        wal::{WalFile, WalWrite},
+        wal::{FileId, WalFile, WalWrite},
     };
 
     #[test]
@@ -330,14 +330,14 @@ mod tests {
         let value = UserInner::new(0, "v".to_string(), false, 0, 0, 0, 0, 0, 0, 0, 0);
         block_on(async {
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file));
+                let mut wal = WalFile::new(Cursor::new(&mut file), FileId::new());
                 wal.write(Record::new(RecordType::Full, &key, 0, Some(&value)))
                     .await
                     .unwrap();
                 wal.flush().await.unwrap();
             }
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file));
+                let mut wal = WalFile::new(Cursor::new(&mut file), FileId::new());
                 let mem_table: MemTable<UserInner> = MemTable::from_wal(&mut wal).await.unwrap();
                 assert_eq!(mem_table.get(&key, &0), Some(Some(&value)));
             }

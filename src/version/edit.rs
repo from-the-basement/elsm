@@ -4,11 +4,11 @@ use executor::futures::{
     util::{AsyncReadExt, AsyncWriteExt},
     AsyncRead, AsyncWrite,
 };
-use snowflake::ProcessUniqueId;
 
 use crate::{
     scope::Scope,
     serdes::{Decode, Encode},
+    wal::FileId,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -17,7 +17,7 @@ where
     K: Encode + Decode + Ord + Clone,
 {
     Add { level: u8, scope: Scope<K> },
-    Remove { level: u8, gen: ProcessUniqueId },
+    Remove { level: u8, gen: FileId },
 }
 
 impl<K> VersionEdit<K>
@@ -53,7 +53,7 @@ where
             VersionEdit::Remove { gen, level } => {
                 writer.write_all(&1u8.to_le_bytes()).await?;
                 writer.write_all(&level.to_le_bytes()).await?;
-                writer.write_all(&bincode::serialize(gen).unwrap()).await?;
+                writer.write_all(&gen.to_bytes()).await?;
             }
         }
 
@@ -98,7 +98,7 @@ where
                 let gen = {
                     let mut slice = [0; 16];
                     reader.read_exact(&mut slice).await?;
-                    bincode::deserialize(&slice).unwrap()
+                    FileId::from_bytes(slice)
                 };
                 VersionEdit::Remove { level, gen }
             }
@@ -111,7 +111,7 @@ where
 mod tests {
     use futures::{executor::block_on, io::Cursor};
 
-    use crate::{scope::Scope, serdes::Encode, version::edit::VersionEdit};
+    use crate::{scope::Scope, serdes::Encode, version::edit::VersionEdit, wal::FileId};
 
     #[test]
     fn encode_and_decode() {
@@ -123,6 +123,7 @@ mod tests {
                         min: "Min".to_string(),
                         max: "Max".to_string(),
                         gen: Default::default(),
+                        wal_ids: Some(vec![FileId::new(), FileId::new()]),
                     },
                 },
                 VersionEdit::Remove {

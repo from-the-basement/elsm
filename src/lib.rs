@@ -25,7 +25,6 @@ use std::{
 };
 
 use async_lock::{Mutex, RwLock};
-use consistent_hash::jump_consistent_hash;
 use executor::{
     futures::{AsyncRead, StreamExt},
     spawn,
@@ -42,7 +41,6 @@ use mem_table::MemTable;
 use oracle::Oracle;
 use record::{Record, RecordType};
 use serdes::Encode;
-use snowflake::ProcessUniqueId;
 use tracing::error;
 use transaction::Transaction;
 use wal::{provider::WalProvider, WalFile, WalManager, WalWrite, WriteError};
@@ -55,11 +53,11 @@ use crate::{
     serdes::Decode,
     stream::{buf_stream::BufStream, merge_stream::MergeStream, EStreamImpl, StreamError},
     version::{cleaner::Cleaner, set::VersionSet, Version},
-    wal::WalRecover,
+    wal::{FileId, WalRecover},
 };
 
 pub type Offset = i64;
-pub(crate) type Immutable<S> = Arc<RwLock<VecDeque<IndexBatch<S>>>>;
+pub(crate) type Immutable<S> = Arc<RwLock<VecDeque<(IndexBatch<S>, FileId)>>>;
 
 #[derive(Debug)]
 pub enum CompactTask {
@@ -99,7 +97,7 @@ where
     pub(crate) mutable_shards: RwLock<MutableShard<S, WP>>,
     pub(crate) immutable: Immutable<S>,
     pub(crate) compaction_tx: Mutex<Sender<CompactTask>>,
-    pub(crate) version_set: VersionSet<S>,
+    pub(crate) version_set: VersionSet<S, WP>,
 }
 
 impl<S, O, WP> Db<S, O, WP>
@@ -127,11 +125,12 @@ where
         let (task_tx, mut task_rx) = channel(1);
         let (mut cleaner, clean_sender) = Cleaner::new(option.clone());
 
-        let version_set = VersionSet::<S>::new(&option, clean_sender.clone())
-            .await
-            .unwrap();
+        let version_set =
+            VersionSet::<S, WP>::new(&option, clean_sender.clone(), wal_manager.clone())
+                .await
+                .unwrap();
         let mut compactor =
-            Compactor::<S>::new(immutable.clone(), option.clone(), version_set.clone());
+            Compactor::<S, WP>::new(immutable.clone(), option.clone(), version_set.clone());
 
         spawn(async move {
             if let Err(err) = cleaner.listen().await {
@@ -164,19 +163,17 @@ where
             compaction_tx: Mutex::new(task_tx),
             version_set,
         };
-        let mut file_stream = pin!(wal_manager.wal_provider.list());
+        let mut file_stream = pin!(wal_manager.wal_provider.list().map_err(WriteError::Io)?);
 
         while let Some(file) = file_stream.next().await {
-            let file = file.map_err(|err| WriteError::Internal(Box::new(err)))?;
-
-            db.recover(
-                &mut wal_manager
-                    .pack_wal_file(file)
-                    .await
-                    .map_err(WriteError::Io)?,
-            )
-            .await
-            .map_err(|err| WriteError::Internal(Box::new(err)))?;
+            let (file, file_id) = file.map_err(|err| WriteError::Internal(Box::new(err)))?;
+            let mut file = wal_manager
+                .pack_wal_file(file, file_id)
+                .await
+                .map_err(WriteError::Io)?;
+            db.recover(&mut file)
+                .await
+                .map_err(|err| WriteError::Internal(Box::new(err)))?;
         }
 
         Ok(db)
@@ -201,7 +198,7 @@ where
         ts: TimeStamp,
         value: S,
     ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
-        self.append(record_type, value.primary_key(), ts, Some(value))
+        self.append(record_type, value.primary_key(), ts, Some(value), false)
             .await
     }
 
@@ -211,15 +208,17 @@ where
         ts: TimeStamp,
         key: S::PrimaryKey,
     ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
-        self.append(record_type, key, ts, None).await
+        self.append(record_type, key, ts, None, false).await
     }
 
+    // TODO(Kould): use hard coding or runtime judgment(`is_recover`)?
     async fn append(
         &self,
         record_type: RecordType,
         key: S::PrimaryKey,
         ts: TimeStamp,
         value: Option<S>,
+        is_recover: bool,
     ) -> Result<(), WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
         let wal_manager = self.wal_manager.clone();
         let max_mem_table_size = self.option.max_mem_table_size;
@@ -227,36 +226,40 @@ where
         let freeze = {
             let mut guard = self.mutable_shards.write().await;
 
-            guard
-                .wal
-                .write(Record::new(record_type, &key, ts, value.as_ref()))
-                .await?;
+            if !is_recover {
+                guard
+                    .wal
+                    .write(Record::new(record_type, &key, ts, value.as_ref()))
+                    .await?;
+            }
             guard.mutable.insert(key, ts, value);
 
             if guard.mutable.is_excess(max_mem_table_size) {
-                let mut wal_file = wal_manager
-                    .create_wal_file()
-                    .await
-                    .map_err(WriteError::Io)?;
-                mem::swap(&mut guard.wal, &mut wal_file);
-                wal_file.close().await.map_err(WriteError::Io)?;
-
+                let file_id = guard.wal.file_id();
+                if !is_recover {
+                    let mut wal_file = wal_manager
+                        .create_wal_file()
+                        .await
+                        .map_err(WriteError::Io)?;
+                    mem::swap(&mut guard.wal, &mut wal_file);
+                    wal_file.close().await.map_err(WriteError::Io)?;
+                }
                 let mut mem_table = MemTable::default();
                 mem::swap(&mut guard.mutable, &mut mem_table);
 
-                Some(mem_table)
+                Some((mem_table, file_id))
             } else {
                 None
             }
         };
 
-        if let Some(mem_table) = freeze {
+        if let Some((mem_table, file_id)) = freeze {
             if mem_table.is_empty() {
                 return Ok(());
             }
             let mut guard = self.immutable.write().await;
 
-            guard.push_back(Self::freeze(mem_table).await?);
+            guard.push_back((Self::freeze(mem_table).await?, file_id));
             if guard.len() > self.option.immutable_chunk_num {
                 if let Some(mut guard) = self.compaction_tx.try_lock() {
                     let _ = guard.try_send(CompactTask::Flush(None));
@@ -286,7 +289,7 @@ where
             return value;
         }
         let guard = self.immutable.read().await;
-        for index_batch in guard.iter().rev() {
+        for (index_batch, _) in guard.iter().rev() {
             if let Some(value) = index_batch.find(key, ts).await {
                 return value;
             }
@@ -332,7 +335,7 @@ where
         drop(guard);
         let guard = self.immutable.read().await;
 
-        for batch in guard.iter() {
+        for (batch, _) in guard.iter() {
             let mut items = Vec::new();
             let mut stream = pin!(batch.range(lower, upper, ts).await?);
 
@@ -362,18 +365,20 @@ where
             0 => Ok(()),
             1 => {
                 let (key, ts, value) = kvs.next().unwrap();
-                self.append(RecordType::Full, key, ts, value).await
+                self.append(RecordType::Full, key, ts, value, false).await
             }
             len => {
                 let (key, ts, value) = kvs.next().unwrap();
-                self.append(RecordType::First, key, ts, value).await?;
+                self.append(RecordType::First, key, ts, value, false)
+                    .await?;
 
                 for (key, ts, value) in (&mut kvs).take(len - 2) {
-                    self.append(RecordType::Middle, key, ts, value).await?;
+                    self.append(RecordType::Middle, key, ts, value, false)
+                        .await?;
                 }
 
                 let (key, ts, value) = kvs.next().unwrap();
-                self.append(RecordType::Last, key, ts, value).await
+                self.append(RecordType::Last, key, ts, value, false).await
             }
         }
     }
@@ -403,17 +408,10 @@ where
     {
         let mut stream = pin!(wal.recover());
         while let Some(record) = stream.next().await {
-            let mut record_type = RecordType::First;
             let Record { key, ts, value, .. } =
                 record.map_err(|err| WriteError::Internal(Box::new(err)))?;
 
-            self.append(
-                mem::replace(&mut record_type, RecordType::Middle),
-                key,
-                ts,
-                value,
-            )
-            .await?;
+            self.append(RecordType::Full, key, ts, value, true).await?;
         }
         Ok(())
     }
@@ -554,7 +552,7 @@ impl DbOption {
         }
     }
 
-    pub(crate) fn table_path(&self, gen: &ProcessUniqueId) -> PathBuf {
+    pub(crate) fn table_path(&self, gen: &FileId) -> PathBuf {
         self.path.join(format!("{}.parquet", gen))
     }
     pub(crate) fn version_path(&self) -> PathBuf {
@@ -1106,17 +1104,16 @@ mod tests {
                     0
                 ))
             );
-            // FIXME: clean unless wal
-            // let mut stream: MergeStream<UserInner> = db.range(None, None, &0).await.unwrap();
-            //
-            // let mut results = vec![];
-            // while let Some(result) = stream.next().await {
-            //     results.push(result.unwrap().1.unwrap());
-            // }
-            // assert_eq!(results.len(), test_items().len());
-            // assert_eq!(results, test_items());
-            //
-            // drop(stream);
+            let mut stream: MergeStream<UserInner> = db.range(None, None, &0).await.unwrap();
+
+            let mut results = vec![];
+            while let Some(result) = stream.next().await {
+                results.push(result.unwrap().1.unwrap());
+            }
+            assert_eq!(results.len(), test_items().len());
+            assert_eq!(results, test_items());
+
+            drop(stream);
         });
     }
 
