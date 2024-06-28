@@ -17,6 +17,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     error,
     fmt::Debug,
+    fs,
     future::Future,
     io, mem,
     path::PathBuf,
@@ -113,6 +114,8 @@ where
         wal_provider: WP,
         option: DbOption,
     ) -> Result<Self, WriteError<<Record<S::PrimaryKey, S> as Encode>::Error>> {
+        fs::create_dir_all(&option.path).unwrap();
+
         let wal_manager = Arc::new(WalManager::new(wal_provider));
         let mutable_shards = RwLock::new(MutableShard {
             mutable: MemTable::default(),
