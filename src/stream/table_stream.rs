@@ -20,12 +20,12 @@ use parquet::arrow::{
     ParquetRecordBatchStreamBuilder, ProjectionMask,
 };
 use pin_project::pin_project;
-use snowflake::ProcessUniqueId;
 
 use crate::{
     schema::Schema,
     serdes::Encode,
     stream::{batch_stream::BatchStream, StreamError},
+    wal::FileId,
     DbOption, Offset,
 };
 
@@ -45,7 +45,7 @@ where
 {
     pub(crate) async fn new(
         option: &DbOption,
-        gen: &ProcessUniqueId,
+        gen: &FileId,
         lower: Option<&S::PrimaryKey>,
         upper: Option<&S::PrimaryKey>,
     ) -> Result<Self, StreamError<S::PrimaryKey, S>> {

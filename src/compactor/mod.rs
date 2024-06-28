@@ -3,8 +3,8 @@ use std::{cmp, collections::VecDeque, fmt::Debug, fs::File, mem, pin::pin, sync:
 use executor::{fs, futures::StreamExt};
 use futures::channel::oneshot;
 use parquet::arrow::{ArrowWriter, AsyncArrowWriter};
-use snowflake::ProcessUniqueId;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::{
     index_batch::IndexBatch,
@@ -16,28 +16,31 @@ use crate::{
         EStreamImpl, StreamError,
     },
     version::{edit::VersionEdit, set::VersionSet, Version, VersionError, MAX_LEVEL},
+    wal::{provider::WalProvider, FileId},
     DbOption, Immutable,
 };
 
-pub(crate) struct Compactor<S>
+pub(crate) struct Compactor<S, WP>
 where
     S: Schema,
+    WP: WalProvider,
 {
     pub(crate) option: Arc<DbOption>,
     pub(crate) immutable: Immutable<S>,
-    pub(crate) version_set: VersionSet<S>,
+    pub(crate) version_set: VersionSet<S, WP>,
 }
 
-impl<S> Compactor<S>
+impl<S, WP> Compactor<S, WP>
 where
     S: Schema,
+    WP: WalProvider,
 {
     pub(crate) fn new(
         immutable: Immutable<S>,
         option: Arc<DbOption>,
-        version_set: VersionSet<S>,
+        version_set: VersionSet<S, WP>,
     ) -> Self {
-        Compactor::<S> {
+        Compactor::<S, WP> {
             option,
             immutable,
             version_set,
@@ -87,13 +90,14 @@ where
 
     pub(crate) async fn minor_compaction(
         option: &DbOption,
-        batches: VecDeque<IndexBatch<S>>,
+        batches: VecDeque<(IndexBatch<S>, FileId)>,
     ) -> Result<Option<Scope<S::PrimaryKey>>, CompactionError<S>> {
         if !batches.is_empty() {
             let mut min = None;
             let mut max = None;
 
-            let gen = ProcessUniqueId::new();
+            let gen = FileId::new();
+            let mut wal_ids = Vec::with_capacity(batches.len());
 
             let mut writer = AsyncArrowWriter::try_new(
                 fs::File::from(File::create(option.table_path(&gen)).map_err(CompactionError::Io)?),
@@ -102,7 +106,7 @@ where
             )
             .map_err(CompactionError::Parquet)?;
 
-            for batch in batches {
+            for (batch, wal_id) in batches {
                 if let Some((batch_min, batch_max)) = batch.scope() {
                     if matches!(min.as_ref().map(|min| min > batch_min), Some(true) | None) {
                         min = Some(batch_min.clone())
@@ -115,12 +119,14 @@ where
                     .write(&batch.batch)
                     .await
                     .map_err(CompactionError::Parquet)?;
+                wal_ids.push(wal_id);
             }
             writer.close().await.map_err(CompactionError::Parquet)?;
             return Ok(Some(Scope {
                 min: min.ok_or(CompactionError::EmptyLevel)?,
                 max: max.ok_or(CompactionError::EmptyLevel)?,
                 gen,
+                wal_ids: Some(wal_ids),
             }));
         }
         Ok(None)
@@ -132,7 +138,7 @@ where
         mut min: &S::PrimaryKey,
         mut max: &S::PrimaryKey,
         version_edits: &mut Vec<VersionEdit<S::PrimaryKey>>,
-        delete_gens: &mut Vec<ProcessUniqueId>,
+        delete_gens: &mut Vec<FileId>,
     ) -> Result<(), CompactionError<S>> {
         let mut level = 0;
 
@@ -286,7 +292,7 @@ where
         assert!(min.is_some());
         assert!(max.is_some());
 
-        let gen = ProcessUniqueId::new();
+        let gen = Ulid::new();
         let batch = builder.finish();
         let mut writer = ArrowWriter::try_new(
             File::create(option.table_path(&gen)).map_err(CompactionError::Io)?,
@@ -302,6 +308,7 @@ where
                 min: min.take().ok_or(CompactionError::EmptyLevel)?,
                 max: max.take().ok_or(CompactionError::EmptyLevel)?,
                 gen,
+                wal_ids: None,
             },
         });
         Ok(())
@@ -335,7 +342,6 @@ mod tests {
     use executor::ExecutorBuilder;
     use futures::channel::mpsc::channel;
     use parquet::arrow::ArrowWriter;
-    use snowflake::ProcessUniqueId;
     use tempfile::TempDir;
 
     use crate::{
@@ -347,6 +353,7 @@ mod tests {
         scope::Scope,
         tests::UserInner,
         version::{edit::VersionEdit, Version},
+        wal::{provider::in_mem::InMemProvider, FileId},
         DbOption,
     };
 
@@ -375,7 +382,7 @@ mod tests {
 
     async fn build_parquet_table<S: schema::Schema>(
         option: &DbOption,
-        gen: ProcessUniqueId,
+        gen: FileId,
         items: Vec<(S, bool)>,
     ) {
         let batch = build_index_batch(items).await;
@@ -428,9 +435,9 @@ mod tests {
             ])
             .await;
 
-            let scope = Compactor::<UserInner>::minor_compaction(
+            let scope = Compactor::<UserInner, InMemProvider>::minor_compaction(
                 &option,
-                VecDeque::from(vec![batch_2, batch_1]),
+                VecDeque::from(vec![(batch_2, FileId::new()), (batch_1, FileId::new())]),
             )
             .await
             .unwrap()
@@ -449,8 +456,8 @@ mod tests {
             option.major_threshold_with_sst_size = 2;
 
             // level 1
-            let table_gen_1 = ProcessUniqueId::new();
-            let table_gen_2 = ProcessUniqueId::new();
+            let table_gen_1 = FileId::new();
+            let table_gen_2 = FileId::new();
             build_parquet_table(
                 &option,
                 table_gen_1,
@@ -491,9 +498,9 @@ mod tests {
             .await;
 
             // level 2
-            let table_gen_3 = ProcessUniqueId::new();
-            let table_gen_4 = ProcessUniqueId::new();
-            let table_gen_5 = ProcessUniqueId::new();
+            let table_gen_3 = FileId::new();
+            let table_gen_4 = FileId::new();
+            let table_gen_5 = FileId::new();
             build_parquet_table(
                 &option,
                 table_gen_3,
@@ -563,33 +570,38 @@ mod tests {
                 min: 1,
                 max: 3,
                 gen: table_gen_1,
+                wal_ids: None,
             });
             version.level_slice[0].push(Scope {
                 min: 4,
                 max: 6,
                 gen: table_gen_2,
+                wal_ids: None,
             });
             version.level_slice[1].push(Scope {
                 min: 1,
                 max: 3,
                 gen: table_gen_3,
+                wal_ids: None,
             });
             version.level_slice[1].push(Scope {
                 min: 4,
                 max: 6,
                 gen: table_gen_4,
+                wal_ids: None,
             });
             version.level_slice[1].push(Scope {
                 min: 7,
                 max: 9,
                 gen: table_gen_5,
+                wal_ids: None,
             });
 
             let min = 2;
             let max = 5;
             let mut version_edits = Vec::new();
 
-            Compactor::<UserInner>::major_compaction(
+            Compactor::<UserInner, InMemProvider>::major_compaction(
                 &version,
                 &option,
                 &min,

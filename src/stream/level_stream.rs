@@ -7,11 +7,11 @@ use std::{
 use executor::futures::Stream;
 use futures::Future;
 use pin_project::pin_project;
-use snowflake::ProcessUniqueId;
 
 use crate::{
     schema::Schema,
     stream::{table_stream::TableStream, StreamError},
+    wal::FileId,
     DbOption,
 };
 
@@ -23,7 +23,7 @@ where
     lower: Option<S::PrimaryKey>,
     upper: Option<S::PrimaryKey>,
     option: &'stream DbOption,
-    gens: VecDeque<ProcessUniqueId>,
+    gens: VecDeque<FileId>,
     stream: Option<TableStream<'stream, S>>,
 }
 
@@ -33,7 +33,7 @@ where
 {
     pub(crate) async fn new(
         option: &'stream DbOption,
-        gens: Vec<ProcessUniqueId>,
+        gens: Vec<FileId>,
         lower: Option<&S::PrimaryKey>,
         upper: Option<&S::PrimaryKey>,
     ) -> Result<Self, StreamError<S::PrimaryKey, S>> {

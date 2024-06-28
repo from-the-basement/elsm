@@ -9,8 +9,10 @@ use async_stream::stream;
 use crossbeam_queue::SegQueue;
 use executor::futures::Stream;
 use futures::{io::Cursor, ready, AsyncRead, AsyncWrite};
+use ulid::Ulid;
 
 use super::WalProvider;
+use crate::wal::FileId;
 
 #[derive(Debug, Default, Clone)]
 pub struct InMemProvider {
@@ -26,20 +28,25 @@ impl InMemProvider {
 impl WalProvider for InMemProvider {
     type File = Buf;
 
-    async fn open(&self, _fid: u32) -> std::io::Result<Self::File> {
+    async fn open(&self, _fid: FileId) -> std::io::Result<Self::File> {
         Ok(Buf {
             buf: Some(Cursor::new(Vec::new())),
             wals: self.wals.clone(),
         })
     }
 
-    fn list(&self) -> impl Stream<Item = io::Result<Self::File>> {
-        stream! {
-            yield Ok(Buf {
+    fn remove(&self, _fid: FileId) -> io::Result<()> {
+        // FIXME
+        Ok(())
+    }
+
+    fn list(&self) -> io::Result<impl Stream<Item = io::Result<(Self::File, FileId)>>> {
+        Ok(stream! {
+            yield Ok((Buf {
                 buf: Some(Cursor::new(Vec::new())),
                 wals: self.wals.clone(),
-            })
-        }
+            }, Ulid::new()))
+        })
     }
 }
 

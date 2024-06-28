@@ -20,7 +20,6 @@ use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ArrowReaderMetadata, RowFilter},
     ParquetRecordBatchStreamBuilder, ProjectionMask,
 };
-use snowflake::ProcessUniqueId;
 use thiserror::Error;
 use tracing::error;
 
@@ -30,6 +29,7 @@ use crate::{
     serdes::Encode,
     stream::{level_stream::LevelStream, table_stream::TableStream, EStreamImpl, StreamError},
     version::cleaner::CleanTag,
+    wal::FileId,
     DbOption,
 };
 
@@ -149,7 +149,7 @@ where
     }
 
     async fn read_parquet(
-        scope_gen: &ProcessUniqueId,
+        scope_gen: &FileId,
         key_scalar: &S::PrimaryKeyArray,
         option: &DbOption,
     ) -> Result<Option<RecordBatch>, VersionError<S>> {

@@ -1,13 +1,7 @@
 mod checksum;
 pub mod provider;
 
-use std::{
-    error::Error,
-    future::Future,
-    io,
-    marker::PhantomData,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::{error::Error, future::Future, io, marker::PhantomData};
 
 use async_stream::stream;
 use checksum::{HashReader, HashWriter};
@@ -16,6 +10,7 @@ use futures::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, Stream,
 };
 use thiserror::Error;
+use ulid::Ulid;
 
 use self::provider::WalProvider;
 use crate::{
@@ -23,10 +18,11 @@ use crate::{
     serdes::{Decode, Encode},
 };
 
+pub(crate) type FileId = Ulid;
+
 #[derive(Debug)]
 pub(crate) struct WalManager<WP> {
     pub(crate) wal_provider: WP,
-    file_id: AtomicU32,
 }
 
 impl<WP> WalManager<WP>
@@ -34,24 +30,26 @@ where
     WP: WalProvider,
 {
     pub(crate) fn new(wal_provider: WP) -> Self {
-        Self {
-            wal_provider,
-            file_id: AtomicU32::new(0),
-        }
+        Self { wal_provider }
     }
 
     pub(crate) async fn create_wal_file<K, V>(&self) -> io::Result<WalFile<WP::File, K, V>> {
-        let file_id = self.file_id.fetch_add(1, Ordering::Relaxed);
+        let file_id = Ulid::new();
         let file = self.wal_provider.open(file_id).await?;
 
-        self.pack_wal_file(file).await
+        self.pack_wal_file(file, file_id).await
+    }
+
+    pub(crate) fn remove_wal_file(&self, file_id: FileId) -> io::Result<()> {
+        self.wal_provider.remove(file_id)
     }
 
     pub(crate) async fn pack_wal_file<K, V>(
         &self,
         file: WP::File,
+        file_id: FileId,
     ) -> io::Result<WalFile<WP::File, K, V>> {
-        Ok(WalFile::new(file))
+        Ok(WalFile::new(file, file_id))
     }
 }
 
@@ -79,15 +77,21 @@ pub trait WalRecover<K, V> {
 #[derive(Debug)]
 pub(crate) struct WalFile<F, K, V> {
     file: F,
+    file_id: FileId,
     _marker: PhantomData<(K, V)>,
 }
 
 impl<F, K, V> WalFile<F, K, V> {
-    pub(crate) fn new(file: F) -> Self {
+    pub(crate) fn new(file: F, file_id: FileId) -> Self {
         Self {
             file,
+            file_id,
             _marker: PhantomData,
         }
+    }
+
+    pub(crate) fn file_id(&self) -> FileId {
+        self.file_id
     }
 }
 
@@ -180,7 +184,7 @@ mod tests {
 
     use futures::{executor::block_on, io::Cursor, StreamExt};
 
-    use super::{Record, WalFile, WalRecover, WalWrite};
+    use super::{FileId, Record, WalFile, WalRecover, WalWrite};
     use crate::record::RecordType;
 
     #[test]
@@ -188,7 +192,7 @@ mod tests {
         let mut file = Vec::new();
         block_on(async {
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file));
+                let mut wal = WalFile::new(Cursor::new(&mut file), FileId::new());
                 wal.write(Record::new(
                     RecordType::Full,
                     &"key".to_string(),
@@ -200,7 +204,7 @@ mod tests {
                 wal.flush().await.unwrap();
             }
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file));
+                let mut wal = WalFile::new(Cursor::new(&mut file), FileId::new());
 
                 {
                     let mut stream = pin!(wal.recover());
@@ -222,7 +226,7 @@ mod tests {
             }
 
             {
-                let mut wal = WalFile::new(Cursor::new(&mut file));
+                let mut wal = WalFile::new(Cursor::new(&mut file), FileId::new());
 
                 {
                     let mut stream = pin!(wal.recover());
